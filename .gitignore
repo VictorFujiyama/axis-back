@@ -20,3 +20,8 @@ pnpm-debug.log*
 # Uploaded files (local storage)
 uploads/*
 !uploads/.gitkeep
+
+# Internal docs and test scripts (local only)
+docs/
+scripts/
+*.pdf
