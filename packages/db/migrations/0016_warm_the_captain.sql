@@ -1,0 +1,1 @@
+ALTER TABLE "conversations" ADD COLUMN "muted" boolean DEFAULT false NOT NULL;

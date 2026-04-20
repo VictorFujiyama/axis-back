@@ -1,0 +1,22 @@
+node_modules/
+dist/
+.turbo/
+coverage/
+
+*.log
+pnpm-debug.log*
+
+.env
+.env.local
+.env.*.local
+!.env.example
+
+.DS_Store
+*.swp
+.idea/
+.vscode/
+*.tsbuildinfo
+
+# Uploaded files (local storage)
+uploads/*
+!uploads/.gitkeep

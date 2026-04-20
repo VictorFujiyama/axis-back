@@ -1,0 +1,1 @@
+ALTER TABLE "tags" ADD COLUMN "show_on_sidebar" boolean DEFAULT false NOT NULL;
