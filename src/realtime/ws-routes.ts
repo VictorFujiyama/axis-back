@@ -45,7 +45,7 @@ function eventRoom(e: RealtimeEvent): string[] {
     case 'message.updated':
       return [`conversation:${e.conversationId}`, `inbox:${e.inboxId}`];
     case 'typing.indicator':
-      return [`conversation:${e.conversationId}`];
+      return [`conversation:${e.conversationId}`, `inbox:${e.inboxId}`];
   }
 }
 
@@ -160,17 +160,29 @@ export async function realtimeRoutes(app: FastifyInstance): Promise<void> {
         return;
       }
 
-      // Handle typing indicator — broadcast to other clients in the conversation room.
+      // Handle typing indicator — broadcast to the conversation room (for
+      // agents inside the thread) and the inbox room (so the sidebar list can
+      // show a "digitando…" preview). Look up inboxId from the DB rather than
+      // trusting the client — prevents a hostile client from fanning out
+      // typing events to inboxes they shouldn't touch.
       const typingResult = typingMsg.safeParse(parsed);
       if (typingResult.success) {
         const { conversationId } = typingResult.data;
-        eventBus.emitEvent({
-          type: 'typing.indicator',
-          inboxId: '',           // ACL skipped for typing; room-level access is sufficient.
-          conversationId,
-          userId: ctx.userId,
-          userName: ctx.userName,
-        });
+        void (async () => {
+          const [row] = await app.db
+            .select({ inboxId: schema.conversations.inboxId })
+            .from(schema.conversations)
+            .where(eq(schema.conversations.id, conversationId))
+            .limit(1);
+          if (!row || !canAccessInbox(ctx, row.inboxId)) return;
+          eventBus.emitEvent({
+            type: 'typing.indicator',
+            inboxId: row.inboxId,
+            conversationId,
+            userId: ctx.userId,
+            userName: ctx.userName,
+          });
+        })();
         return;
       }
 

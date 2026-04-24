@@ -1,7 +1,13 @@
 import { and, desc, eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
+import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { eventBus, type RealtimeEvent } from './event-bus';
+
+const widgetTypingMsg = z.object({
+  type: z.literal('typing'),
+  conversationId: z.string().uuid(),
+});
 
 interface WidgetCtx {
   inboxId: string;
@@ -78,6 +84,18 @@ export async function widgetWsRoutes(app: FastifyInstance): Promise<void> {
     const knownConvIds = new Set<string>(initialConvs.map((c) => c.id));
     const latestConv = initialConvs[0];
 
+    // Display name for typing events. Anonymous widget visitors fall back to
+    // "Visitante" so agents still get a meaningful "X está digitando…" label.
+    const [contactRow] = await app.db
+      .select({ name: schema.contacts.name })
+      .from(schema.contacts)
+      .where(eq(schema.contacts.id, ctx.contactId))
+      .limit(1);
+    const contactName =
+      contactRow?.name && contactRow.name.trim().length > 0
+        ? contactRow.name
+        : 'Visitante';
+
     send({
       type: 'hello',
       contactId: ctx.contactId,
@@ -112,13 +130,34 @@ export async function widgetWsRoutes(app: FastifyInstance): Promise<void> {
       }
     });
 
-    // Read-only socket: any message from the widget closes it (anti-abuse).
-    socket.on('message', () => {
+    // The only accepted inbound message is a typing indicator — any other
+    // payload closes the socket (anti-abuse). Validate conversationId is one
+    // the visitor owns so a hostile widget token can't fan out typing events
+    // into conversations that don't belong to it.
+    socket.on('message', (raw: { toString: () => string }) => {
+      let parsed: unknown;
       try {
-        socket.close(1003, 'read-only');
+        parsed = JSON.parse(raw.toString());
       } catch {
-        /* ignore */
+        try { socket.close(1003, 'invalid'); } catch { /* ignore */ }
+        return;
       }
+      const typingResult = widgetTypingMsg.safeParse(parsed);
+      if (typingResult.success) {
+        const { conversationId } = typingResult.data;
+        if (!knownConvIds.has(conversationId)) return;
+        eventBus.emitEvent({
+          type: 'typing.indicator',
+          inboxId: ctx.inboxId,
+          conversationId,
+          // contactId doubles as userId here; agent sockets filter self-echo
+          // by their own userId, so the visitor's contactId never collides.
+          userId: ctx.contactId,
+          userName: contactName,
+        });
+        return;
+      }
+      try { socket.close(1003, 'unsupported'); } catch { /* ignore */ }
     });
 
     socket.on('close', () => {
