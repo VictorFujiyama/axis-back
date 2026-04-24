@@ -169,6 +169,13 @@
       "when": 1777039665320,
       "tag": "0023_volatile_frank_castle",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1777046510745,
+      "tag": "0024_orange_juggernaut",
+      "breakpoints": true
     }
   ]
 }

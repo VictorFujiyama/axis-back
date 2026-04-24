@@ -29,7 +29,10 @@ export const conversations = pgTable(
       onDelete: 'set null',
     }),
     status: conversationStatusEnum('status').notNull().default('open'),
-    priority: conversationPriorityEnum('priority').notNull().default('medium'),
+    // Nullable with no default — priority starts unset and is only filled in
+    // when a human explicitly chooses one (Chatwoot parity). Auto-defaulting
+    // to 'medium' tagged every new conversation with a fake priority.
+    priority: conversationPriorityEnum('priority'),
     muted: boolean('muted').notNull().default(false),
     firstResponseAt: timestamp('first_response_at', { withTimezone: true }),
     lastMessageAt: timestamp('last_message_at', { withTimezone: true }),

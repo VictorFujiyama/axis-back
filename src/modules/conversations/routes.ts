@@ -27,7 +27,9 @@ const listQuery = z.object({
 
 const updateBody = z.object({
   status: z.enum(['open', 'pending', 'resolved', 'snoozed']).optional(),
-  priority: z.enum(['low', 'medium', 'high', 'urgent']).optional(),
+  // nullish so the UI can clear priority by sending null — "Nenhum" in the
+  // sidebar dropdown must actually unset the column, not be ignored.
+  priority: z.enum(['low', 'medium', 'high', 'urgent']).nullish(),
 });
 
 const assignBody = z
@@ -357,7 +359,8 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
           patch.resolvedBy = null;
         }
       }
-      if (body.priority) patch.priority = body.priority;
+      // priority is tri-state: undefined = skip, null = clear, 'low|…|urgent' = set.
+      if (body.priority !== undefined) patch.priority = body.priority;
       const [conv] = await app.db
         .update(schema.conversations)
         .set(patch)
