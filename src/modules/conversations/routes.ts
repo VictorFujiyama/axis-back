@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
@@ -15,10 +15,12 @@ const listQuery = z.object({
   assigned: z.enum(['me', 'unassigned', 'all']).default('all'),
   inboxId: z.string().uuid().optional(),
   tagId: z.string().uuid().optional(),
-  // Secondary filter layered over status/assigned: 'mentions' narrows to
-  // conversations where the authenticated user has an active mention
-  // notification (private-note @mentions). Maps the "Menções" sidebar item.
-  filter: z.enum(['mentions']).optional(),
+  // Secondary filter layered over status/assigned:
+  //  - 'mentions' narrows to conversations where the authenticated user has
+  //    an active mention notification (private-note @mentions).
+  //  - 'unattended' narrows to conversations that have never been replied to
+  //    or are waiting for the first agent touch (Chatwoot parity).
+  filter: z.enum(['mentions', 'unattended']).optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
@@ -126,6 +128,7 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
             and(
               eq(schema.notifications.userId, req.user.sub),
               eq(schema.notifications.type, 'mention'),
+              isNull(schema.notifications.readAt),
             ),
           );
         const ids = mentioned
@@ -133,6 +136,16 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
           .filter((id): id is string => id !== null);
         if (ids.length === 0) return { items: [], nextCursor: null };
         conditions.push(inArray(schema.conversations.id, ids));
+      } else if (query.filter === 'unattended') {
+        // Chatwoot parity: a conversation is "unattended" when no agent has
+        // ever replied (firstResponseAt IS NULL) OR the customer has sent
+        // something and we haven't caught up yet (waitingForAgentSince set).
+        conditions.push(
+          or(
+            isNull(schema.conversations.firstResponseAt),
+            isNotNull(schema.conversations.waitingForAgentSince),
+          )!,
+        );
       }
 
       const rows = await app.db
@@ -230,7 +243,7 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
         status: z.enum(['open', 'pending', 'resolved', 'snoozed']).optional(),
         inboxId: z.string().uuid().optional(),
         tagId: z.string().uuid().optional(),
-        filter: z.enum(['mentions']).optional(),
+        filter: z.enum(['mentions', 'unattended']).optional(),
       });
       const query = countsQuery.parse(req.query);
       const base = [isNull(schema.conversations.deletedAt), eq(schema.conversations.accountId, req.user.accountId)];
@@ -257,6 +270,7 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
             and(
               eq(schema.notifications.userId, req.user.sub),
               eq(schema.notifications.type, 'mention'),
+              isNull(schema.notifications.readAt),
             ),
           );
         const ids = mentioned
@@ -264,6 +278,13 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
           .filter((id): id is string => id !== null);
         if (ids.length === 0) return { mine: 0, unassigned: 0, all: 0 };
         base.push(inArray(schema.conversations.id, ids));
+      } else if (query.filter === 'unattended') {
+        base.push(
+          or(
+            isNull(schema.conversations.firstResponseAt),
+            isNotNull(schema.conversations.waitingForAgentSince),
+          )!,
+        );
       }
 
       const runCount = async (extra: ReturnType<typeof and>[]) => {
@@ -565,6 +586,33 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
             eq(schema.messages.conversationId, id),
             eq(schema.messages.senderType, 'contact'),
             isNull(schema.messages.readAt),
+          ),
+        );
+      return reply.code(204).send();
+    },
+  );
+
+  // Separate from /read: fired when the agent LEAVES a conversation. Clears
+  // this user's active mention notification so the Menções sidebar drops the
+  // row — but not so eagerly that the agent loses access while they're still
+  // reading it.
+  app.post(
+    '/api/v1/conversations/:id/read-mention',
+    { preHandler: app.requireAuth },
+    async (req, reply) => {
+      const { id } = idParams.parse(req.params);
+      if (!(await canAccessConversation(app, req.user, id))) {
+        return reply.forbidden();
+      }
+      await app.db
+        .update(schema.notifications)
+        .set({ readAt: new Date() })
+        .where(
+          and(
+            eq(schema.notifications.userId, req.user.sub),
+            eq(schema.notifications.conversationId, id),
+            eq(schema.notifications.type, 'mention'),
+            isNull(schema.notifications.readAt),
           ),
         );
       return reply.code(204).send();

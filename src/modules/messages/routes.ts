@@ -120,6 +120,9 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
           status: schema.conversations.status,
           deletedAt: schema.conversations.deletedAt,
           firstResponseAt: schema.conversations.firstResponseAt,
+          assignedUserId: schema.conversations.assignedUserId,
+          assignedTeamId: schema.conversations.assignedTeamId,
+          assignedBotId: schema.conversations.assignedBotId,
         })
         .from(schema.conversations)
         .where(eq(schema.conversations.id, id))
@@ -156,6 +159,7 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
 
         // Update conversation timestamps — only for actually-sent messages
         // (not private notes, not scheduled-for-future).
+        let didAutoAssign = false;
         if (!body.isPrivateNote && !scheduled) {
           const convPatch: Record<string, unknown> = {
             lastMessageAt: now,
@@ -165,13 +169,25 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
           if (!conv.firstResponseAt) {
             convPatch.firstResponseAt = now;
           }
+          // Auto-assign on reply (Chatwoot parity): the agent who sends a
+          // reply into an unassigned conversation takes ownership. Skip when
+          // the conversation already has an assignee (user/team/bot) to not
+          // clobber explicit routing decisions.
+          if (
+            !conv.assignedUserId &&
+            !conv.assignedTeamId &&
+            !conv.assignedBotId
+          ) {
+            convPatch.assignedUserId = req.user.sub;
+            didAutoAssign = true;
+          }
           await tx
             .update(schema.conversations)
             .set(convPatch)
             .where(eq(schema.conversations.id, id));
         }
 
-        return msg;
+        return { msg, didAutoAssign };
       });
 
       const [senderRow] = await app.db
@@ -180,28 +196,40 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
         .where(eq(schema.users.id, req.user.sub))
         .limit(1);
 
+      const msg = result!.msg;
       eventBus.emitEvent({
         type: 'message.created',
         inboxId: conv.inboxId,
         conversationId: id,
         message: {
-          id: result!.id,
-          conversationId: result!.conversationId,
-          inboxId: result!.inboxId,
-          senderType: result!.senderType,
-          senderId: result!.senderId,
-          content: result!.content,
-          contentType: result!.contentType,
-          isPrivateNote: result!.isPrivateNote,
-          createdAt: result!.createdAt,
+          id: msg.id,
+          conversationId: msg.conversationId,
+          inboxId: msg.inboxId,
+          senderType: msg.senderType,
+          senderId: msg.senderId,
+          content: msg.content,
+          contentType: msg.contentType,
+          isPrivateNote: msg.isPrivateNote,
+          createdAt: msg.createdAt,
           sender: { name: senderRow?.name ?? null, email: req.user.email },
         },
       });
 
+      if (result!.didAutoAssign) {
+        eventBus.emitEvent({
+          type: 'conversation.assigned',
+          inboxId: conv.inboxId,
+          conversationId: id,
+          assignedUserId: req.user.sub,
+          assignedTeamId: null,
+          assignedBotId: null,
+        });
+      }
+
       // Channel dispatch — skip if scheduled (worker dispatches later) or private note.
       if (!body.isPrivateNote && !scheduled) {
-        void dispatchOutbound(app, id, result!.id).catch((err) => {
-          app.log.error({ err, messageId: result!.id }, 'outbound dispatch failed');
+        void dispatchOutbound(app, id, msg.id).catch((err) => {
+          app.log.error({ err, messageId: msg.id }, 'outbound dispatch failed');
         });
       }
 
@@ -212,8 +240,8 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
           .getQueue<ScheduledMessageJob>(QUEUE_NAMES.SCHEDULED_MESSAGE)
           .add(
             'publish',
-            { messageId: result!.id, conversationId: id },
-            { jobId: `msg-${result!.id}`, delay },
+            { messageId: msg.id, conversationId: id },
+            { jobId: `msg-${msg.id}`, delay },
           );
       }
 
@@ -233,7 +261,7 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
               mentionedUserIds: resolved.map((r) => r.userId).filter((u) => u !== req.user.sub),
               actorName: author?.name ?? req.user.email ?? 'Alguém',
               conversationId: id,
-              messageId: result!.id,
+              messageId: msg.id,
               preview: body.content,
             });
           } catch (err) {
@@ -247,7 +275,7 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
         .del(`draft:${id}:${req.user.sub}`)
         .catch((err) => app.log.warn({ err }, 'draft: failed to clear on send'));
 
-      return reply.code(201).send(publicMessage(result!));
+      return reply.code(201).send(publicMessage(msg));
     },
   );
 

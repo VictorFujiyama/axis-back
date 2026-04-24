@@ -125,7 +125,20 @@ export async function buildApp(): Promise<FastifyInstance> {
     credentials: true,
   });
   await app.register(sensible);
-  await app.register(rateLimit, { max: 100, timeWindow: '1 minute' });
+  // Global default — webhooks and chatty endpoints override this per-route.
+  // 100/min was far too low for an active agent: inbox polling, draft
+  // auto-save, counts, contact lookups and realtime refetches together blow
+  // past it in well under a minute per tab. Key by bearer token when present
+  // so one noisy agent doesn't starve another sharing an IP.
+  await app.register(rateLimit, {
+    max: 600,
+    timeWindow: '1 minute',
+    keyGenerator: (req) => {
+      const auth = req.headers.authorization;
+      if (auth?.startsWith('Bearer ')) return `jwt:${auth.slice(7, 40)}`;
+      return req.ip;
+    },
+  });
 
   if (config.NODE_ENV !== 'production') {
     await app.register(swagger, {
