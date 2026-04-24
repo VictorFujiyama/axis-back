@@ -141,4 +141,45 @@ export async function sendOutboundTelegram(
   throw new Error(`telegram ${res.status}: ${data.description ?? 'server error'}`);
 }
 
+/**
+ * Deletes a message the bot previously sent. Telegram's Bot API restricts this
+ * to ~48h after the message; older ones return 400 "message can't be deleted".
+ * Returns `{ ok: true }` on success, `{ ok: false, reason }` on permanent
+ * failure (400/403/404). 5xx/network errors throw so the caller can surface
+ * a user-visible error (no retry semantics here — it's a user action, not a job).
+ */
+export async function deleteTelegramMessage(
+  input: { chatId: string; channelMsgId: string; inboxId: string },
+  config: TelegramConfig,
+  secrets: TelegramSecrets,
+  { log }: { log: FastifyBaseLogger },
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!secrets.botToken) return { ok: false, reason: 'no botToken configured' };
+
+  const apiBase = (config.apiBase ?? 'https://api.telegram.org').replace(/\/$/, '');
+  const url = `${apiBase}/bot${encodeURIComponent(secrets.botToken)}/deleteMessage`;
+  const body = { chat_id: input.chatId, message_id: Number(input.channelMsgId) };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const data = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    description?: string;
+    error_code?: number;
+  };
+  if (res.ok && data.ok) return { ok: true };
+  if (res.status >= 400 && res.status < 500) {
+    log.warn(
+      { inboxId: input.inboxId, status: res.status, description: data.description },
+      'telegram.delete: 4xx (permanent)',
+    );
+    return { ok: false, reason: data.description ?? `telegram ${res.status}` };
+  }
+  throw new Error(`telegram ${res.status}: ${data.description ?? 'server error'}`);
+}
+
 export type { TelegramSecrets, TelegramConfig };

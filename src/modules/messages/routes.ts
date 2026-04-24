@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { canAccessConversation } from '../conversations/access';
+import { deleteMessageUpstream, deleteCapabilityForChannel } from './delete-upstream';
 import { eventBus } from '../../realtime/event-bus';
 import { lastInboundChannelMsgId } from '../channels/email-sender';
 import { QUEUE_NAMES, type EmailOutboundJob, type WhatsAppOutboundJob, type TelegramOutboundJob, type TwilioMetaOutboundJob, type ScheduledMessageJob } from '../../queue';
@@ -279,11 +280,16 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
+  const deleteQuery = z.object({
+    scope: z.enum(['me', 'everyone']).default('me'),
+  });
+
   app.delete(
     '/api/v1/messages/:id',
     { preHandler: app.requireAuth },
     async (req, reply) => {
       const { id } = idParams.parse(req.params);
+      const { scope } = deleteQuery.parse(req.query ?? {});
 
       const [msg] = await app.db
         .select({
@@ -305,7 +311,39 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
         return reply.forbidden('Só é possível deletar mensagens enviadas por você');
       }
 
-      await app.db.delete(schema.messages).where(eq(schema.messages.id, id));
+      // For scope=everyone, first try to remove the message on the customer's
+      // side. If the provider refuses (out of window, unsupported), surface a
+      // 400 to the agent so they can fall back to scope=me.
+      if (scope === 'everyone') {
+        const result = await deleteMessageUpstream(app, id);
+        if (!result.ok) {
+          return reply.code(400).send({ error: result.reason });
+        }
+      }
+
+      const [fullMsg] = await app.db
+        .select()
+        .from(schema.messages)
+        .where(eq(schema.messages.id, id))
+        .limit(1);
+      if (!fullMsg) return reply.notFound();
+
+      const nextMeta = {
+        ...((fullMsg.metadata as Record<string, unknown> | null) ?? {}),
+        deleted: true,
+        deletedScope: scope,
+      };
+
+      await app.db
+        .update(schema.messages)
+        .set({
+          content: 'Esta mensagem foi excluída',
+          contentType: 'text',
+          mediaUrl: null,
+          mediaMimeType: null,
+          metadata: nextMeta,
+        })
+        .where(eq(schema.messages.id, id));
 
       eventBus.emitEvent({
         type: 'message.deleted',
@@ -315,6 +353,43 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
       });
 
       return reply.code(204).send();
+    },
+  );
+
+  // Lightweight capability probe — lets the UI decide whether to show the
+  // "delete for everyone" option based on the channel + message age.
+  app.get(
+    '/api/v1/messages/:id/delete-capabilities',
+    { preHandler: app.requireAuth },
+    async (req, reply) => {
+      const { id } = idParams.parse(req.params);
+      const [row] = await app.db
+        .select({
+          conversationId: schema.messages.conversationId,
+          createdAt: schema.messages.createdAt,
+          channelType: schema.inboxes.channelType,
+          senderId: schema.messages.senderId,
+          senderType: schema.messages.senderType,
+        })
+        .from(schema.messages)
+        .innerJoin(schema.inboxes, eq(schema.inboxes.id, schema.messages.inboxId))
+        .where(eq(schema.messages.id, id))
+        .limit(1);
+      if (!row) return reply.notFound();
+      if (!(await canAccessConversation(app, req.user, row.conversationId))) {
+        return reply.forbidden();
+      }
+      const isMine = row.senderType === 'user' && row.senderId === req.user.sub;
+      if (!isMine) return reply.send({ canDeleteForMe: false, canDeleteForEveryone: false });
+
+      const cap = deleteCapabilityForChannel(row.channelType);
+      const withinWindow =
+        !cap.maxAgeMs || Date.now() - row.createdAt.getTime() <= cap.maxAgeMs;
+      return reply.send({
+        canDeleteForMe: true,
+        canDeleteForEveryone: cap.supported && withinWindow,
+        channelType: row.channelType,
+      });
     },
   );
 }
