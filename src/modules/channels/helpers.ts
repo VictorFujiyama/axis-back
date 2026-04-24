@@ -101,6 +101,21 @@ export async function ingestIncomingMessage(
     }
   }
 
+  // Resolve the inbox's accountId so persisted rows (contact, conversation)
+  // are scoped to the same tenant as the inbox. Without this, conversations
+  // get NULL account_id and disappear from the listing endpoint which always
+  // filters by req.user.accountId. Also guards against a webhook arriving
+  // after the inbox was soft-deleted — we refuse rather than persist orphans.
+  const [inboxRow] = await db
+    .select({ accountId: schema.inboxes.accountId, deletedAt: schema.inboxes.deletedAt })
+    .from(schema.inboxes)
+    .where(eq(schema.inboxes.id, input.inboxId))
+    .limit(1);
+  if (!inboxRow || inboxRow.deletedAt || !inboxRow.accountId) {
+    throw new Error(`inbox ${input.inboxId} not found or missing accountId`);
+  }
+  const accountId = inboxRow.accountId;
+
   const result = await db.transaction(async (tx) => {
     // 1. Find or create contact identity
     const [identity] = await tx
@@ -132,6 +147,7 @@ export async function ingestIncomingMessage(
           name: input.from.name,
           email: input.from.email,
           phone: input.from.phone,
+          accountId,
         })
         .returning({ id: schema.contacts.id });
       if (!contact) throw new Error('contact insert failed');
@@ -251,6 +267,7 @@ export async function ingestIncomingMessage(
         .values({
           contactId,
           inboxId: input.inboxId,
+          accountId,
           // Bot-managed conversations start as 'pending' — invisible to human agents
           // until the bot hands off or fails.
           status: resolvedBotId ? 'pending' : 'open',
@@ -269,6 +286,7 @@ export async function ingestIncomingMessage(
       .values({
         conversationId,
         inboxId: input.inboxId,
+        accountId,
         senderType: 'contact',
         senderId: contactId,
         content: input.content,

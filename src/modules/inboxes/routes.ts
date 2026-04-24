@@ -2,6 +2,7 @@ import { and, eq, inArray, isNull } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
+import { config as appConfig } from '../../config';
 import { decryptJSON, encryptJSON } from '../../crypto';
 import { writeAudit } from '../../lib/audit';
 import {
@@ -11,6 +12,7 @@ import {
   setTelegramWebhook,
   telegramWebhookUrl,
 } from '../channels/telegram-setup';
+import { setTwilioWebhook, twilioWebhookUrl } from '../channels/twilio-setup';
 
 const channelTypes = [
   'whatsapp',
@@ -47,6 +49,25 @@ const memberBody = z.object({
 
 // Public representation — omit encrypted secrets blob and indicate configured.
 function publicInbox(row: typeof schema.inboxes.$inferSelect) {
+  const config = (row.config ?? {}) as Record<string, unknown>;
+  const provider = typeof config.provider === 'string' ? config.provider : undefined;
+  const webhookAutoConfigured = config.webhookAutoConfigured === true;
+
+  // Callback URL the user needs to paste into the channel provider (Twilio,
+  // etc). Null when PUBLIC_API_URL is unset or when the channel has no
+  // inbound webhook (bot channels handle it internally).
+  let callbackWebhookUrl: string | null = null;
+  if (appConfig.PUBLIC_API_URL) {
+    const base = appConfig.PUBLIC_API_URL.replace(/\/$/, '');
+    if (row.channelType === 'whatsapp' && (provider === 'twilio' || !provider)) {
+      callbackWebhookUrl = `${base}/webhooks/whatsapp/${row.id}`;
+    } else if (row.channelType === 'sms') {
+      callbackWebhookUrl = `${base}/webhooks/sms/${row.id}`;
+    } else if (row.channelType === 'telegram') {
+      callbackWebhookUrl = `${base}/webhooks/telegram/${row.id}`;
+    }
+  }
+
   return {
     id: row.id,
     name: row.name,
@@ -55,6 +76,8 @@ function publicInbox(row: typeof schema.inboxes.$inferSelect) {
     defaultBotId: row.defaultBotId,
     enabled: row.enabled,
     secretsConfigured: row.secrets !== null,
+    callbackWebhookUrl,
+    webhookAutoConfigured,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -151,7 +174,7 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
-      const [inbox] = await app.db
+      let [inbox] = await app.db
         .insert(schema.inboxes)
         .values({
           name: resolvedName,
@@ -171,6 +194,65 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
         },
         { db: app.db, log: app.log },
       );
+
+      // For Twilio channels (whatsapp/sms), hit the Twilio REST API to point
+      // the inbound webhook at our server — mirrors Chatwoot's
+      // Twilio::WebhookSetupService. Awaited so the API response reflects the
+      // actual config state; finish page branches on `webhookAutoConfigured`.
+      if (
+        (body.channelType === 'whatsapp' || body.channelType === 'sms') &&
+        typeof secrets.authToken === 'string'
+      ) {
+        const provider = (config.provider as string | undefined) ?? 'twilio';
+        if (provider === 'twilio' && typeof config.accountSid === 'string') {
+          const webhookUrl = twilioWebhookUrl(body.channelType, inbox!.id);
+          if (!webhookUrl) {
+            app.log.warn(
+              { inboxId: inbox!.id, channel: body.channelType },
+              'twilio inbox created but PUBLIC_API_URL not set — webhook not registered',
+            );
+          } else {
+            const r = await setTwilioWebhook({
+              accountSid: config.accountSid,
+              authToken: secrets.authToken,
+              webhookUrl,
+              fromNumber:
+                typeof config.fromNumber === 'string' ? config.fromNumber : undefined,
+              messagingServiceSid:
+                typeof config.messagingServiceSid === 'string'
+                  ? config.messagingServiceSid
+                  : undefined,
+              channel: body.channelType,
+              log: app.log,
+            });
+            if (r.ok) {
+              app.log.info(
+                { inboxId: inbox!.id, target: r.target, webhookUrl },
+                'twilio webhook registered',
+              );
+              // Twilio already accepted the webhook — the response must reflect
+              // that even if the follow-up DB UPDATE fails. Reflect the truth
+              // in memory so the finish page shows the success banner; a failed
+              // UPDATE is logged and the caller (admin) can see the warning.
+              const updatedConfig = { ...config, webhookAutoConfigured: true };
+              try {
+                const [updated] = await app.db
+                  .update(schema.inboxes)
+                  .set({ config: updatedConfig })
+                  .where(eq(schema.inboxes.id, inbox!.id))
+                  .returning();
+                if (updated) inbox = updated;
+              } catch (err) {
+                app.log.error(
+                  { err, inboxId: inbox!.id },
+                  'twilio webhook configured but DB UPDATE failed — state drift',
+                );
+                inbox = { ...inbox!, config: updatedConfig };
+              }
+            }
+          }
+        }
+      }
 
       // Fire-and-forget: register webhook with Telegram so inbound messages
       // start flowing. If this fails (bad token, API down, PUBLIC_API_URL

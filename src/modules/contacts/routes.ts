@@ -66,6 +66,7 @@ const filterSchema = z.array(
 
 const listQuery = z.object({
   q: z.string().optional(),
+  ids: z.string().optional(),
   tagId: z.string().uuid().optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
@@ -145,6 +146,12 @@ export async function contactRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/v1/contacts', { preHandler: app.requireAuth }, async (req, reply) => {
     const query = listQuery.parse(req.query);
     const conditions = [isNull(schema.contacts.deletedAt), eq(schema.contacts.accountId, req.user.accountId)];
+
+    if (query.ids) {
+      const idList = query.ids.split(',').filter((id) => id.length > 0);
+      if (idList.length === 0) return { items: [], nextCursor: null };
+      conditions.push(inArray(schema.contacts.id, idList));
+    }
 
     if (query.q) {
       const like = `%${query.q.toLowerCase()}%`;

@@ -7,6 +7,7 @@ export const tags = pgTable('tags', {
   id: uuid('id').primaryKey().defaultRandom(),
   accountId: uuid('account_id').references(() => accounts.id, { onDelete: 'cascade' }),
   name: text('name').notNull().unique(),
+  description: text('description'),
   color: text('color').notNull().default('#7b3fa9'),
   showOnSidebar: boolean('show_on_sidebar').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),

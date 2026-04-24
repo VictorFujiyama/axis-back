@@ -7,12 +7,14 @@ const HEX_COLOR = /^#[0-9A-Fa-f]{6}$/;
 
 const createBody = z.object({
   name: z.string().min(1).max(60).transform((v) => v.trim().toLowerCase()),
+  description: z.string().max(255).optional(),
   color: z.string().regex(HEX_COLOR).default('#7b3fa9'),
   showOnSidebar: z.boolean().default(false),
 });
 
 const updateBody = z.object({
   name: z.string().min(1).max(60).optional(),
+  description: z.string().max(255).optional(),
   color: z.string().regex(HEX_COLOR).optional(),
   showOnSidebar: z.boolean().optional(),
 });
@@ -34,7 +36,7 @@ export async function tagRoutes(app: FastifyInstance): Promise<void> {
       try {
         const [tag] = await app.db
           .insert(schema.tags)
-          .values({ name: body.name, color: body.color, showOnSidebar: body.showOnSidebar, accountId: req.user.accountId })
+          .values({ name: body.name, description: body.description ?? null, color: body.color, showOnSidebar: body.showOnSidebar, accountId: req.user.accountId })
           .returning();
         return reply.code(201).send(tag);
       } catch (err) {
@@ -54,6 +56,7 @@ export async function tagRoutes(app: FastifyInstance): Promise<void> {
       const body = updateBody.parse(req.body);
       const patch: Record<string, unknown> = {};
       if (body.name !== undefined) patch.name = body.name.trim().toLowerCase();
+      if (body.description !== undefined) patch.description = body.description;
       if (body.color !== undefined) patch.color = body.color;
       if (body.showOnSidebar !== undefined) patch.showOnSidebar = body.showOnSidebar;
       const [tag] = await app.db

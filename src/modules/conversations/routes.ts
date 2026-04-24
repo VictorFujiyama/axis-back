@@ -131,6 +131,13 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
             ORDER BY messages.created_at DESC
             LIMIT 1
           )`.as('last_message_is_note'),
+          lastMessageSenderType: sql<string | null>`(
+            SELECT sender_type FROM messages
+            WHERE messages.conversation_id = conversations.id
+              AND messages.sender_type != 'system'
+            ORDER BY messages.created_at DESC
+            LIMIT 1
+          )`.as('last_message_sender_type'),
         })
         .from(schema.conversations)
         .where(and(...conditions))
@@ -138,10 +145,51 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
         .limit(query.limit + 1);
 
       const hasMore = rows.length > query.limit;
-      const items = (hasMore ? rows.slice(0, query.limit) : rows).map((r) => ({
+      const page = hasMore ? rows.slice(0, query.limit) : rows;
+      const convIds = page.map((r) => r.conv.id);
+
+      // Batch-fetch tags for all conversations in one query
+      const tagRows = convIds.length > 0
+        ? await app.db
+            .select({
+              conversationId: schema.conversationTags.conversationId,
+              id: schema.tags.id,
+              name: schema.tags.name,
+              color: schema.tags.color,
+            })
+            .from(schema.conversationTags)
+            .innerJoin(schema.tags, eq(schema.tags.id, schema.conversationTags.tagId))
+            .where(inArray(schema.conversationTags.conversationId, convIds))
+        : [];
+
+      const tagsByConv: Record<string, { id: string; name: string; color: string }[]> = {};
+      for (const t of tagRows) {
+        (tagsByConv[t.conversationId] ??= []).push({ id: t.id, name: t.name, color: t.color });
+      }
+
+      // Batch-fetch unread counts (inbound messages with read_at IS NULL)
+      const unreadByConv: Record<string, number> = {};
+      if (convIds.length > 0) {
+        const unreadRows = await app.db.execute<{ conversation_id: string; cnt: string }>(sql`
+          select conversation_id, count(*)::text as cnt
+          from messages
+          where conversation_id in (${sql.join(convIds.map((c) => sql`${c}`), sql`, `)})
+            and sender_type = 'contact'
+            and read_at is null
+          group by conversation_id
+        `);
+        for (const row of unreadRows as unknown as Array<{ conversation_id: string; cnt: string }>) {
+          unreadByConv[row.conversation_id] = Number(row.cnt);
+        }
+      }
+
+      const items = page.map((r) => ({
         ...publicConversation(r.conv),
         lastMessageContent: r.lastMessageContent,
         lastMessageIsNote: !!r.lastMessageIsNote,
+        lastMessageSenderType: r.lastMessageSenderType ?? null,
+        tags: tagsByConv[r.conv.id] ?? [],
+        unreadCount: unreadByConv[r.conv.id] ?? 0,
       }));
       const last = items[items.length - 1];
       return {
@@ -160,6 +208,7 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
       const countsQuery = z.object({
         status: z.enum(['open', 'pending', 'resolved', 'snoozed']).optional(),
         inboxId: z.string().uuid().optional(),
+        tagId: z.string().uuid().optional(),
       });
       const query = countsQuery.parse(req.query);
       const base = [isNull(schema.conversations.deletedAt), eq(schema.conversations.accountId, req.user.accountId)];
@@ -170,6 +219,14 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
       }
       if (query.status) base.push(eq(schema.conversations.status, query.status));
       if (query.inboxId) base.push(eq(schema.conversations.inboxId, query.inboxId));
+      if (query.tagId) {
+        const tagged = await app.db
+          .select({ id: schema.conversationTags.conversationId })
+          .from(schema.conversationTags)
+          .where(eq(schema.conversationTags.tagId, query.tagId));
+        if (tagged.length === 0) return { mine: 0, unassigned: 0, all: 0 };
+        base.push(inArray(schema.conversations.id, tagged.map((t) => t.id)));
+      }
 
       const runCount = async (extra: ReturnType<typeof and>[]) => {
         const [row] = await app.db
@@ -450,6 +507,29 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
         );
 
       return publicConversation(conv);
+    },
+  );
+
+  // Mark inbound messages as read
+  app.post(
+    '/api/v1/conversations/:id/read',
+    { preHandler: app.requireAuth },
+    async (req, reply) => {
+      const { id } = idParams.parse(req.params);
+      if (!(await canAccessConversation(app, req.user, id))) {
+        return reply.forbidden();
+      }
+      await app.db
+        .update(schema.messages)
+        .set({ readAt: new Date() })
+        .where(
+          and(
+            eq(schema.messages.conversationId, id),
+            eq(schema.messages.senderType, 'contact'),
+            isNull(schema.messages.readAt),
+          ),
+        );
+      return reply.code(204).send();
     },
   );
 
