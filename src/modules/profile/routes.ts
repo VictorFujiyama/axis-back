@@ -70,7 +70,11 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
   // Mirrors Chatwoot's POST /api/v1/profile/availability.
   app.post(
     '/api/v1/profile/availability',
-    { preHandler: app.requireAuth },
+    {
+      preHandler: app.requireAuth,
+      // Each write fires a DB update + Redis write + account-wide WS broadcast.
+      config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    },
     async (req, reply) => {
       const body = availabilityBody.parse(req.body);
       // Reject cross-account writes — always scope to the account in the token.
@@ -104,7 +108,10 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
   // the socket drops (Chatwoot parity).
   app.post(
     '/api/v1/profile/auto_offline',
-    { preHandler: app.requireAuth },
+    {
+      preHandler: app.requireAuth,
+      config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    },
     async (req, reply) => {
       const body = autoOfflineBody.parse(req.body);
       if (body.profile.account_id !== req.user.accountId) {

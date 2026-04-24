@@ -286,7 +286,13 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
 
   app.delete(
     '/api/v1/messages/:id',
-    { preHandler: app.requireAuth },
+    {
+      preHandler: app.requireAuth,
+      // Each scope=everyone delete triggers an upstream Telegram call with a
+      // 15s timeout. Cap per-user to keep a misbehaving client from burning
+      // the bot's rate budget on the provider.
+      config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    },
     async (req, reply) => {
       const { id } = idParams.parse(req.params);
       const { scope } = deleteQuery.parse(req.query ?? {});
@@ -360,7 +366,10 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
   // "delete for everyone" option based on the channel + message age.
   app.get(
     '/api/v1/messages/:id/delete-capabilities',
-    { preHandler: app.requireAuth },
+    {
+      preHandler: app.requireAuth,
+      config: { rateLimit: { max: 120, timeWindow: '1 minute' } },
+    },
     async (req, reply) => {
       const { id } = idParams.parse(req.params);
       const [row] = await app.db
