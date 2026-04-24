@@ -50,6 +50,18 @@ export type RealtimeEvent =
       messageId: string;
     }
   | {
+      type: 'message.updated';
+      inboxId: string;
+      conversationId: string;
+      messageId: string;
+      changes: Partial<{
+        deliveredAt: Date | null;
+        readAt: Date | null;
+        failedAt: Date | null;
+        failureReason: string | null;
+      }>;
+    }
+  | {
       type: 'typing.indicator';
       inboxId: string;
       conversationId: string;

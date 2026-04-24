@@ -124,8 +124,9 @@ async function updateWhatsAppSender(params: {
   authToken: string;
   senderSid: string;
   webhookUrl: string;
+  statusCallbackUrl: string;
 }): Promise<{ status: number; body: string }> {
-  const { accountSid, authToken, senderSid, webhookUrl } = params;
+  const { accountSid, authToken, senderSid, webhookUrl, statusCallbackUrl } = params;
   const url = `https://messaging.twilio.com/v2/Channels/Senders/${encodeURIComponent(senderSid)}`;
   const res = await fetch(url, {
     method: 'POST',
@@ -134,7 +135,14 @@ async function updateWhatsAppSender(params: {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      webhook: { callback_url: webhookUrl, callback_method: 'POST' },
+      webhook: {
+        callback_url: webhookUrl,
+        callback_method: 'POST',
+        // Delivery / read receipts land here so the message UI can flip the
+        // clock icon to a check without a page reload.
+        status_callback_url: statusCallbackUrl,
+        status_callback_method: 'POST',
+      },
     }),
     signal: AbortSignal.timeout(10_000),
   });
@@ -199,6 +207,7 @@ export async function setTwilioWebhook(
         authToken,
         senderSid: sid,
         webhookUrl,
+        statusCallbackUrl: `${webhookUrl}/status`,
       });
       if (r.status >= 200 && r.status < 300) {
         return { ok: true, target: 'whatsapp-sender' };

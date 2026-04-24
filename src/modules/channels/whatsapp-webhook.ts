@@ -7,6 +7,7 @@ import { config as appConfig } from '../../config';
 import { ingestWithHooks } from './post-ingest';
 import { parseWhatsAppSecrets, parseWhatsAppConfig } from './whatsapp-sender';
 import { verifyTwilioSignature } from './whatsapp-signature';
+import { eventBus } from '../../realtime/event-bus';
 
 const inboxParam = z.object({ inboxId: z.string().uuid() });
 
@@ -225,7 +226,7 @@ export async function whatsappChannelRoutes(app: FastifyInstance): Promise<void>
       if (Object.keys(patch).length > 0) {
         // Filter by inboxId too — matches the composite UNIQUE index
         // (inbox_id, channel_msg_id), so this is an index lookup, not a scan.
-        await app.db
+        const updated = await app.db
           .update(schema.messages)
           .set(patch)
           .where(
@@ -233,7 +234,28 @@ export async function whatsappChannelRoutes(app: FastifyInstance): Promise<void>
               eq(schema.messages.inboxId, inboxId),
               eq(schema.messages.channelMsgId, body.MessageSid),
             ),
-          );
+          )
+          .returning({
+            id: schema.messages.id,
+            conversationId: schema.messages.conversationId,
+          });
+        const row = updated[0];
+        if (row) {
+          // Notify clients so the "sending" clock flips to the sent/read check
+          // without waiting for a page reload.
+          eventBus.emitEvent({
+            type: 'message.updated',
+            inboxId,
+            conversationId: row.conversationId,
+            messageId: row.id,
+            changes: patch as {
+              deliveredAt?: Date;
+              readAt?: Date;
+              failedAt?: Date;
+              failureReason?: string;
+            },
+          });
+        }
       }
       return reply.code(204).send();
     },
