@@ -15,6 +15,10 @@ const listQuery = z.object({
   assigned: z.enum(['me', 'unassigned', 'all']).default('all'),
   inboxId: z.string().uuid().optional(),
   tagId: z.string().uuid().optional(),
+  // Secondary filter layered over status/assigned: 'mentions' narrows to
+  // conversations where the authenticated user has an active mention
+  // notification (private-note @mentions). Maps the "Menções" sidebar item.
+  filter: z.enum(['mentions']).optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
@@ -114,6 +118,23 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
         );
       }
 
+      if (query.filter === 'mentions') {
+        const mentioned = await app.db
+          .select({ id: schema.notifications.conversationId })
+          .from(schema.notifications)
+          .where(
+            and(
+              eq(schema.notifications.userId, req.user.sub),
+              eq(schema.notifications.type, 'mention'),
+            ),
+          );
+        const ids = mentioned
+          .map((m) => m.id)
+          .filter((id): id is string => id !== null);
+        if (ids.length === 0) return { items: [], nextCursor: null };
+        conditions.push(inArray(schema.conversations.id, ids));
+      }
+
       const rows = await app.db
         .select({
           conv: schema.conversations,
@@ -209,6 +230,7 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
         status: z.enum(['open', 'pending', 'resolved', 'snoozed']).optional(),
         inboxId: z.string().uuid().optional(),
         tagId: z.string().uuid().optional(),
+        filter: z.enum(['mentions']).optional(),
       });
       const query = countsQuery.parse(req.query);
       const base = [isNull(schema.conversations.deletedAt), eq(schema.conversations.accountId, req.user.accountId)];
@@ -226,6 +248,22 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
           .where(eq(schema.conversationTags.tagId, query.tagId));
         if (tagged.length === 0) return { mine: 0, unassigned: 0, all: 0 };
         base.push(inArray(schema.conversations.id, tagged.map((t) => t.id)));
+      }
+      if (query.filter === 'mentions') {
+        const mentioned = await app.db
+          .select({ id: schema.notifications.conversationId })
+          .from(schema.notifications)
+          .where(
+            and(
+              eq(schema.notifications.userId, req.user.sub),
+              eq(schema.notifications.type, 'mention'),
+            ),
+          );
+        const ids = mentioned
+          .map((m) => m.id)
+          .filter((id): id is string => id !== null);
+        if (ids.length === 0) return { mine: 0, unassigned: 0, all: 0 };
+        base.push(inArray(schema.conversations.id, ids));
       }
 
       const runCount = async (extra: ReturnType<typeof and>[]) => {

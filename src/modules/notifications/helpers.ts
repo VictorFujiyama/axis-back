@@ -20,14 +20,20 @@ export async function resolveMentions(
       or(
         inArray(sql`lower(split_part(${schema.users.email}, '@', 1))`, lowerTokens),
         inArray(sql`lower(${schema.users.name})`, lowerTokens),
+        // The composer inserts @NameWithoutSpaces so the regex can capture
+        // multi-word names as a single token. Match that form too.
+        inArray(sql`lower(regexp_replace(${schema.users.name}, '\\s+', '', 'g'))`, lowerTokens),
       )!,
     );
   const out: Array<{ userId: string; token: string; displayName: string }> = [];
   for (const u of users) {
     const localPart = u.email.split('@')[0]?.toLowerCase();
-    const matched = tokens.find(
-      (t) => t.toLowerCase() === localPart || t.toLowerCase() === u.name.toLowerCase(),
-    );
+    const nameLower = u.name.toLowerCase();
+    const nameNoSpace = nameLower.replace(/\s+/g, '');
+    const matched = tokens.find((t) => {
+      const low = t.toLowerCase();
+      return low === localPart || low === nameLower || low === nameNoSpace;
+    });
     if (matched) out.push({ userId: u.id, token: matched, displayName: u.name });
   }
   return out;
@@ -50,6 +56,8 @@ export async function createMentionNotifications(
       input.mentionedUserIds.map((userId) => ({
         userId,
         type: 'mention' as const,
+        conversationId: input.conversationId,
+        messageId: input.messageId,
         title: `${input.actorName} mencionou você`,
         body: input.preview.slice(0, 200),
         data: {

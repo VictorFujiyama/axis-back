@@ -155,6 +155,20 @@
       "when": 1776826068508,
       "tag": "0021_cold_the_watchers",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1777039332591,
+      "tag": "0022_robust_norrin_radd",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1777039665320,
+      "tag": "0023_volatile_frank_castle",
+      "breakpoints": true
     }
   ]
 }

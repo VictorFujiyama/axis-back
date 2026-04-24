@@ -1,5 +1,7 @@
 import { boolean, index, jsonb, pgEnum, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
 import { accounts } from './accounts';
+import { conversations } from './conversations';
+import { messages } from './messages';
 import { users } from './users';
 
 export const notificationTypeEnum = pgEnum('notification_type', [
@@ -20,6 +22,18 @@ export const notifications = pgTable(
     accountId: uuid('account_id').references(() => accounts.id, { onDelete: 'cascade' }),
     userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
     type: notificationTypeEnum('type').notNull(),
+    // Denormalized from data.conversationId so the mentions filter can join
+    // without a JSONB extract. Nullable because future notification types
+    // (system-wide announcements) may not bind to a conversation.
+    conversationId: uuid('conversation_id').references(() => conversations.id, {
+      onDelete: 'cascade',
+    }),
+    // For mention notifications: FK to the exact private note the mention
+    // originated from. CASCADE so a deleted message doesn't leave stale
+    // entries in the "Menções" sidebar list.
+    messageId: uuid('message_id').references(() => messages.id, {
+      onDelete: 'cascade',
+    }),
     title: text('title').notNull(),
     body: text('body'),
     data: jsonb('data').notNull().default({}),
@@ -29,6 +43,7 @@ export const notifications = pgTable(
   (t) => [
     index('notifications_user_unread_idx').on(t.userId, t.readAt),
     index('notifications_user_created_idx').on(t.userId, t.createdAt),
+    index('notifications_user_type_conv_idx').on(t.userId, t.type, t.conversationId),
   ],
 );
 
