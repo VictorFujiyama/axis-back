@@ -67,6 +67,12 @@ export type RealtimeEvent =
       conversationId: string;
       userId: string;
       userName: string;
+    }
+  | {
+      type: 'presence.update';
+      accountId: string;
+      users: Record<string, 'online' | 'busy' | 'offline'>;
+      contacts: Record<string, 'online'>;
     };
 
 export interface RealtimeMessage {

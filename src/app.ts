@@ -11,12 +11,14 @@ import dbPlugin from './plugins/db';
 import redisPlugin from './plugins/redis';
 import jwtPlugin from './plugins/jwt';
 import queuePlugin from './plugins/queue';
+import presencePlugin from './plugins/presence';
 import { registerWorkers } from './queue/workers';
 import { registerAutomationEventHook } from './modules/automations/event-hook';
 import { healthRoutes } from './modules/health/routes';
 import { authRoutes } from './modules/auth/routes';
 import { accountRoutes } from './modules/accounts/routes';
 import { userRoutes } from './modules/users/routes';
+import { profileRoutes } from './modules/profile/routes';
 import { inboxRoutes } from './modules/inboxes/routes';
 import { tagRoutes } from './modules/tags/routes';
 import { contactRoutes } from './modules/contacts/routes';
@@ -154,6 +156,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(redisPlugin);
   await app.register(jwtPlugin);
   await app.register(queuePlugin);
+  await app.register(presencePlugin);
 
   // Register WebSocket plugin at root so multiple route plugins can declare WS endpoints.
   await app.register(websocket, {
@@ -170,6 +173,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(authRoutes);
   await app.register(accountRoutes);
   await app.register(userRoutes);
+  await app.register(profileRoutes);
   await app.register(inboxRoutes);
   await app.register(tagRoutes);
   await app.register(contactRoutes);

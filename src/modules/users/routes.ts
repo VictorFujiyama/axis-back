@@ -34,7 +34,7 @@ const updateBody = z.object({
 });
 
 const statusBody = z.object({
-  status: z.enum(['online', 'away', 'offline']),
+  status: z.enum(['online', 'busy', 'offline']),
 });
 
 const idParams = z.object({ id: z.string().uuid() });

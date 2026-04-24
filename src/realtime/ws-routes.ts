@@ -6,9 +6,27 @@ import { schema } from '@blossom/db';
 import type { UserRole } from '@blossom/shared-types';
 import { eventBus, type RealtimeEvent } from './event-bus';
 
+/**
+ * Reads the current users+contacts presence snapshot from Redis and broadcasts it
+ * to every socket subscribed to account:{id}. Mirrors Chatwoot's
+ * RoomChannel#broadcast_presence.
+ */
+export async function broadcastPresence(app: FastifyInstance, accountId: string): Promise<void> {
+  try {
+    const [users, contacts] = await Promise.all([
+      app.presence.getAvailableUsers(accountId),
+      app.presence.getAvailableContacts(accountId),
+    ]);
+    eventBus.emitEvent({ type: 'presence.update', accountId, users, contacts });
+  } catch (err) {
+    app.log.warn({ err, accountId }, 'broadcastPresence failed');
+  }
+}
+
 interface SocketCtx {
   userId: string;
   userName: string;
+  accountId: string;
   role: UserRole;
   inboxIds: Set<string>; // for agent ACL (snapshot — see review TODO)
   rooms: Set<string>;
@@ -46,6 +64,8 @@ function eventRoom(e: RealtimeEvent): string[] {
       return [`conversation:${e.conversationId}`, `inbox:${e.inboxId}`];
     case 'typing.indicator':
       return [`conversation:${e.conversationId}`, `inbox:${e.inboxId}`];
+    case 'presence.update':
+      return [`account:${e.accountId}`];
   }
 }
 
@@ -70,7 +90,14 @@ export async function realtimeRoutes(app: FastifyInstance): Promise<void> {
       socket.close(4401, 'missing token');
       return;
     }
-    let payload: { sub: string; email: string; role: UserRole; aud?: string; exp?: number };
+    let payload: {
+      sub: string;
+      email: string;
+      role: UserRole;
+      accountId?: string;
+      aud?: string;
+      exp?: number;
+    };
     try {
       payload = app.jwt.verify(token);
     } catch {
@@ -82,7 +109,7 @@ export async function realtimeRoutes(app: FastifyInstance): Promise<void> {
       socket.close(4403, 'wrong audience');
       return;
     }
-    if (!payload.sub || !payload.role) {
+    if (!payload.sub || !payload.role || !payload.accountId) {
       socket.close(4401, 'missing claims');
       return;
     }
@@ -104,9 +131,11 @@ export async function realtimeRoutes(app: FastifyInstance): Promise<void> {
     const ctx: SocketCtx = {
       userId: payload.sub,
       userName: userRow?.name ?? payload.email,
+      accountId: payload.accountId,
       role: payload.role,
       inboxIds: new Set(memberships.map((m) => m.inboxId)),
-      rooms: new Set([`user:${payload.sub}`]),
+      // Auto-subscribe to the account room so presence.update broadcasts reach this socket.
+      rooms: new Set([`user:${payload.sub}`, `account:${payload.accountId}`]),
       expiresAtMs,
       unsubscribe: () => {},
     };
@@ -131,6 +160,14 @@ export async function realtimeRoutes(app: FastifyInstance): Promise<void> {
 
     send({ type: 'hello', userId: ctx.userId, role: ctx.role });
 
+    // Register presence heartbeat + kick off an initial presence broadcast so
+    // every agent in this account sees the newcomer right away (Chatwoot does
+    // the same on RoomChannel#subscribed).
+    void app.presence
+      .updatePresence(ctx.accountId, 'User', ctx.userId)
+      .then(() => broadcastPresence(app, ctx.accountId))
+      .catch((err: unknown) => app.log.warn({ err }, 'presence bootstrap failed'));
+
     // Subscribe to event bus and forward filtered events.
     // Defer with setImmediate so emit() returns to caller fast (HTTP latency).
     ctx.unsubscribe = eventBus.onEvent((event) => {
@@ -142,6 +179,13 @@ export async function realtimeRoutes(app: FastifyInstance): Promise<void> {
         if (rooms.some((r) => ctx.rooms.has(r))) {
           setImmediate(() => send(event));
         }
+        return;
+      }
+      // Presence is account-scoped; room ACL alone is enough since only
+      // same-account sockets auto-subscribe to account:{id}.
+      if (event.type === 'presence.update') {
+        if (event.accountId !== ctx.accountId) return;
+        setImmediate(() => send(event));
         return;
       }
       if (!canAccessInbox(ctx, event.inboxId)) return;
@@ -249,11 +293,22 @@ export async function realtimeRoutes(app: FastifyInstance): Promise<void> {
       } catch {
         clearInterval(ping);
       }
+      // Refresh presence TTL in Redis (no broadcast on every ping — that would
+      // be O(N²) traffic per account; we only broadcast on real state changes).
+      void app.presence
+        .updatePresence(ctx.accountId, 'User', ctx.userId)
+        .catch((err: unknown) => app.log.warn({ err }, 'presence heartbeat failed'));
     }, 30_000);
 
     socket.on('close', () => {
       ctx.unsubscribe();
       clearInterval(ping);
+      // Broadcast so other agents get a fresh snapshot. We do NOT remove the
+      // user's presence score here — with multi-tab usage the other tabs' zadd
+      // keeps them online. If this was the last tab, TTL evicts them in ~20s.
+      void broadcastPresence(app, ctx.accountId).catch((err: unknown) =>
+        app.log.warn({ err }, 'presence close broadcast failed'),
+      );
     });
   });
 }

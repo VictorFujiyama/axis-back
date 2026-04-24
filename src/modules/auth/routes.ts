@@ -92,6 +92,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         accountId: schema.accountUsers.accountId,
         role: schema.accountUsers.role,
         accountName: schema.accounts.name,
+        availability: schema.accountUsers.availability,
+        autoOffline: schema.accountUsers.autoOffline,
       })
       .from(schema.accountUsers)
       .innerJoin(schema.accounts, eq(schema.accountUsers.accountId, schema.accounts.id))
@@ -121,6 +123,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           avatarUrl: user.avatarUrl,
           accountId: membership.accountId,
           accountName: membership.accountName,
+          accounts: accountMemberships.map((m) => ({
+            id: m.accountId,
+            name: m.accountName,
+            role: m.role,
+            availability: m.availability,
+            auto_offline: m.autoOffline,
+          })),
         },
       });
     }
@@ -159,22 +168,19 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
     const userId = decoded.sub;
 
-    const [membership] = await app.db
+    const memberships = await app.db
       .select({
         accountId: schema.accountUsers.accountId,
         role: schema.accountUsers.role,
         accountName: schema.accounts.name,
+        availability: schema.accountUsers.availability,
+        autoOffline: schema.accountUsers.autoOffline,
       })
       .from(schema.accountUsers)
       .innerJoin(schema.accounts, eq(schema.accountUsers.accountId, schema.accounts.id))
-      .where(
-        and(
-          eq(schema.accountUsers.userId, userId),
-          eq(schema.accountUsers.accountId, body.accountId),
-        ),
-      )
-      .limit(1);
+      .where(eq(schema.accountUsers.userId, userId));
 
+    const membership = memberships.find((m) => m.accountId === body.accountId);
     if (!membership) {
       return reply.forbidden('User is not a member of this account');
     }
@@ -208,6 +214,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         avatarUrl: user.avatarUrl,
         accountId: membership.accountId,
         accountName: membership.accountName,
+        accounts: memberships.map((m) => ({
+          id: m.accountId,
+          name: m.accountName,
+          role: m.role,
+          availability: m.availability,
+          auto_offline: m.autoOffline,
+        })),
       },
     });
   });
@@ -218,22 +231,19 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const body = switchAccountBody.parse(req.body);
 
-      const [membership] = await app.db
+      const memberships = await app.db
         .select({
           accountId: schema.accountUsers.accountId,
           role: schema.accountUsers.role,
           accountName: schema.accounts.name,
+          availability: schema.accountUsers.availability,
+          autoOffline: schema.accountUsers.autoOffline,
         })
         .from(schema.accountUsers)
         .innerJoin(schema.accounts, eq(schema.accountUsers.accountId, schema.accounts.id))
-        .where(
-          and(
-            eq(schema.accountUsers.userId, req.user.sub),
-            eq(schema.accountUsers.accountId, body.accountId),
-          ),
-        )
-        .limit(1);
+        .where(eq(schema.accountUsers.userId, req.user.sub));
 
+      const membership = memberships.find((m) => m.accountId === body.accountId);
       if (!membership) {
         return reply.forbidden('User is not a member of this account');
       }
@@ -267,6 +277,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           avatarUrl: user.avatarUrl,
           accountId: membership.accountId,
           accountName: membership.accountName,
+          accounts: memberships.map((m) => ({
+            id: m.accountId,
+            name: m.accountName,
+            role: m.role,
+            availability: m.availability,
+            auto_offline: m.autoOffline,
+          })),
         },
       });
     },
@@ -354,12 +371,14 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           accountId: schema.accountUsers.accountId,
           role: schema.accountUsers.role,
           accountName: schema.accounts.name,
+          availability: schema.accountUsers.availability,
+          autoOffline: schema.accountUsers.autoOffline,
         })
         .from(schema.accountUsers)
         .innerJoin(schema.accounts, eq(schema.accountUsers.accountId, schema.accounts.id))
         .where(eq(schema.accountUsers.userId, user.id));
 
-      const currentMembership = memberships.find(m => m.accountId === req.user.accountId);
+      const currentMembership = memberships.find((m) => m.accountId === req.user.accountId);
 
       return reply.send({
         id: user.id,
@@ -370,10 +389,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         avatarUrl: user.avatarUrl,
         accountId: req.user.accountId,
         accountName: currentMembership?.accountName ?? '',
-        accounts: memberships.map(m => ({
+        accounts: memberships.map((m) => ({
           id: m.accountId,
           name: m.accountName,
           role: m.role,
+          availability: m.availability,
+          auto_offline: m.autoOffline,
         })),
       });
     },

@@ -1,5 +1,5 @@
 export type UserRole = 'admin' | 'supervisor' | 'agent';
-export type UserStatus = 'online' | 'away' | 'offline';
+export type UserStatus = 'online' | 'busy' | 'offline';
 
 export type ChannelType =
   | 'whatsapp'

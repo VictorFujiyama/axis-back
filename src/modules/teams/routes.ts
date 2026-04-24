@@ -176,7 +176,7 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
         .innerJoin(schema.users, eq(schema.users.id, schema.teamMembers.userId))
         .where(eq(schema.teamMembers.teamId, id))
         .orderBy(schema.teamMembers.userId);
-      const online = members.filter((m) => m.status === 'online' || m.status === 'away');
+      const online = members.filter((m) => m.status === 'online');
       const pool = online.length > 0 ? online : members;
       let chosen: string | null = null;
       if (pool.length > 0) {

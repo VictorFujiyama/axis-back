@@ -176,6 +176,13 @@
       "when": 1777046510745,
       "tag": "0024_orange_juggernaut",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1777047834245,
+      "tag": "0025_cool_steel_serpent",
+      "breakpoints": true
     }
   ]
 }

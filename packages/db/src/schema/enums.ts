@@ -4,7 +4,7 @@ export const userRoleEnum = pgEnum('user_role', ['admin', 'supervisor', 'agent']
 
 export const accountStatusEnum = pgEnum('account_status', ['active', 'suspended']);
 
-export const userStatusEnum = pgEnum('user_status', ['online', 'away', 'offline']);
+export const userStatusEnum = pgEnum('user_status', ['online', 'busy', 'offline']);
 
 export const channelTypeEnum = pgEnum('channel_type', [
   'whatsapp',

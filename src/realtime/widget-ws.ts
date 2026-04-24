@@ -105,6 +105,8 @@ export async function widgetWsRoutes(app: FastifyInstance): Promise<void> {
 
     // Single listener: learns new convs from visitor's own messages AND forwards replies.
     ctx.unsubscribe = eventBus.onEvent((event: RealtimeEvent) => {
+      // Presence events are agent-only; never leak to widget sockets.
+      if (event.type === 'presence.update') return;
       if (event.inboxId !== ctx.inboxId) return;
 
       if (event.type === 'message.created') {
