@@ -10,6 +10,9 @@ export type UploadResult = {
 
 const isProd = process.env.NODE_ENV === 'production';
 const bucketName = process.env.GCS_BUCKET_NAME;
+// Optional prefix appended before "uploads/" — used when sharing a bucket
+// with another app (e.g. GCS_PATH_PREFIX=axis writes to tenetimages/axis/uploads/...).
+const pathPrefix = process.env.GCS_PATH_PREFIX?.replace(/^\/|\/$/g, '') ?? '';
 
 let cachedBucket: Bucket | null = null;
 
@@ -63,7 +66,7 @@ async function uploadLocal(buffer: Buffer, key: string): Promise<UploadResult> {
 }
 
 async function uploadGcs(buffer: Buffer, key: string, contentType: string): Promise<UploadResult> {
-  const objectKey = `uploads/${key}`;
+  const objectKey = pathPrefix ? `${pathPrefix}/uploads/${key}` : `uploads/${key}`;
   const file = getBucket().file(objectKey);
   await file.save(buffer, {
     contentType,

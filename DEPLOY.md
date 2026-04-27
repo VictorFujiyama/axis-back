@@ -111,7 +111,8 @@ Na aba **Environment** do serviço `axis-back`, adicionar (todas como Secret qua
 | `ENCRYPTION_KEY` | gerado em passo 0 | ✅ CRÍTICO |
 | `CORS_ORIGINS` | `https://axis-front.onrender.com` (ou domínio real depois) | ❌ |
 | `PUBLIC_API_URL` | `https://axis-back.onrender.com` (ou domínio real depois) | ❌ |
-| `GCS_BUCKET_NAME` | `axis-files` (ou `blossom-axis-files`) | ❌ |
+| `GCS_BUCKET_NAME` | `axis-files` (ou `tenetimages` se compartilhar) | ❌ |
+| `GCS_PATH_PREFIX` | vazio se bucket dedicado, `axis` se compartilhar com Tenet | ❌ |
 | `GOOGLE_APPLICATION_CREDENTIALS_JSON` | conteúdo inteiro do JSON da service account, em uma linha | ✅ |
 | `OPENAI_API_KEY` | sua chave | ✅ |
 | `ANTHROPIC_API_KEY` | sua chave | ✅ |
