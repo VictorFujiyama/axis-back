@@ -1,4 +1,4 @@
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
@@ -32,13 +32,13 @@ export async function slaRoutes(app: FastifyInstance): Promise<void> {
           resolvedAt: schema.conversations.resolvedAt,
         })
         .from(schema.conversations)
-        .where(and(sql`${schema.conversations.id} = ANY(${body.ids})`, eq(schema.conversations.accountId, req.user.accountId)));
+        .where(and(inArray(schema.conversations.id, body.ids), eq(schema.conversations.accountId, req.user.accountId)));
       if (convs.length === 0) return {};
       const inboxIds = Array.from(new Set(convs.map((c) => c.inboxId)));
       const inboxes = await app.db
         .select({ id: schema.inboxes.id, config: schema.inboxes.config })
         .from(schema.inboxes)
-        .where(sql`${schema.inboxes.id} = ANY(${inboxIds})`);
+        .where(inArray(schema.inboxes.id, inboxIds));
       const cfgByInbox = new Map<string, SlaConfig | undefined>();
       for (const i of inboxes) {
         cfgByInbox.set(i.id, (i.config as { sla?: SlaConfig } | null)?.sla);

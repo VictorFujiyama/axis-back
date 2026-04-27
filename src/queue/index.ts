@@ -7,10 +7,16 @@ import { config } from '../config';
  * We share the connection options and create new instances per worker.
  */
 function makeConnection(): ConnectionOptions {
-  // BullMQ requires maxRetriesPerRequest=null on the connection used by workers
+  // BullMQ requires maxRetriesPerRequest=null on the connection used by workers.
+  // Carry through credentials and TLS from the URL — Upstash and other managed
+  // Redis providers reject unauthenticated TCP connections.
+  const u = new URL(config.REDIS_URL);
   return {
-    host: new URL(config.REDIS_URL).hostname,
-    port: Number(new URL(config.REDIS_URL).port || 6379),
+    host: u.hostname,
+    port: Number(u.port || 6379),
+    username: u.username || undefined,
+    password: u.password ? decodeURIComponent(u.password) : undefined,
+    tls: u.protocol === 'rediss:' ? {} : undefined,
     maxRetriesPerRequest: null,
   };
 }
