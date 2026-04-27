@@ -1,12 +1,12 @@
-import { createWriteStream } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join, extname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
 import type { FastifyInstance } from 'fastify';
+import { uploadFile, isGcsEnabled } from '../../lib/storage';
 
-const UPLOADS_DIR = join(import.meta.dirname, '..', '..', '..', 'uploads');
+const LOCAL_UPLOADS_DIR = join(import.meta.dirname, '..', '..', '..', 'uploads');
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
 
@@ -22,9 +22,6 @@ const ALLOWED_EXTENSIONS = new Set([
 ]);
 
 export async function uploadRoutes(app: FastifyInstance): Promise<void> {
-  // Ensure uploads directory exists.
-  await mkdir(UPLOADS_DIR, { recursive: true });
-
   // Multipart parser for file uploads.
   if (!app.hasContentTypeParser('multipart/form-data')) {
     await app.register(multipart, {
@@ -35,17 +32,21 @@ export async function uploadRoutes(app: FastifyInstance): Promise<void> {
     });
   }
 
-  // Serve uploaded files as static assets with security headers.
-  await app.register(fastifyStatic, {
-    root: UPLOADS_DIR,
-    prefix: '/uploads/',
-    decorateReply: false,
-    setHeaders(res) {
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.setHeader('Content-Security-Policy', "default-src 'none'");
-      res.setHeader('Content-Disposition', 'inline');
-    },
-  });
+  // Local filesystem fallback: only when GCS is not configured.
+  // Production must set GCS_BUCKET_NAME — see lib/storage.ts.
+  if (!isGcsEnabled()) {
+    await mkdir(LOCAL_UPLOADS_DIR, { recursive: true });
+    await app.register(fastifyStatic, {
+      root: LOCAL_UPLOADS_DIR,
+      prefix: '/uploads/',
+      decorateReply: false,
+      setHeaders(res) {
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Content-Security-Policy', "default-src 'none'");
+        res.setHeader('Content-Disposition', 'inline');
+      },
+    });
+  }
 
   // ====== POST /api/v1/upload ======
 
@@ -71,7 +72,6 @@ export async function uploadRoutes(app: FastifyInstance): Promise<void> {
         return reply.badRequest('Missing file field');
       }
 
-      // Validate extension.
       const originalName = uploaded.filename;
       const ext = extname(originalName).toLowerCase();
       if (!ext || !ALLOWED_EXTENSIONS.has(ext)) {
@@ -80,7 +80,6 @@ export async function uploadRoutes(app: FastifyInstance): Promise<void> {
         );
       }
 
-      // Read file into buffer (respects multipart fileSize limit).
       let buf: Buffer;
       try {
         buf = await uploaded.toBuffer();
@@ -88,25 +87,17 @@ export async function uploadRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(413).send({ error: 'File exceeds the 10 MB size limit' });
       }
 
-      // Double-check size (belt-and-suspenders — multipart limits should catch it).
       if (buf.length > MAX_FILE_SIZE) {
         return reply.code(413).send({ error: 'File exceeds the 10 MB size limit' });
       }
 
-      // Generate unique filename.
-      const uniqueName = `${randomUUID()}${ext}`;
-      const destPath = join(UPLOADS_DIR, uniqueName);
-
-      // Write to disk.
-      const ws = createWriteStream(destPath);
-      await new Promise<void>((resolve, reject) => {
-        ws.on('finish', resolve);
-        ws.on('error', reject);
-        ws.end(buf);
-      });
+      // Path includes accountId so each tenant's files are isolated and
+      // easy to audit/purge (LGPD right-to-erasure). UUID keeps URL unguessable.
+      const key = `${req.user.accountId}/${randomUUID()}${ext}`;
+      const result = await uploadFile(buf, key, uploaded.mimetype);
 
       return {
-        url: `/uploads/${uniqueName}`,
+        url: result.url,
         mimeType: uploaded.mimetype,
         originalName,
       };

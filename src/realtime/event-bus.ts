@@ -85,6 +85,7 @@ export interface RealtimeMessage {
   contentType: string;
   isPrivateNote: boolean;
   createdAt: Date;
+  sender?: { name: string | null; email?: string };
 }
 
 export interface RealtimeConversation {
@@ -92,6 +93,7 @@ export interface RealtimeConversation {
   inboxId: string;
   contactId: string;
   status: string;
+  priority?: string | null;
   assignedUserId: string | null;
   assignedTeamId: string | null;
   assignedBotId: string | null;

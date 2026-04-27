@@ -1,11 +1,13 @@
-import { Algorithm, hash, verify } from '@node-rs/argon2';
+import { hash, verify } from '@node-rs/argon2';
 
+// Argon2id = 2 (numeric value of @node-rs/argon2's const enum).
+// Avoid importing the const enum itself — incompatible with isolatedModules.
 const hashOptions = {
   memoryCost: 19456,
   timeCost: 2,
   parallelism: 1,
-  algorithm: Algorithm.Argon2id,
-};
+  algorithm: 2,
+} as const;
 
 export function hashPassword(plain: string): Promise<string> {
   return hash(plain, hashOptions);

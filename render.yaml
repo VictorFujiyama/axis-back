@@ -1,0 +1,41 @@
+# Render Blueprint — Axis Backend
+#
+# Postgres = Neon (external, set DATABASE_URL via dashboard).
+# Redis    = Upstash (external, set REDIS_URL via dashboard).
+# Storage  = GCS bucket (axis-files).
+#
+# All secrets are managed via the Render dashboard (Environment tab).
+# This file only declares non-secret defaults and the service shape.
+
+services:
+  - type: web
+    name: axis-back
+    runtime: docker
+    plan: starter
+    region: ohio
+    branch: main
+    healthCheckPath: /api/v1/health
+    autoDeploy: true
+    preDeployCommand: pnpm db:migrate
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3200
+      - key: HOST
+        value: 0.0.0.0
+      - key: LOG_LEVEL
+        value: info
+      # The following must be set in the Render dashboard:
+      #   DATABASE_URL                       (Neon postgres connection string)
+      #   REDIS_URL                          (Upstash redis connection string)
+      #   JWT_SECRET                         (64 hex chars)
+      #   ENCRYPTION_KEY                     (32 bytes base64) — CRITICAL, never lose
+      #   CORS_ORIGINS                       (https://app.<your-domain>)
+      #   PUBLIC_API_URL                     (https://api.<your-domain>)
+      #   GCS_BUCKET_NAME                    (axis-files)
+      #   GOOGLE_APPLICATION_CREDENTIALS_JSON (full service account JSON)
+      #   OPENAI_API_KEY
+      #   ANTHROPIC_API_KEY
+      #   SMTP_HOST / SMTP_USER / SMTP_PASS  (optional)
+      #   ENABLED_MODULES                    (e.g. logistica-acme)

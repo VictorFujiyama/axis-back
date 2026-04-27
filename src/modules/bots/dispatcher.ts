@@ -1,6 +1,6 @@
 import type { FastifyBaseLogger } from 'fastify';
 import { schema, type DB } from '@blossom/db';
-import { QUEUE_NAMES, type BotDispatchJob } from '../../queue';
+import { QUEUE_NAMES, type BotDispatchJob, type QueueName } from '../../queue';
 import type { Queue } from 'bullmq';
 
 export interface DispatchInput {
@@ -52,8 +52,8 @@ export function dispatchBot(input: DispatchInput, deps: DispatchDeps): void {
 }
 
 // Helper exported so callers in routes can resolve the queue from app instance:
-export function getBotQueue(app: { queues: { getQueue: (n: string) => Queue }}): Queue<BotDispatchJob> {
-  return app.queues.getQueue(QUEUE_NAMES.BOT_DISPATCH) as Queue<BotDispatchJob>;
+export function getBotQueue(app: { queues: { getQueue: <T = unknown>(name: QueueName) => Queue<T> } }): Queue<BotDispatchJob> {
+  return app.queues.getQueue<BotDispatchJob>(QUEUE_NAMES.BOT_DISPATCH);
 }
 
 // Touch unused symbol to avoid TS warning (keeps import for type narrowing future use).

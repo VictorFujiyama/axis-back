@@ -165,7 +165,7 @@ export async function campaignRoutes(app: FastifyInstance): Promise<void> {
         .where(eq(schema.inboxes.id, body.inboxId))
         .limit(1);
       if (!inbox) return { count: 0 };
-      const [{ count }] = await app.db
+      const countRows = await app.db
         .select({ count: sql<number>`count(distinct ${schema.contacts.id})::int` })
         .from(schema.contacts)
         .innerJoin(schema.contactTags, eq(schema.contactTags.contactId, schema.contacts.id))
@@ -181,7 +181,7 @@ export async function campaignRoutes(app: FastifyInstance): Promise<void> {
             isNull(schema.contacts.deletedAt),
           ),
         );
-      return { count };
+      return { count: countRows[0]?.count ?? 0 };
     },
   );
 

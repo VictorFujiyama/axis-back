@@ -486,7 +486,7 @@ export async function actionRoutes(app: FastifyInstance): Promise<void> {
         contactId: body.contactId ?? conv?.contactId ?? null,
         conversationId: body.conversationId ?? null,
         payload: { formData: cleanFormData, eventId },
-        response: response as Record<string, unknown>,
+        response: response as unknown as Record<string, unknown>,
         status,
         errorMessage: errorMessage ?? null,
         durationMs: String(durationMs),

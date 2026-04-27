@@ -157,6 +157,7 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
             accountId: req.user.accountId,
           })
           .returning();
+        if (!msg) throw new Error('Failed to insert message');
 
         // Update conversation timestamps — only for actually-sent messages
         // (not private notes, not scheduled-for-future).

@@ -67,7 +67,7 @@ export async function notificationRoutes(app: FastifyInstance): Promise<void> {
         };
       });
 
-      const [{ count: unread }] = await app.db
+      const unreadRows = await app.db
         .select({ count: sql<number>`count(*)::int` })
         .from(schema.notifications)
         .where(
@@ -77,6 +77,7 @@ export async function notificationRoutes(app: FastifyInstance): Promise<void> {
             isNull(schema.notifications.readAt),
           ),
         );
+      const unread = unreadRows[0]?.count ?? 0;
       return { items, unread };
     },
   );
