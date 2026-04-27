@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, inArray, isNotNull, isNull, lt, lte, or, sql } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
@@ -572,25 +572,44 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
-  // Mark inbound messages as read
+  // Mark inbound messages as read.
+  // Optional body { untilMessageId } scopes the read mark to messages created
+  // at or before that message — matches WhatsApp-style read-by-visibility,
+  // where we only mark read what the agent has actually scrolled into view.
+  // Without it, marks all unread inbound messages in the conversation.
   app.post(
     '/api/v1/conversations/:id/read',
     { preHandler: app.requireAuth },
     async (req, reply) => {
       const { id } = idParams.parse(req.params);
+      const body = z
+        .object({ untilMessageId: z.string().uuid().optional() })
+        .parse(req.body ?? {});
       if (!(await canAccessConversation(app, req.user, id))) {
         return reply.forbidden();
       }
-      await app.db
-        .update(schema.messages)
-        .set({ readAt: new Date() })
-        .where(
-          and(
-            eq(schema.messages.conversationId, id),
-            eq(schema.messages.senderType, 'contact'),
-            isNull(schema.messages.readAt),
-          ),
-        );
+
+      const conds = [
+        eq(schema.messages.conversationId, id),
+        eq(schema.messages.senderType, 'contact'),
+        isNull(schema.messages.readAt),
+      ];
+      if (body.untilMessageId) {
+        const [until] = await app.db
+          .select({ createdAt: schema.messages.createdAt })
+          .from(schema.messages)
+          .where(
+            and(
+              eq(schema.messages.id, body.untilMessageId),
+              eq(schema.messages.conversationId, id),
+            ),
+          )
+          .limit(1);
+        if (!until) return reply.badRequest('untilMessageId not in conversation');
+        conds.push(lte(schema.messages.createdAt, until.createdAt));
+      }
+
+      await app.db.update(schema.messages).set({ readAt: new Date() }).where(and(...conds));
       return reply.code(204).send();
     },
   );
