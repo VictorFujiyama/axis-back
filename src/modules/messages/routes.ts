@@ -465,6 +465,16 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
         return reply.conflict('Another retry is already in progress or state changed');
       }
 
+      // Tell open clients the failed bubble should clear immediately —
+      // otherwise the spinner stays until the status callback fires.
+      eventBus.emitEvent({
+        type: 'message.updated',
+        inboxId: msg.inboxId,
+        conversationId: msg.conversationId,
+        messageId: id,
+        changes: { failedAt: null, failureReason: null, deliveredAt: null },
+      });
+
       // Step 3: enqueue. We await so a dispatch failure (e.g. inbox missing)
       // is reported synchronously and we can roll back to a failed state —
       // otherwise the row would stay reset but with no job ever scheduled.
