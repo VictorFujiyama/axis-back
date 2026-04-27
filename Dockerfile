@@ -36,10 +36,11 @@ ENV NODE_ENV=production
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages ./packages
 COPY --from=build /app/modules ./modules
-COPY --from=build /app/dist ./dist
+COPY --from=build /app/src ./src
 COPY --from=build /app/package.json ./
 COPY --from=build /app/pnpm-workspace.yaml ./
 COPY --from=build /app/pnpm-lock.yaml ./
+COPY --from=build /app/tsconfig.base.json /app/tsconfig.json ./
 
 RUN addgroup -S axis && adduser -S axis -G axis
 USER axis
@@ -48,4 +49,7 @@ EXPOSE 3200
 
 # Run migrations on every start. Drizzle migrate is idempotent — fast no-op
 # when nothing's changed. Lets us deploy on Render Free tier (no preDeploy).
-CMD ["sh", "-c", "pnpm db:migrate && node dist/server.js"]
+# tsx (not node) at runtime: workspaces export .ts directly via package.json
+# "main" — building each workspace separately would be heavier than the cost
+# of tsx's transpile-on-load (irrelevant on free tier vs cold-start time).
+CMD ["sh", "-c", "pnpm db:migrate && pnpm start"]
