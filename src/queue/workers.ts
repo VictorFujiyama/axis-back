@@ -1,4 +1,5 @@
-import { eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
+import type { Worker } from 'bullmq';
 import type { FastifyInstance } from 'fastify';
 import { schema } from '@blossom/db';
 import { decryptJSON } from '../crypto';
@@ -32,6 +33,44 @@ import {
 } from '../modules/channels/twilio-shared';
 import { config as appConfig } from '../config';
 
+/**
+ * Mark `messages.failedAt` when a BullMQ outbound job exhausts all retries.
+ * The senders set failedAt themselves on permanent (4xx) failures and skip
+ * doing so on transient (5xx/network) ones — those throw and BullMQ retries.
+ * Without this handler, retries-exhausted messages stay in a "ghost" state
+ * (no failedAt, no channelMsgId) and the manual /retry endpoint can't act.
+ */
+function markFailedOnExhaust<T extends { messageId: string }>(
+  worker: Worker<T>,
+  app: FastifyInstance,
+  label: string,
+): void {
+  worker.on('failed', (job, err) => {
+    if (!job) return;
+    const maxAttempts = job.opts.attempts ?? 5;
+    if (job.attemptsMade < maxAttempts) return;
+    void app.db
+      .update(schema.messages)
+      .set({
+        failedAt: new Date(),
+        failureReason: `${label}: ${err.message?.slice(0, 480) ?? 'transient retries exhausted'}`,
+      })
+      .where(
+        and(
+          eq(schema.messages.id, job.data.messageId),
+          isNull(schema.messages.deliveredAt),
+          isNull(schema.messages.failedAt),
+        ),
+      )
+      .catch((e) => {
+        app.log.error(
+          { err: e, messageId: job.data.messageId },
+          `${label}: failed-to-mark-failed`,
+        );
+      });
+  });
+}
+
 export function registerWorkers(app: FastifyInstance): void {
   // Bot dispatcher worker — with fallback on final failure
   const botWorker = app.queues.registerWorker<BotDispatchJob>(
@@ -64,7 +103,7 @@ export function registerWorkers(app: FastifyInstance): void {
   });
 
   // Email outbound worker
-  app.queues.registerWorker<EmailOutboundJob>(
+  const emailWorker = app.queues.registerWorker<EmailOutboundJob>(
     QUEUE_NAMES.EMAIL_OUTBOUND,
     async (job) => {
       const data = job.data;
@@ -101,9 +140,10 @@ export function registerWorkers(app: FastifyInstance): void {
     },
     5,
   );
+  markFailedOnExhaust(emailWorker, app, 'email');
 
   // WhatsApp outbound worker
-  app.queues.registerWorker<WhatsAppOutboundJob>(
+  const whatsappWorker = app.queues.registerWorker<WhatsAppOutboundJob>(
     QUEUE_NAMES.WHATSAPP_OUTBOUND,
     async (job) => {
       const data = job.data;
@@ -143,9 +183,10 @@ export function registerWorkers(app: FastifyInstance): void {
     },
     5,
   );
+  markFailedOnExhaust(whatsappWorker, app, 'whatsapp');
 
   // Telegram outbound worker
-  app.queues.registerWorker<TelegramOutboundJob>(
+  const telegramWorker = app.queues.registerWorker<TelegramOutboundJob>(
     QUEUE_NAMES.TELEGRAM_OUTBOUND,
     async (job) => {
       const data = job.data;
@@ -181,13 +222,14 @@ export function registerWorkers(app: FastifyInstance): void {
     },
     10,
   );
+  markFailedOnExhaust(telegramWorker, app, 'telegram');
 
   // Instagram + Messenger outbound via Twilio — share the sender, differ only in prefix.
   for (const [queueName, prefix] of [
     [QUEUE_NAMES.INSTAGRAM_OUTBOUND, 'instagram'],
     [QUEUE_NAMES.MESSENGER_OUTBOUND, 'messenger'],
   ] as const) {
-    app.queues.registerWorker<TwilioMetaOutboundJob>(
+    const twilioMetaWorker = app.queues.registerWorker<TwilioMetaOutboundJob>(
       queueName,
       async (job) => {
         const data = job.data;
@@ -228,6 +270,7 @@ export function registerWorkers(app: FastifyInstance): void {
       },
       5,
     );
+    markFailedOnExhaust(twilioMetaWorker, app, prefix);
   }
 
   registerSnoozeWorker(app);

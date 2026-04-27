@@ -1,4 +1,4 @@
-import { and, asc, eq, gt } from 'drizzle-orm';
+import { and, asc, eq, gt, isNotNull, isNull } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
@@ -400,6 +400,92 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
         canDeleteForEveryone: cap.supported && withinWindow,
         channelType: row.channelType,
       });
+    },
+  );
+
+  // ====== POST /api/v1/messages/:id/retry ======
+  // Manual retry for failed outbound messages. Auto-retry (5 attempts with
+  // exponential backoff) is handled by BullMQ at enqueue time; this endpoint
+  // is for the case where all attempts exhausted and the agent wants another
+  // shot — typically after fixing whatever caused the failure (Twilio sender,
+  // contact phone, message template, etc.).
+  app.post(
+    '/api/v1/messages/:id/retry',
+    {
+      preHandler: app.requireAuth,
+      config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    },
+    async (req, reply) => {
+      const { id } = idParams.parse(req.params);
+
+      // Step 1: load row for auth + state checks. We re-validate state inside
+      // the conditional UPDATE below to defeat the race (two simultaneous
+      // retries) — this select is just for the friendly error responses.
+      const [msg] = await app.db
+        .select()
+        .from(schema.messages)
+        .where(eq(schema.messages.id, id))
+        .limit(1);
+      if (!msg) return reply.notFound();
+      // Auth check FIRST — don't leak existence/state of cross-tenant rows.
+      if (!(await canAccessConversation(app, req.user, msg.conversationId))) {
+        return reply.notFound();
+      }
+      if (msg.senderType !== 'user') {
+        return reply.badRequest('Only outbound messages can be retried');
+      }
+      if (msg.deliveredAt) {
+        return reply.conflict('Message was already delivered');
+      }
+      if (!msg.failedAt) {
+        return reply.conflict('Message is not in failed state');
+      }
+
+      // Step 2: claim the retry atomically. The WHERE clause ensures only
+      // one concurrent request resets the row; the loser sees rowCount=0
+      // and returns 409. This is our mutex against double Twilio submission.
+      const claimed = await app.db
+        .update(schema.messages)
+        .set({
+          failedAt: null,
+          failureReason: null,
+          channelMsgId: null,
+          deliveredAt: null,
+        })
+        .where(
+          and(
+            eq(schema.messages.id, id),
+            eq(schema.messages.senderType, 'user'),
+            isNotNull(schema.messages.failedAt),
+            isNull(schema.messages.deliveredAt),
+          ),
+        )
+        .returning();
+      if (claimed.length === 0) {
+        return reply.conflict('Another retry is already in progress or state changed');
+      }
+
+      // Step 3: enqueue. We await so a dispatch failure (e.g. inbox missing)
+      // is reported synchronously and we can roll back to a failed state —
+      // otherwise the row would stay reset but with no job ever scheduled.
+      try {
+        await dispatchOutbound(app, msg.conversationId, id);
+      } catch (err) {
+        app.log.error({ err, messageId: id }, 'manual retry: dispatch failed');
+        await app.db
+          .update(schema.messages)
+          .set({ failedAt: new Date(), failureReason: 'retry: dispatch failed' })
+          .where(eq(schema.messages.id, id));
+        return reply.code(500).send({ error: 'dispatch failed, retry again' });
+      }
+
+      const [updated] = await app.db
+        .select()
+        .from(schema.messages)
+        .where(eq(schema.messages.id, id))
+        .limit(1);
+      if (!updated) throw new Error('message vanished after retry update');
+      return publicMessage(updated);
     },
   );
 }

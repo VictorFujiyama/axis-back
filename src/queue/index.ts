@@ -125,8 +125,11 @@ export class QueueRegistry {
         new Queue(name, {
           connection: makeConnection(),
           defaultJobOptions: {
-            attempts: 4,
-            backoff: { type: 'exponential', delay: 1_000 },
+            // 5 attempts × exponential 5s = ~5s, 10s, 20s, 40s, 80s.
+            // Covers transient errors (provider rate limits, network blips,
+            // brief upstream outages) without the agent waiting forever.
+            attempts: 5,
+            backoff: { type: 'exponential', delay: 5_000 },
             removeOnComplete: { age: 3600, count: 1000 },
             removeOnFail: { age: 7 * 24 * 3600, count: 5000 },
           },
