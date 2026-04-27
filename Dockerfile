@@ -46,4 +46,6 @@ USER axis
 
 EXPOSE 3200
 
-CMD ["node", "dist/server.js"]
+# Run migrations on every start. Drizzle migrate is idempotent — fast no-op
+# when nothing's changed. Lets us deploy on Render Free tier (no preDeploy).
+CMD ["sh", "-c", "pnpm db:migrate && node dist/server.js"]

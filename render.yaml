@@ -11,12 +11,14 @@ services:
   - type: web
     name: axis-back
     runtime: docker
-    plan: starter
+    # Free plan sleeps after 15min idle and doesn't support preDeployCommand;
+    # migrations run from CMD (Dockerfile) instead. Upgrade to `starter` ($7)
+    # for always-on, no cold starts, and stable WebSocket connections.
+    plan: free
     region: ohio
     branch: main
     healthCheckPath: /api/v1/health
     autoDeploy: true
-    preDeployCommand: pnpm db:migrate
     envVars:
       - key: NODE_ENV
         value: production
