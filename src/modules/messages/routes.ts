@@ -277,7 +277,13 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
         .del(`draft:${id}:${req.user.sub}`)
         .catch((err) => app.log.warn({ err }, 'draft: failed to clear on send'));
 
-      return reply.code(201).send(publicMessage(msg));
+      // Include sender so the front renders the agent avatar immediately on
+       // optimistic insert; otherwise the row sits without sender info until
+      // a page reload (the realtime event that has it is deduped on arrival).
+      return reply.code(201).send({
+        ...publicMessage(msg),
+        sender: { name: senderRow?.name ?? null, email: req.user.email },
+      });
     },
   );
 
