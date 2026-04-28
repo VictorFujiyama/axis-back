@@ -10,7 +10,7 @@ export interface AccessTokenPayload {
   accountId: string;
 }
 
-const ACCESS_TTL = '2m';
+const ACCESS_TTL = '15m';
 const REFRESH_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 
 // Redis stores sha256(token) so a Redis dump doesn't leak usable tokens.
