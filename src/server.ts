@@ -14,7 +14,7 @@ async function main(): Promise<void> {
 
   try {
     await app.listen({ host: config.HOST, port: config.PORT });
-    app.log.info(`Blossom Inbox backend listening on http://${config.HOST}:${config.PORT}`);
+    app.log.info(`Axis Inbox backend listening on http://${config.HOST}:${config.PORT}`);
     app.log.info(`API docs: http://localhost:${config.PORT}/docs`);
   } catch (err) {
     app.log.error(err);

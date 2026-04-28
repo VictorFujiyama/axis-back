@@ -150,7 +150,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   if (config.NODE_ENV !== 'production') {
     await app.register(swagger, {
       openapi: {
-        info: { title: 'Blossom Inbox API', version: '0.0.1' },
+        info: { title: 'Axis Inbox API', version: '0.0.1' },
         servers: [{ url: `http://localhost:${config.PORT}` }],
       },
     });
