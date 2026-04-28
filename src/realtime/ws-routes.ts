@@ -28,7 +28,7 @@ interface SocketCtx {
   userName: string;
   accountId: string;
   role: UserRole;
-  inboxIds: Set<string>; // for agent ACL (snapshot — see review TODO)
+  inboxIds: Set<string>; // for agent ACL — refreshed on auth.refresh
   rooms: Set<string>;
   expiresAtMs: number;
   unsubscribe: () => void;
@@ -45,6 +45,13 @@ const subscribeMsg = z.object({
 const typingMsg = z.object({
   type: z.literal('typing'),
   conversationId: z.string().min(1).max(80),
+});
+
+// Lets a long-lived socket pick up a freshly refreshed access token without
+// being torn down — extends ctx.expiresAtMs so the next ping doesn't kill it.
+const authRefreshMsg = z.object({
+  action: z.literal('auth.refresh'),
+  token: z.string().min(20).max(4096),
 });
 
 function eventRoom(e: RealtimeEvent): string[] {
@@ -115,7 +122,8 @@ export async function realtimeRoutes(app: FastifyInstance): Promise<void> {
     }
     const expiresAtMs = (payload.exp ?? 0) * 1000;
 
-    // Load the user's name and inbox memberships once (snapshot — refreshed on reconnect).
+    // Load the user's name and inbox memberships once. Memberships also
+    // refresh on every auth.refresh so privilege changes propagate mid-session.
     const [memberships, userRow] = await Promise.all([
       app.db
         .select({ inboxId: schema.inboxMembers.inboxId })
@@ -201,6 +209,72 @@ export async function realtimeRoutes(app: FastifyInstance): Promise<void> {
         parsed = JSON.parse(raw.toString());
       } catch {
         send({ type: 'error', message: 'invalid json' });
+        return;
+      }
+
+      // Token rotation on a live socket: validate the new access token, then
+      // refuse it if it represents a different identity. Keeps the connection
+      // open through the 15min access TTL without forcing a reconnect. We also
+      // refresh the role + inbox ACL snapshot here so privilege changes
+      // (demotion, removal from inbox) propagate without needing the user to
+      // close the tab.
+      const authResult = authRefreshMsg.safeParse(parsed);
+      if (authResult.success) {
+        const nextToken = authResult.data.token;
+        void (async () => {
+          try {
+            let nextPayload: typeof payload;
+            try {
+              nextPayload = app.jwt.verify(nextToken);
+            } catch {
+              send({ type: 'auth.error', message: 'invalid token' });
+              return;
+            }
+            if (nextPayload.aud && nextPayload.aud !== 'agent') {
+              send({ type: 'auth.error', message: 'wrong audience' });
+              return;
+            }
+            if (!nextPayload.sub || !nextPayload.role || !nextPayload.accountId) {
+              send({ type: 'auth.error', message: 'missing claims' });
+              return;
+            }
+            if (nextPayload.sub !== ctx.userId || nextPayload.accountId !== ctx.accountId) {
+              send({ type: 'auth.error', message: 'identity mismatch' });
+              return;
+            }
+            const nextExpMs = (nextPayload.exp ?? 0) * 1000;
+            // Defense against a captured shorter-lived token being replayed to
+            // shrink the session, and against a buggy issuer minting an instantly
+            // expired token. `app.jwt.verify` already rejects past `exp`, so this
+            // is belt-and-suspenders.
+            if (nextExpMs <= Date.now()) {
+              send({ type: 'auth.error', message: 'token already expired' });
+              return;
+            }
+            if (nextExpMs <= ctx.expiresAtMs) {
+              // Stale/replayed token — don't shrink. ACK with the value we're
+              // actually honoring so the client re-arms its timer against the
+              // server's view of expiry instead of stalling on its optimistic
+              // local update.
+              send({ type: 'auth.refreshed', expiresAt: ctx.expiresAtMs });
+              return;
+            }
+            // Refresh ACL snapshot. Cheap (one indexed query per ~14min per socket).
+            const nextMemberships = await app.db
+              .select({ inboxId: schema.inboxMembers.inboxId })
+              .from(schema.inboxMembers)
+              .where(eq(schema.inboxMembers.userId, ctx.userId));
+            ctx.role = nextPayload.role;
+            ctx.inboxIds = new Set(nextMemberships.map((m) => m.inboxId));
+            ctx.expiresAtMs = nextExpMs;
+            send({ type: 'auth.refreshed', expiresAt: ctx.expiresAtMs });
+          } catch (err) {
+            // DB hiccup or any other unexpected failure — surface as auth.error
+            // so the client retries instead of stalling until the 4401 close.
+            app.log.warn({ err, userId: ctx.userId }, 'auth.refresh failed');
+            send({ type: 'auth.error', message: 'refresh failed' });
+          }
+        })();
         return;
       }
 
