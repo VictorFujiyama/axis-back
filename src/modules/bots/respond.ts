@@ -181,6 +181,8 @@ export async function botRespondRoutes(app: FastifyInstance): Promise<void> {
               senderId: msg!.senderId,
               content: msg!.content,
               contentType: msg!.contentType,
+              mediaUrl: msg!.mediaUrl,
+              mediaMimeType: msg!.mediaMimeType,
               isPrivateNote: msg!.isPrivateNote,
               createdAt: msg!.createdAt,
             },

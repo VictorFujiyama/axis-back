@@ -119,6 +119,8 @@ async function maybeSendOutOfHoursReply(input: PostIngestInput): Promise<void> {
       senderId: msg.senderId,
       content: msg.content,
       contentType: msg.contentType,
+      mediaUrl: msg.mediaUrl,
+      mediaMimeType: msg.mediaMimeType,
       isPrivateNote: msg.isPrivateNote,
       createdAt: msg.createdAt,
     },

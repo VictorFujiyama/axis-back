@@ -83,6 +83,8 @@ export interface RealtimeMessage {
   senderId: string | null;
   content: string | null;
   contentType: string;
+  mediaUrl: string | null;
+  mediaMimeType: string | null;
   isPrivateNote: boolean;
   createdAt: Date;
   sender?: { name: string | null; email?: string };

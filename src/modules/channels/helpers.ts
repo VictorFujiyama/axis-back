@@ -344,6 +344,8 @@ export async function ingestIncomingMessage(
         senderId: m.senderId,
         content: m.content,
         contentType: m.contentType,
+        mediaUrl: m.mediaUrl,
+        mediaMimeType: m.mediaMimeType,
         isPrivateNote: m.isPrivateNote,
         createdAt: m.createdAt,
       },

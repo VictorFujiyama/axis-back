@@ -211,6 +211,8 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
           senderId: msg.senderId,
           content: msg.content,
           contentType: msg.contentType,
+          mediaUrl: msg.mediaUrl,
+          mediaMimeType: msg.mediaMimeType,
           isPrivateNote: msg.isPrivateNote,
           createdAt: msg.createdAt,
           sender: { name: senderRow?.name ?? null, email: req.user.email },

@@ -517,6 +517,8 @@ export async function actionRoutes(app: FastifyInstance): Promise<void> {
               senderId: note!.senderId,
               content: note!.content,
               contentType: note!.contentType,
+              mediaUrl: note!.mediaUrl,
+              mediaMimeType: note!.mediaMimeType,
               isPrivateNote: note!.isPrivateNote,
               createdAt: note!.createdAt,
             },

@@ -248,6 +248,8 @@ async function insertBotMessage(
         senderId: msg.senderId,
         content: msg.content,
         contentType: msg.contentType,
+        mediaUrl: msg.mediaUrl,
+        mediaMimeType: msg.mediaMimeType,
         isPrivateNote: msg.isPrivateNote,
         createdAt: msg.createdAt,
       },
