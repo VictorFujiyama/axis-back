@@ -332,6 +332,7 @@ export async function ingestIncomingMessage(
   // contact's message is observed by clients before the bot's reply arrives.
   if (!result.deduped && result.message && result.conversationId) {
     const m = result.message;
+    const meta = (m.metadata ?? {}) as Record<string, unknown>;
     eventBus.emitEvent({
       type: 'message.created',
       inboxId: input.inboxId,
@@ -346,6 +347,7 @@ export async function ingestIncomingMessage(
         contentType: m.contentType,
         mediaUrl: m.mediaUrl,
         mediaMimeType: m.mediaMimeType,
+        mediaPending: meta.mediaPending === true ? true : undefined,
         isPrivateNote: m.isPrivateNote,
         createdAt: m.createdAt,
       },

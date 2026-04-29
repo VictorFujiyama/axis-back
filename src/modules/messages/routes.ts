@@ -33,6 +33,7 @@ const sendBody = z.object({
 type MessageRow = typeof schema.messages.$inferSelect;
 
 function publicMessage(row: MessageRow) {
+  const meta = (row.metadata ?? {}) as Record<string, unknown>;
   return {
     id: row.id,
     conversationId: row.conversationId,
@@ -43,6 +44,11 @@ function publicMessage(row: MessageRow) {
     contentType: row.contentType,
     mediaUrl: row.mediaUrl,
     mediaMimeType: row.mediaMimeType,
+    // Surface async-mirror state so the client can render a skeleton on
+    // refresh without inspecting the metadata jsonb itself.
+    mediaPending: meta.mediaPending === true,
+    /** True when the background mirror exhausted retries — front shows a fallback. */
+    mediaFailed: meta.mediaMirrorFailed === true,
     isPrivateNote: row.isPrivateNote,
     metadata: row.metadata,
     deliveredAt: row.deliveredAt,

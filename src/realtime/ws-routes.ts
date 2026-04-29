@@ -68,6 +68,7 @@ function eventRoom(e: RealtimeEvent): string[] {
       return [`conversation:${e.conversationId}`, `inbox:${e.inboxId}`];
     case 'message.deleted':
     case 'message.updated':
+    case 'message.media-ready':
       return [`conversation:${e.conversationId}`, `inbox:${e.inboxId}`];
     case 'typing.indicator':
       return [`conversation:${e.conversationId}`, `inbox:${e.inboxId}`];

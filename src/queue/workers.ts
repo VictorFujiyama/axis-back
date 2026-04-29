@@ -1,9 +1,11 @@
-import { and, eq, isNull } from 'drizzle-orm';
+import { and, eq, isNull, sql } from 'drizzle-orm';
 import type { Worker } from 'bullmq';
 import type { FastifyInstance } from 'fastify';
 import { schema } from '@blossom/db';
 import { decryptJSON } from '../crypto';
-import { QUEUE_NAMES, type BotDispatchJob, type EmailOutboundJob, type WhatsAppOutboundJob, type TelegramOutboundJob, type TwilioMetaOutboundJob } from './index';
+import { eventBus } from '../realtime/event-bus';
+import { QUEUE_NAMES, type BotDispatchJob, type EmailOutboundJob, type MediaMirrorJob, type WhatsAppOutboundJob, type TelegramOutboundJob, type TwilioMetaOutboundJob } from './index';
+import { mirrorTwilioMedia } from '../lib/twilio-media';
 import { registerSnoozeWorker } from '../modules/conversations/snooze-worker';
 import { registerScheduledMessageWorker } from '../modules/messages/scheduled-worker';
 import { dispatchOutbound } from '../modules/messages/routes';
@@ -40,7 +42,7 @@ import { config as appConfig } from '../config';
  * Without this handler, retries-exhausted messages stay in a "ghost" state
  * (no failedAt, no channelMsgId) and the manual /retry endpoint can't act.
  */
-function markFailedOnExhaust<T extends { messageId: string }>(
+function markFailedOnExhaust<T extends { messageId: string; conversationId: string; inboxId: string }>(
   worker: Worker<T>,
   app: FastifyInstance,
   label: string,
@@ -49,12 +51,11 @@ function markFailedOnExhaust<T extends { messageId: string }>(
     if (!job) return;
     const maxAttempts = job.opts.attempts ?? 5;
     if (job.attemptsMade < maxAttempts) return;
+    const failureReason = `${label}: ${err.message?.slice(0, 480) ?? 'transient retries exhausted'}`;
+    const failedAt = new Date();
     void app.db
       .update(schema.messages)
-      .set({
-        failedAt: new Date(),
-        failureReason: `${label}: ${err.message?.slice(0, 480) ?? 'transient retries exhausted'}`,
-      })
+      .set({ failedAt, failureReason })
       .where(
         and(
           eq(schema.messages.id, job.data.messageId),
@@ -62,6 +63,19 @@ function markFailedOnExhaust<T extends { messageId: string }>(
           isNull(schema.messages.failedAt),
         ),
       )
+      .returning({ id: schema.messages.id })
+      .then((rows) => {
+        // Notify open clients so the failed bubble appears without a refresh.
+        // Skip emit if the row was already terminal — no real change happened.
+        if (rows.length === 0) return;
+        eventBus.emitEvent({
+          type: 'message.updated',
+          inboxId: job.data.inboxId,
+          conversationId: job.data.conversationId,
+          messageId: job.data.messageId,
+          changes: { failedAt, failureReason },
+        });
+      })
       .catch((e) => {
         app.log.error(
           { err: e, messageId: job.data.messageId },
@@ -272,6 +286,101 @@ export function registerWorkers(app: FastifyInstance): void {
     );
     markFailedOnExhaust(twilioMetaWorker, app, prefix);
   }
+
+  // Media mirror worker — pulls inbound provider-hosted media (Twilio CDN
+  // requires Basic Auth and rotates URLs hourly) into our R2 storage so the
+  // browser can render it directly. Runs async so the inbound webhook can
+  // ack in <300ms instead of waiting on download+upload (~500ms-2s sync).
+  const mediaMirrorWorker = app.queues.registerWorker<MediaMirrorJob>(
+    QUEUE_NAMES.MEDIA_MIRROR,
+    async (job) => {
+      const data = job.data;
+      const [inbox] = await app.db
+        .select()
+        .from(schema.inboxes)
+        .where(eq(schema.inboxes.id, data.inboxId))
+        .limit(1);
+      if (!inbox) throw new Error('inbox not found');
+
+      const cfg = parseWhatsAppConfig(inbox.config);
+      if (!cfg.accountSid) throw new Error('inbox missing twilio accountSid');
+
+      let secrets;
+      try {
+        secrets = parseWhatsAppSecrets(inbox.secrets ? decryptJSON(inbox.secrets) : {});
+      } catch (err) {
+        app.log.error({ err, inboxId: inbox.id }, 'media mirror: cannot decrypt secrets');
+        throw err;
+      }
+      if (!secrets.authToken) throw new Error('inbox missing twilio authToken');
+
+      const finalUrl = await mirrorTwilioMedia({
+        twilioUrl: data.twilioUrl,
+        mimeType: data.mimeType ?? undefined,
+        accountId: data.accountId,
+        twilioAccountSid: cfg.accountSid,
+        twilioAuthToken: secrets.authToken,
+      });
+
+      // Single atomic update — if the worker crashes between two writes the
+      // row would land with the new URL but stuck in mediaPending=true and
+      // BullMQ retry would burn a fresh R2 object. The `-` jsonb operator
+      // strips the pending key without clobbering siblings.
+      await app.db
+        .update(schema.messages)
+        .set({
+          mediaUrl: finalUrl,
+          mediaMimeType: data.mimeType ?? undefined,
+          metadata: sql`${schema.messages.metadata} - 'mediaPending'`,
+        })
+        .where(eq(schema.messages.id, data.messageId));
+
+      eventBus.emitEvent({
+        type: 'message.media-ready',
+        inboxId: data.inboxId,
+        conversationId: data.conversationId,
+        messageId: data.messageId,
+        mediaUrl: finalUrl,
+        mediaMimeType: data.mimeType ?? null,
+      });
+    },
+    5,
+  );
+  mediaMirrorWorker.on('failed', (job, err) => {
+    if (!job) return;
+    const maxAttempts = job.opts.attempts ?? 5;
+    if (job.attemptsMade < maxAttempts) return;
+    // All retries exhausted — drop the pending flag and stamp a failure
+    // breadcrumb so the front can render a "mídia indisponível" hint
+    // instead of spinning forever. Empty mediaUrl on the WS payload is
+    // the failure sentinel for open clients.
+    void app.db
+      .update(schema.messages)
+      .set({
+        metadata: sql`(${schema.messages.metadata} - 'mediaPending') || jsonb_build_object('mediaMirrorFailed', true)`,
+      })
+      .where(eq(schema.messages.id, job.data.messageId))
+      .then(() => {
+        eventBus.emitEvent({
+          type: 'message.media-ready',
+          inboxId: job.data.inboxId,
+          conversationId: job.data.conversationId,
+          messageId: job.data.messageId,
+          mediaUrl: '',
+          mediaMimeType: job.data.mimeType ?? null,
+        });
+      })
+      .catch((e) => {
+        app.log.error(
+          { err: e, messageId: job.data.messageId },
+          'media mirror: failed-to-mark-failed',
+        );
+      });
+    app.log.warn(
+      { err: err.message, messageId: job.data.messageId, attempts: job.attemptsMade },
+      'media mirror: retries exhausted',
+    );
+  });
 
   registerSnoozeWorker(app);
   registerScheduledMessageWorker(app, dispatchOutbound);

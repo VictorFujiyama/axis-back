@@ -50,6 +50,14 @@ export type RealtimeEvent =
       messageId: string;
     }
   | {
+      type: 'message.media-ready';
+      inboxId: string;
+      conversationId: string;
+      messageId: string;
+      mediaUrl: string;
+      mediaMimeType: string | null;
+    }
+  | {
       type: 'message.updated';
       inboxId: string;
       conversationId: string;
@@ -85,6 +93,12 @@ export interface RealtimeMessage {
   contentType: string;
   mediaUrl: string | null;
   mediaMimeType: string | null;
+  /**
+   * True when an inbound media payload is still being mirrored to our
+   * storage in the background. The front should render a skeleton until
+   * a `message.media-ready` event arrives with the final URL.
+   */
+  mediaPending?: boolean;
   isPrivateNote: boolean;
   createdAt: Date;
   sender?: { name: string | null; email?: string };

@@ -33,6 +33,7 @@ export const QUEUE_NAMES = {
   WEBHOOK_DELIVERY: 'webhook-delivery',
   CAMPAIGN_RUNNER: 'campaign-runner',
   CAMPAIGN_SEND: 'campaign-send',
+  MEDIA_MIRROR: 'media-mirror',
 } as const;
 
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
@@ -103,6 +104,24 @@ export interface TwilioMetaOutboundJob {
   contactAddress: string;
   text: string;
   mediaUrl: string | null;
+}
+
+/**
+ * Background mirror of an inbound media URL into our own storage.
+ *
+ * Why async: the synchronous mirror in the webhook adds 500ms-2s of dead time
+ * before the front sees the message — provider download + R2 upload happen
+ * back-to-back. Pushing it to a worker lets us 201-ack Twilio immediately,
+ * broadcast a placeholder to the agent, then swap in the final URL via a
+ * `message.media-ready` event when the upload finishes.
+ */
+export interface MediaMirrorJob {
+  messageId: string;
+  conversationId: string;
+  inboxId: string;
+  accountId: string;
+  twilioUrl: string;
+  mimeType: string | null;
 }
 
 export interface WhatsAppOutboundJob {

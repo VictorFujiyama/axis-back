@@ -1,4 +1,4 @@
-import { and, eq, isNull } from 'drizzle-orm';
+import { and, eq, isNull, sql } from 'drizzle-orm';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
@@ -8,7 +8,7 @@ import { ingestWithHooks } from './post-ingest';
 import { parseWhatsAppSecrets, parseWhatsAppConfig } from './whatsapp-sender';
 import { verifyTwilioSignature } from './whatsapp-signature';
 import { eventBus } from '../../realtime/event-bus';
-import { mirrorTwilioMedia } from '../../lib/twilio-media';
+import { QUEUE_NAMES, type MediaMirrorJob } from '../../queue';
 
 const inboxParam = z.object({ inboxId: z.string().uuid() });
 
@@ -141,33 +141,20 @@ export async function whatsappChannelRoutes(app: FastifyInstance): Promise<void>
       const name = body.ProfileName?.trim() || fromPhone;
       const numMedia = Number.parseInt(body.NumMedia, 10) || 0;
 
-      // Mirror inbound media into our storage. Twilio media URLs require
-      // Basic Auth and rotate the signed CDN URL behind them — the browser
-      // can't render them directly. Fall back to the original URL only if
-      // the mirror fails so we don't drop the message.
-      let storedMediaUrl = body.MediaUrl0;
-      if (
+      // Twilio media URLs require Basic Auth and the signed CDN URL behind
+      // them rotates ~hourly, so the browser cannot render them directly.
+      // We mirror the bytes into R2 in a background worker (MEDIA_MIRROR)
+      // instead of awaiting it here — the inline mirror added 500ms-2s of
+      // perceived delay before the agent saw the message. The message is
+      // inserted with mediaUrl=null + metadata.mediaPending=true so the
+      // front renders a skeleton; the worker swaps in the final URL via a
+      // `message.media-ready` realtime event when the upload finishes.
+      const hasMirrorableMedia =
         numMedia > 0 &&
-        body.MediaUrl0 &&
-        secrets?.authToken &&
-        inboxConfig.accountSid &&
-        inbox.accountId
-      ) {
-        try {
-          storedMediaUrl = await mirrorTwilioMedia({
-            twilioUrl: body.MediaUrl0,
-            mimeType: body.MediaContentType0,
-            accountId: inbox.accountId,
-            twilioAccountSid: inboxConfig.accountSid,
-            twilioAuthToken: secrets.authToken,
-          });
-        } catch (err) {
-          app.log.warn(
-            { err, inboxId, twilioUrl: body.MediaUrl0 },
-            'whatsapp webhook: media mirror failed; persisting raw twilio url',
-          );
-        }
-      }
+        !!body.MediaUrl0 &&
+        !!secrets?.authToken &&
+        !!inboxConfig.accountSid &&
+        !!inbox.accountId;
 
       const result = await ingestWithHooks(
         app,
@@ -182,14 +169,65 @@ export async function whatsappChannelRoutes(app: FastifyInstance): Promise<void>
           },
           content: body.Body || (numMedia > 0 ? '(mídia)' : '(sem conteúdo)'),
           contentType: numMedia > 0 ? contentTypeFromMime(body.MediaContentType0) : 'text',
-          mediaUrl: storedMediaUrl,
+          mediaUrl: hasMirrorableMedia ? undefined : body.MediaUrl0,
           mediaMimeType: body.MediaContentType0,
           channelMsgId: body.MessageSid,
-          metadata: { numMedia, from: body.From, to: body.To },
+          metadata: {
+            numMedia,
+            from: body.From,
+            to: body.To,
+            ...(hasMirrorableMedia ? { mediaPending: true } : {}),
+          },
         },
         inbox.config,
         inbox.defaultBotId,
       );
+
+      // Enqueue the mirror after the message exists. Skip on dedup — the
+      // original ingestion already enqueued (or completed) the mirror.
+      if (hasMirrorableMedia && !result.deduped && result.messageId && result.conversationId) {
+        const job: MediaMirrorJob = {
+          messageId: result.messageId,
+          conversationId: result.conversationId,
+          inboxId,
+          accountId: inbox.accountId!,
+          twilioUrl: body.MediaUrl0!,
+          mimeType: body.MediaContentType0 ?? null,
+        };
+        try {
+          await app.queues.getQueue<MediaMirrorJob>(QUEUE_NAMES.MEDIA_MIRROR).add('mirror', job);
+        } catch (err) {
+          app.log.error(
+            { err, messageId: job.messageId },
+            'whatsapp webhook: failed to enqueue media mirror',
+          );
+          // The job never made it onto the queue — without this the message
+          // would render a skeleton forever. Drop the pending flag and stamp
+          // the failure breadcrumb so the front can show the fallback.
+          void app.db
+            .update(schema.messages)
+            .set({
+              metadata: sql`(${schema.messages.metadata} - 'mediaPending') || jsonb_build_object('mediaMirrorFailed', true)`,
+            })
+            .where(eq(schema.messages.id, job.messageId))
+            .then(() => {
+              eventBus.emitEvent({
+                type: 'message.media-ready',
+                inboxId: job.inboxId,
+                conversationId: job.conversationId,
+                messageId: job.messageId,
+                mediaUrl: '',
+                mediaMimeType: job.mimeType ?? null,
+              });
+            })
+            .catch((dbErr) => {
+              app.log.error(
+                { err: dbErr, messageId: job.messageId },
+                'whatsapp webhook: failed-to-mark-failed after enqueue failure',
+              );
+            });
+        }
+      }
 
       if (result.blocked) {
         return reply.code(200).send({ accepted: false, reason: 'blocked' });
