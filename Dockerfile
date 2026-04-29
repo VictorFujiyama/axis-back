@@ -9,7 +9,7 @@ COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
 COPY packages/db/package.json ./packages/db/
 COPY packages/sdk/package.json ./packages/sdk/
 COPY packages/shared-types/package.json ./packages/shared-types/
-COPY modules/logistica-acme/package.json ./modules/logistica-acme/
+COPY modules/catalog/package.json ./modules/catalog/
 
 RUN pnpm install --frozen-lockfile
 
