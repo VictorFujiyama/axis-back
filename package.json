@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",
-    "@blossom-modules/logistica-acme": "workspace:*",
+    "@blossom-modules/catalog": "workspace:*",
     "@blossom/db": "workspace:*",
     "@blossom/sdk": "workspace:*",
     "@blossom/shared-types": "workspace:*",

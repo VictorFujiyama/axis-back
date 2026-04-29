@@ -1,5 +1,5 @@
 {
-  "name": "@blossom-modules/logistica-acme",
+  "name": "@blossom-modules/catalog",
   "version": "0.0.1",
   "private": true,
   "type": "module",
@@ -7,7 +7,10 @@
   "exports": { ".": "./src/index.ts" },
   "scripts": { "type-check": "tsc --noEmit" },
   "dependencies": {
+    "@blossom/db": "workspace:*",
     "@blossom/sdk": "workspace:*",
+    "@blossom/shared-types": "workspace:*",
+    "drizzle-orm": "^0.38.3",
     "zod": "^3.24.1"
   },
   "devDependencies": {

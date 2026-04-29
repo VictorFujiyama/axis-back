@@ -183,6 +183,13 @@
       "when": 1777047834245,
       "tag": "0025_cool_steel_serpent",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1777430361513,
+      "tag": "0026_aromatic_stone_men",
+      "breakpoints": true
     }
   ]
 }

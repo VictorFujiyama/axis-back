@@ -11,9 +11,9 @@ importers:
       '@anthropic-ai/sdk':
         specifier: ^0.90.0
         version: 0.90.0(zod@3.25.76)
-      '@blossom-modules/logistica-acme':
+      '@blossom-modules/catalog':
         specifier: workspace:*
-        version: link:modules/logistica-acme
+        version: link:modules/catalog
       '@blossom/db':
         specifier: workspace:*
         version: link:packages/db
@@ -112,11 +112,20 @@ importers:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@22.19.17)
 
-  modules/logistica-acme:
+  modules/catalog:
     dependencies:
+      '@blossom/db':
+        specifier: workspace:*
+        version: link:../../packages/db
       '@blossom/sdk':
         specifier: workspace:*
         version: link:../../packages/sdk
+      '@blossom/shared-types':
+        specifier: workspace:*
+        version: link:../../packages/shared-types
+      drizzle-orm:
+        specifier: ^0.38.3
+        version: 0.38.4(postgres@3.4.9)
       zod:
         specifier: ^3.24.1
         version: 3.25.76
