@@ -1,5 +1,5 @@
 /// <reference path="./fastify-augment.d.ts" />
-import { and, desc, eq, ilike, isNull, or } from 'drizzle-orm';
+import { and, count, desc, eq, ilike, isNull, or } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { schema } from '@blossom/db';
 import { createProductBody, idParams, listQuery, updateProductBody } from './schemas';
@@ -12,6 +12,8 @@ export function registerCatalogRoutes(app: FastifyInstance): void {
     { preHandler: app.requireAuth },
     async (req) => {
       const q = listQuery.parse(req.query ?? {});
+      const page = q.page ?? 1;
+      const pageSize = q.pageSize ?? 12;
       const conditions = [eq(schema.moduleCatalogProducts.accountId, req.user.accountId)];
 
       if (q.archived !== 'true') {
@@ -28,15 +30,24 @@ export function registerCatalogRoutes(app: FastifyInstance): void {
         );
       }
 
-      // Defensive cap; pagination can come later if needed.
-      const rows = await app.db
-        .select()
-        .from(schema.moduleCatalogProducts)
-        .where(and(...conditions))
-        .orderBy(desc(schema.moduleCatalogProducts.createdAt))
-        .limit(500);
+      const where = and(...conditions);
 
-      return { items: rows };
+      // Two parallel queries: page items + total count for the same filter.
+      const [rows, totalRow] = await Promise.all([
+        app.db
+          .select()
+          .from(schema.moduleCatalogProducts)
+          .where(where)
+          .orderBy(desc(schema.moduleCatalogProducts.createdAt))
+          .limit(pageSize)
+          .offset((page - 1) * pageSize),
+        app.db
+          .select({ value: count() })
+          .from(schema.moduleCatalogProducts)
+          .where(where),
+      ]);
+
+      return { items: rows, total: totalRow[0]?.value ?? 0, page, pageSize };
     },
   );
 
