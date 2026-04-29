@@ -4,11 +4,19 @@ import { randomUUID } from 'node:crypto';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
 import type { FastifyInstance } from 'fastify';
-import { uploadFile, isGcsEnabled } from '../../lib/storage';
+import {
+  uploadFile,
+  isGcsEnabled,
+  reserveWriteSlot,
+  StorageQuotaExceeded,
+} from '../../lib/storage';
 
 const LOCAL_UPLOADS_DIR = join(import.meta.dirname, '..', '..', '..', 'uploads');
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+// Defensive cap on per-file size. Smaller than the prior 10 MB to keep the
+// total storage footprint well inside R2's 10 GB free tier. Override via env.
+const MAX_FILE_SIZE = (Number(process.env.STORAGE_MAX_FILE_SIZE_MB) || 2) * 1024 * 1024;
+const MAX_FILE_SIZE_LABEL = `${Math.round(MAX_FILE_SIZE / (1024 * 1024))} MB`;
 
 const ALLOWED_EXTENSIONS = new Set([
   // Images (SVG excluded — can contain scripts)
@@ -31,6 +39,10 @@ export async function uploadRoutes(app: FastifyInstance): Promise<void> {
       },
     });
   }
+  app.log.info(
+    { maxFileSize: MAX_FILE_SIZE_LABEL, monthlyWriteLimit: process.env.STORAGE_MONTHLY_WRITE_LIMIT ?? '500000 (default)' },
+    'uploads: storage limits',
+  );
 
   // Local filesystem fallback: only when GCS is not configured.
   // Production must set GCS_BUCKET_NAME — see lib/storage.ts.
@@ -84,11 +96,29 @@ export async function uploadRoutes(app: FastifyInstance): Promise<void> {
       try {
         buf = await uploaded.toBuffer();
       } catch {
-        return reply.code(413).send({ error: 'File exceeds the 10 MB size limit' });
+        return reply
+          .code(413)
+          .send({ error: `File exceeds the ${MAX_FILE_SIZE_LABEL} size limit` });
       }
 
       if (buf.length > MAX_FILE_SIZE) {
-        return reply.code(413).send({ error: 'File exceeds the 10 MB size limit' });
+        return reply
+          .code(413)
+          .send({ error: `File exceeds the ${MAX_FILE_SIZE_LABEL} size limit` });
+      }
+
+      // Defensive monthly write budget — refuse before hitting paid tier.
+      try {
+        await reserveWriteSlot(app.redis);
+      } catch (err) {
+        if (err instanceof StorageQuotaExceeded) {
+          app.log.warn({ used: err.used, limit: err.limit }, 'storage: monthly write budget exhausted');
+          return reply.code(503).send({
+            error:
+              'Limite mensal de uploads atingido para esta instância. Tente novamente no próximo mês ou contate o admin.',
+          });
+        }
+        throw err;
       }
 
       // Path includes accountId so each tenant's files are isolated and
