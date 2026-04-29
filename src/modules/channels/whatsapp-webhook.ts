@@ -8,6 +8,7 @@ import { ingestWithHooks } from './post-ingest';
 import { parseWhatsAppSecrets, parseWhatsAppConfig } from './whatsapp-sender';
 import { verifyTwilioSignature } from './whatsapp-signature';
 import { eventBus } from '../../realtime/event-bus';
+import { mirrorTwilioMedia } from '../../lib/twilio-media';
 
 const inboxParam = z.object({ inboxId: z.string().uuid() });
 
@@ -140,6 +141,34 @@ export async function whatsappChannelRoutes(app: FastifyInstance): Promise<void>
       const name = body.ProfileName?.trim() || fromPhone;
       const numMedia = Number.parseInt(body.NumMedia, 10) || 0;
 
+      // Mirror inbound media into our storage. Twilio media URLs require
+      // Basic Auth and rotate the signed CDN URL behind them — the browser
+      // can't render them directly. Fall back to the original URL only if
+      // the mirror fails so we don't drop the message.
+      let storedMediaUrl = body.MediaUrl0;
+      if (
+        numMedia > 0 &&
+        body.MediaUrl0 &&
+        secrets?.authToken &&
+        inboxConfig.accountSid &&
+        inbox.accountId
+      ) {
+        try {
+          storedMediaUrl = await mirrorTwilioMedia({
+            twilioUrl: body.MediaUrl0,
+            mimeType: body.MediaContentType0,
+            accountId: inbox.accountId,
+            twilioAccountSid: inboxConfig.accountSid,
+            twilioAuthToken: secrets.authToken,
+          });
+        } catch (err) {
+          app.log.warn(
+            { err, inboxId, twilioUrl: body.MediaUrl0 },
+            'whatsapp webhook: media mirror failed; persisting raw twilio url',
+          );
+        }
+      }
+
       const result = await ingestWithHooks(
         app,
         {
@@ -153,7 +182,7 @@ export async function whatsappChannelRoutes(app: FastifyInstance): Promise<void>
           },
           content: body.Body || (numMedia > 0 ? '(mídia)' : '(sem conteúdo)'),
           contentType: numMedia > 0 ? contentTypeFromMime(body.MediaContentType0) : 'text',
-          mediaUrl: body.MediaUrl0,
+          mediaUrl: storedMediaUrl,
           mediaMimeType: body.MediaContentType0,
           channelMsgId: body.MessageSid,
           metadata: { numMedia, from: body.From, to: body.To },
