@@ -25,15 +25,51 @@ interface DbStub {
   update: ReturnType<typeof vi.fn>;
   set: ReturnType<typeof vi.fn>;
   where: ReturnType<typeof vi.fn>;
+  select: ReturnType<typeof vi.fn>;
+  selectFrom: ReturnType<typeof vi.fn>;
+  selectWhere: ReturnType<typeof vi.fn>;
+  selectLimit: ReturnType<typeof vi.fn>;
 }
 
-function buildAppWithDb(): { app: FastifyInstance; db: DbStub } {
+interface RedisStub {
+  set: ReturnType<typeof vi.fn>;
+  del: ReturnType<typeof vi.fn>;
+}
+
+interface AppBuildResult {
+  app: FastifyInstance;
+  db: DbStub;
+  redis: RedisStub;
+}
+
+/**
+ * Build an app stub with chainable drizzle `update` + `select` and an
+ * ioredis-shaped `redis` whose `set` defaults to `'OK'` (lock acquired).
+ *
+ * The select chain returns `selectRows` — pass a reference so the test can
+ * mutate it after each `update().set()` call to simulate the row being
+ * rotated by a concurrent refresh.
+ */
+function buildAppWithDb(selectRows: unknown[] = []): AppBuildResult {
   const where = vi.fn().mockResolvedValue(undefined);
   const set = vi.fn().mockReturnValue({ where });
   const update = vi.fn().mockReturnValue({ set });
+
+  const selectLimit = vi.fn().mockResolvedValue(selectRows);
+  const selectWhere = vi.fn().mockReturnValue({ limit: selectLimit });
+  const selectFrom = vi.fn().mockReturnValue({ where: selectWhere });
+  const select = vi.fn().mockReturnValue({ from: selectFrom });
+
+  const redisSet = vi.fn().mockResolvedValue('OK');
+  const redisDel = vi.fn().mockResolvedValue(1);
+
   return {
-    app: { db: { update } } as unknown as FastifyInstance,
-    db: { update, set, where },
+    app: {
+      db: { update, select },
+      redis: { set: redisSet, del: redisDel },
+    } as unknown as FastifyInstance,
+    db: { update, set, where, select, selectFrom, selectWhere, selectLimit },
+    redis: { set: redisSet, del: redisDel },
   };
 }
 
@@ -174,5 +210,130 @@ describe('getValidAccessToken — lazy refresh', () => {
     const setArg = db.set.mock.calls[0]![0] as { secrets: string };
     const decrypted = decryptJSON(setArg.secrets) as { expiresAt: string };
     expect(decrypted.expiresAt).toBe('2026-05-05T12:30:00.000Z');
+  });
+});
+
+describe('getValidAccessToken — Redis lock for concurrent refresh (T-13)', () => {
+  const NEW_ACCESS_TOKEN = 'ya29.NEW-access-token';
+  const INBOX_ID = '11111111-1111-1111-1111-111111111111';
+  const LOCK_KEY = `gmail-token-refresh:${INBOX_ID}`;
+
+  it('acquires the lock with NX+PX(30s) before refreshing, then releases it', async () => {
+    const now = Date.parse('2026-05-05T12:00:00.000Z');
+    const inbox = buildInbox('2026-05-05T12:00:30.000Z');
+    const refresh = vi.fn().mockResolvedValue({
+      accessToken: NEW_ACCESS_TOKEN,
+      expiresIn: 3600,
+    });
+    const { app, redis } = buildAppWithDb();
+
+    const token = await getValidAccessToken(app, inbox, {
+      now: () => now,
+      refresh,
+    });
+
+    expect(token).toBe(NEW_ACCESS_TOKEN);
+    expect(redis.set).toHaveBeenCalledTimes(1);
+    expect(redis.set).toHaveBeenCalledWith(LOCK_KEY, '1', 'PX', 30_000, 'NX');
+    // Lock acquired before refresh fires.
+    expect(redis.set.mock.invocationCallOrder[0]!).toBeLessThan(
+      refresh.mock.invocationCallOrder[0]!,
+    );
+    // Lock released exactly once after the work.
+    expect(redis.del).toHaveBeenCalledTimes(1);
+    expect(redis.del).toHaveBeenCalledWith(LOCK_KEY);
+  });
+
+  it('releases the lock even when the refresh call throws', async () => {
+    const now = Date.parse('2026-05-05T12:00:00.000Z');
+    const inbox = buildInbox('2026-05-05T12:00:30.000Z');
+    const boom = new Error('refresh exploded');
+    const refresh = vi.fn().mockRejectedValue(boom);
+    const { app, redis, db } = buildAppWithDb();
+
+    await expect(
+      getValidAccessToken(app, inbox, { now: () => now, refresh }),
+    ).rejects.toThrow('refresh exploded');
+
+    expect(redis.set).toHaveBeenCalledTimes(1);
+    expect(redis.del).toHaveBeenCalledTimes(1);
+    expect(redis.del).toHaveBeenCalledWith(LOCK_KEY);
+    // No DB write when refresh fails.
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it('loser of the race awaits ~200ms and re-reads tokens from DB', async () => {
+    const now = Date.parse('2026-05-05T12:00:00.000Z');
+    const inbox = buildInbox('2026-05-05T12:00:30.000Z');
+    // Simulate the winner having already rotated the secrets in DB.
+    const rotatedRow = {
+      id: INBOX_ID,
+      secrets: encryptJSON({
+        refreshToken: REFRESH_TOKEN,
+        accessToken: NEW_ACCESS_TOKEN,
+        expiresAt: '2026-05-05T13:00:00.000Z',
+      }),
+    };
+    const { app, redis, db } = buildAppWithDb([rotatedRow]);
+    redis.set.mockResolvedValueOnce(null); // lock not acquired
+    const refresh = vi.fn();
+    const sleep = vi.fn().mockResolvedValue(undefined);
+
+    const token = await getValidAccessToken(app, inbox, {
+      now: () => now,
+      refresh,
+      sleep,
+    });
+
+    expect(token).toBe(NEW_ACCESS_TOKEN);
+    // Loser path never refreshes.
+    expect(refresh).not.toHaveBeenCalled();
+    // Loser waits ~200ms before re-reading.
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(200);
+    // Loser SELECTs the inbox row (chain reached `.limit`).
+    expect(db.select).toHaveBeenCalledTimes(1);
+    expect(db.selectLimit).toHaveBeenCalledWith(1);
+    // Loser does not touch the DB write path or release a lock it doesn't hold.
+    expect(db.update).not.toHaveBeenCalled();
+    expect(redis.del).not.toHaveBeenCalled();
+  });
+
+  it('two concurrent calls produce exactly one refresh request', async () => {
+    const now = Date.parse('2026-05-05T12:00:00.000Z');
+    const inbox = buildInbox('2026-05-05T12:00:30.000Z');
+
+    // Shared mutable state: the row both calls would see.
+    // The winner's `update().set()` mutates `rowState.secrets`; the loser's
+    // `select()` reads `[rowState]` — same object reference, so the post-refresh
+    // value is observable.
+    const rowState = { id: INBOX_ID, secrets: inbox.secrets };
+    const { app, redis, db } = buildAppWithDb([rowState]);
+    redis.set
+      .mockResolvedValueOnce('OK') // call 1 wins
+      .mockResolvedValueOnce(null); // call 2 loses
+    db.set.mockImplementation((arg: { secrets: string }) => {
+      rowState.secrets = arg.secrets;
+      return { where: db.where };
+    });
+
+    const refresh = vi.fn().mockResolvedValue({
+      accessToken: NEW_ACCESS_TOKEN,
+      expiresIn: 3600,
+    });
+    const sleep = vi.fn().mockResolvedValue(undefined);
+
+    const [a, b] = await Promise.all([
+      getValidAccessToken(app, inbox, { now: () => now, refresh, sleep }),
+      getValidAccessToken(app, inbox, { now: () => now, refresh, sleep }),
+    ]);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(redis.set).toHaveBeenCalledTimes(2);
+    expect(redis.del).toHaveBeenCalledTimes(1);
+    // Winner returns the new token from refresh; loser returns the same
+    // token re-read from the rotated DB row.
+    expect(a).toBe(NEW_ACCESS_TOKEN);
+    expect(b).toBe(NEW_ACCESS_TOKEN);
   });
 });
