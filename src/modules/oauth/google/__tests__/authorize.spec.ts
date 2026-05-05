@@ -1,12 +1,34 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 
+interface DbStub {
+  select: ReturnType<typeof vi.fn>;
+  from: ReturnType<typeof vi.fn>;
+  where: ReturnType<typeof vi.fn>;
+  limit: ReturnType<typeof vi.fn>;
+}
+
+interface AppBuildOptions {
+  selectRows?: unknown[];
+}
+
+interface AppBuildResult {
+  app: FastifyInstance;
+  db: DbStub;
+}
+
 // The route reads `config.GOOGLE_OAUTH_*` (singleton, parsed once at import).
 // Tests use vi.resetModules + vi.stubEnv so each `buildTestApp` call sees a
 // fresh config. JWT_SECRET stays set via the loaded `.env` so signing/verifying
 // in the same fresh module graph stays consistent between the JWT plugin and
 // the route's signState helper.
-async function buildTestApp(): Promise<FastifyInstance> {
+//
+// The reauth branch (T-16) needs `app.db` for the inbox ownership lookup. We
+// decorate it with a chainable stub here; tests pass `selectRows` to control
+// what the lookup resolves to ([] → not found → 403; [row] → ok).
+async function buildTestApp(
+  options: AppBuildOptions = {},
+): Promise<AppBuildResult> {
   vi.resetModules();
   const Fastify = (await import('fastify')).default;
   const sensible = (await import('@fastify/sensible')).default;
@@ -16,10 +38,18 @@ async function buildTestApp(): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   await app.register(sensible);
   await app.register(jwtPlugin);
+
+  const limit = vi.fn().mockResolvedValue(options.selectRows ?? []);
+  const where = vi.fn().mockReturnValue({ limit });
+  const from = vi.fn().mockReturnValue({ where });
+  const select = vi.fn().mockReturnValue({ from });
+  app.decorate('db', { select } as unknown as FastifyInstance['db']);
+
   await app.register(googleOAuthRoutes);
   await app.ready();
-  return app;
+  return { app, db: { select, from, where, limit } };
 }
+
 
 function stubOAuthEnv(): void {
   vi.stubEnv('GOOGLE_OAUTH_CLIENT_ID', '1234.apps.googleusercontent.com');
@@ -68,7 +98,7 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
   });
 
   it('rejects missing JWT with 401', async () => {
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const res = await app.inject({
         method: 'GET',
@@ -81,7 +111,7 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
   });
 
   it('rejects an invalid JWT with 401', async () => {
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const res = await app.inject({
         method: 'GET',
@@ -95,7 +125,7 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
   });
 
   it('rejects missing inboxName with 400', async () => {
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const token = signJwt(app);
       const res = await app.inject({
@@ -110,7 +140,7 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
   });
 
   it('rejects empty inboxName with 400', async () => {
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const token = signJwt(app);
       const res = await app.inject({
@@ -125,7 +155,7 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
   });
 
   it('rejects whitespace-only inboxName with 400', async () => {
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const token = signJwt(app);
       const res = await app.inject({
@@ -140,7 +170,7 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
   });
 
   it('rejects inboxName longer than 80 chars with 400', async () => {
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const token = signJwt(app);
       const longName = 'a'.repeat(81);
@@ -156,7 +186,7 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
   });
 
   it('redirects 302 to Google consent URL with state on happy path', async () => {
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const token = signJwt(app, {
         sub: 'usr-1234',
@@ -197,7 +227,7 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
   });
 
   it('encodes the JWT identity + inboxName into the signed state', async () => {
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const token = signJwt(app, {
         sub: 'usr-state-id',
@@ -230,7 +260,7 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
   });
 
   it('produces a different state on each call (fresh nonce + ts)', async () => {
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const token = signJwt(app);
       const url = '/api/v1/oauth/google/authorize?inboxName=Gmail+Teste';
@@ -271,7 +301,7 @@ describe('GET /api/v1/oauth/google/authorize — env not configured (T-15)', () 
   it('returns 503 when GOOGLE_OAUTH_CLIENT_ID is missing', async () => {
     stubOAuthEnv();
     delete process.env.GOOGLE_OAUTH_CLIENT_ID;
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const token = signJwt(app);
       const res = await app.inject({
@@ -288,7 +318,7 @@ describe('GET /api/v1/oauth/google/authorize — env not configured (T-15)', () 
   it('returns 503 when GOOGLE_OAUTH_CLIENT_SECRET is missing', async () => {
     stubOAuthEnv();
     delete process.env.GOOGLE_OAUTH_CLIENT_SECRET;
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const token = signJwt(app);
       const res = await app.inject({
@@ -305,7 +335,7 @@ describe('GET /api/v1/oauth/google/authorize — env not configured (T-15)', () 
   it('returns 503 when GOOGLE_OAUTH_REDIRECT_URI is missing', async () => {
     stubOAuthEnv();
     delete process.env.GOOGLE_OAUTH_REDIRECT_URI;
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const token = signJwt(app);
       const res = await app.inject({
@@ -320,7 +350,7 @@ describe('GET /api/v1/oauth/google/authorize — env not configured (T-15)', () 
   });
 
   it('returns 503 when all three are missing', async () => {
-    const app = await buildTestApp();
+    const { app } = await buildTestApp();
     try {
       const token = signJwt(app);
       const res = await app.inject({
@@ -329,6 +359,137 @@ describe('GET /api/v1/oauth/google/authorize — env not configured (T-15)', () 
         headers: { authorization: `Bearer ${token}` },
       });
       expect(res.statusCode).toBe(503);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('GET /api/v1/oauth/google/authorize — reauth branch (T-16)', () => {
+  const VALID_INBOX_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+    stubOAuthEnv();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('rejects a non-uuid inboxId with 400', async () => {
+    const { app } = await buildTestApp();
+    try {
+      const token = signJwt(app);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/v1/oauth/google/authorize?inboxName=Gmail+Teste&inboxId=not-a-uuid',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(400);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('returns 403 when the inbox does not exist (or is deleted)', async () => {
+    // Empty selectRows → DB lookup finds nothing.
+    const { app, db } = await buildTestApp({ selectRows: [] });
+    try {
+      const token = signJwt(app, { accountId: 'acc-self' });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/authorize?inboxName=Gmail+Teste&inboxId=${VALID_INBOX_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(403);
+      // The ownership check must have actually run.
+      expect(db.select).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('returns 403 when the inbox belongs to a different account', async () => {
+    // From the route's perspective the where clause already filters by
+    // accountId — a cross-account row simply isn't returned. Mirror that here:
+    // the stub returns [] and the route returns 403. We additionally assert
+    // that the where clause was invoked, i.e. accountId scoping is in place.
+    const { app, db } = await buildTestApp({ selectRows: [] });
+    try {
+      const token = signJwt(app, { accountId: 'acc-self' });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/authorize?inboxName=Gmail+Teste&inboxId=${VALID_INBOX_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(403);
+      expect(db.where).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('redirects 302 with inboxId encoded into the state when the inbox is owned by the caller', async () => {
+    const { app } = await buildTestApp({
+      selectRows: [
+        {
+          id: VALID_INBOX_ID,
+          accountId: 'acc-owner',
+          name: 'Existing Gmail',
+          channelType: 'email',
+          config: { provider: 'gmail', needsReauth: true },
+          deletedAt: null,
+        },
+      ],
+    });
+    try {
+      const token = signJwt(app, {
+        sub: 'usr-owner-1',
+        accountId: 'acc-owner',
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/authorize?inboxName=Gmail+Teste&inboxId=${VALID_INBOX_ID}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(302);
+      const url = new URL(res.headers.location as string);
+      expect(`${url.origin}${url.pathname}`).toBe(
+        'https://accounts.google.com/o/oauth2/v2/auth',
+      );
+      const state = url.searchParams.get('state')!;
+      expect(state).toBeTruthy();
+
+      const { verifyState } = await import('../state.js');
+      const payload = verifyState(state);
+      expect(payload.inboxId).toBe(VALID_INBOX_ID);
+      expect(payload.accountId).toBe('acc-owner');
+      expect(payload.userId).toBe('usr-owner-1');
+      expect(payload.inboxName).toBe('Gmail Teste');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not touch the DB on the create branch (no inboxId)', async () => {
+    const { app, db } = await buildTestApp({ selectRows: [] });
+    try {
+      const token = signJwt(app);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/v1/oauth/google/authorize?inboxName=Gmail+Teste',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(302);
+      // Create branch must not perform the ownership lookup.
+      expect(db.select).not.toHaveBeenCalled();
+      // And the resulting state must encode inboxId=null.
+      const url = new URL(res.headers.location as string);
+      const { verifyState } = await import('../state.js');
+      const payload = verifyState(url.searchParams.get('state')!);
+      expect(payload.inboxId ?? null).toBeNull();
     } finally {
       await app.close();
     }
