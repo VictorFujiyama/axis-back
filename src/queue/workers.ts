@@ -33,6 +33,7 @@ import {
   parseTwilioSecrets,
   sendOutboundTwilio,
 } from '../modules/channels/twilio-shared';
+import { registerGmailSyncWorker } from './workers/gmail-sync';
 import { config as appConfig } from '../config';
 
 /**
@@ -386,6 +387,7 @@ export function registerWorkers(app: FastifyInstance): void {
   registerScheduledMessageWorker(app, dispatchOutbound);
   registerWebhookWorker(app);
   registerCampaignWorkers(app);
+  registerGmailSyncWorker(app);
 
   app.log.info('queue workers registered');
 }
