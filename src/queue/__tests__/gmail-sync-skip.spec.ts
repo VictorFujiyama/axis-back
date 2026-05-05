@@ -123,26 +123,6 @@ describe('processGmailSyncJob — skip guards', () => {
     );
   });
 
-  it('does not throw and does not log a skip reason for a healthy gmail inbox', async () => {
-    // Spec § "Sync worker": skip-guards should fall through for a healthy
-    // inbox. We seed `gmailHistoryId` so the T-34 bootstrap branch does NOT
-    // fire (and the T-37 incremental branch is still a no-op) — that way the
-    // test stays focused on the skip path. The bootstrap branch has its own
-    // dedicated suite in `gmail-sync-bootstrap.spec.ts`.
-    const inbox = buildInbox({
-      config: { provider: 'gmail', needsReauth: false, gmailHistoryId: 'preset' },
-    });
-    const { app, log } = buildApp([inbox]);
-
-    await expect(
-      processGmailSyncJob(app, { data: { inboxId: INBOX_ID } }),
-    ).resolves.toBeUndefined();
-
-    expect(log.info).not.toHaveBeenCalled();
-    expect(log.warn).not.toHaveBeenCalled();
-    expect(log.error).not.toHaveBeenCalled();
-  });
-
   it('calls db.select exactly once per job (no extra lookups in the skip path)', async () => {
     const inbox = buildInbox({ enabled: false });
     const { app, selectLimit } = buildApp([inbox]);

@@ -220,31 +220,6 @@ describe('processGmailSyncJob — bootstrap path', () => {
     expect(ingest).not.toHaveBeenCalled();
   });
 
-  it('does not run bootstrap when gmailHistoryId is already stored (incremental path is T-37+)', async () => {
-    // T-34 covers ONLY the bootstrap branch. When `gmailHistoryId` is set the
-    // worker falls through without making any Gmail call yet — T-37 will
-    // replace this branch with `users.history.list` (incremental).
-    const inbox = buildHealthyInbox({
-      config: { provider: 'gmail', gmailHistoryId: '987654321' },
-    });
-    const { app, db } = buildApp([inbox]);
-    const fetchImpl = vi.fn();
-    const getAccessToken = vi.fn();
-    const ingest = vi.fn();
-
-    await processGmailSyncJob(
-      app,
-      { data: { inboxId: INBOX_ID } },
-      { fetchImpl, getAccessToken, ingest },
-    );
-
-    expect(fetchImpl).not.toHaveBeenCalled();
-    expect(getAccessToken).not.toHaveBeenCalled();
-    expect(ingest).not.toHaveBeenCalled();
-    // Skipped path: no historyId update fires either (T-36 guard).
-    expect(db.update).not.toHaveBeenCalled();
-  });
-
   it('throws when messages.list returns 4xx so BullMQ schedules a retry', async () => {
     const inbox = buildHealthyInbox();
     const { app, db } = buildApp([inbox]);

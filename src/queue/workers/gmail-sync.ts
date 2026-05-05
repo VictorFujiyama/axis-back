@@ -33,6 +33,17 @@ interface GmailMessageListResponse {
   nextPageToken?: string;
 }
 
+interface GmailHistoryListResponse {
+  history?: Array<{
+    id: string;
+    messagesAdded?: Array<{
+      message: { id: string; threadId: string; labelIds?: string[] };
+    }>;
+  }>;
+  historyId?: string;
+  nextPageToken?: string;
+}
+
 export interface ProcessGmailSyncJobDeps {
   /** Override `fetch` for testing. Defaults to global `fetch`. */
   fetchImpl?: typeof fetch;
@@ -136,6 +147,61 @@ async function fetchGmailHistoryCursor(
 }
 
 /**
+ * Issues `users.history.list?startHistoryId=<id>&historyTypes=messageAdded` and
+ * collects the deduped set of new message ids the cursor revealed. The same
+ * Gmail message can appear in several history records (label changes, thread
+ * reshuffles); we fetch + ingest it exactly once. Returns the response's
+ * `historyId` for the worker to persist as the new cursor — this is
+ * already-known to be the latest snapshot id at request time, NOT a per-record
+ * id, so a single advance covers the entire window.
+ *
+ * Throws on non-2xx so BullMQ retries (T-38 will discriminate the 404 case to
+ * clear the cursor and force a bootstrap). Throws on missing `historyId` to
+ * avoid persisting a partial / undefined cursor that would brick subsequent
+ * runs.
+ */
+async function listHistoryEvents(
+  accessToken: string,
+  startHistoryId: string,
+  fetchImpl: typeof fetch,
+): Promise<{ messageIds: string[]; historyId: string }> {
+  const url = new URL(`${GMAIL_API_BASE}/users/me/history`);
+  url.searchParams.set('startHistoryId', startHistoryId);
+  url.searchParams.set('historyTypes', 'messageAdded');
+  url.searchParams.set('labelId', 'INBOX');
+  url.searchParams.set('maxResults', '500');
+
+  const res = await fetchImpl(url.toString(), {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    throw new Error(`gmail history.list ${res.status}`);
+  }
+  const body = (await res.json()) as GmailHistoryListResponse;
+  if (!body.historyId) {
+    throw new Error('gmail history.list response missing historyId');
+  }
+
+  const seen = new Set<string>();
+  const messageIds: string[] = [];
+  for (const record of body.history ?? []) {
+    for (const added of record.messagesAdded ?? []) {
+      const id = added.message?.id;
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        messageIds.push(id);
+      }
+    }
+  }
+  return { messageIds, historyId: body.historyId };
+}
+
+/**
  * Maps a parsed Gmail message into the channel-agnostic `IncomingMessage` shape
  * `ingestWithHooks` accepts. Returns `null` when the message lacks a parseable
  * `From` (no identifier → cannot route to a contact). The `channelMsgId`
@@ -220,56 +286,97 @@ export async function processGmailSyncJob(
 
   const parsedConfig = parseGmailConfig(rawConfig);
 
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const getAccessToken = deps.getAccessToken ?? getValidAccessToken;
+  const ingest = deps.ingest ?? ingestWithHooks;
+  const accessToken = await getAccessToken(app, inbox as GmailInboxLike);
+
+  let messageIds: string[];
+  let newHistoryId: string;
+
   if (!parsedConfig.gmailHistoryId) {
-    // Bootstrap branch: no cursor stored yet, list recent unread + fetch each
-    // message in `format=full`, ingest each, then persist `gmailHistoryId` via
-    // `users.getProfile` so the next iteration uses the incremental path.
-    const fetchImpl = deps.fetchImpl ?? fetch;
-    const getAccessToken = deps.getAccessToken ?? getValidAccessToken;
-    const ingest = deps.ingest ?? ingestWithHooks;
-    const accessToken = await getAccessToken(app, inbox as GmailInboxLike);
-
+    // Bootstrap branch: no cursor stored yet, list recent unread, then capture
+    // a fresh `historyId` from `users.getProfile` to seed the incremental path.
     const messages = await listBootstrapMessages(accessToken, fetchImpl);
-    for (const message of messages) {
-      const raw = await fetchFullGmailMessage(message.id, accessToken, fetchImpl);
-      const payload = buildIngestPayload(inboxId, raw);
-      if (!payload) {
-        app.log.warn(
-          { inboxId, gmailMessageId: raw.id },
-          'gmail-sync: no From header, skipping message',
-        );
-        continue;
-      }
-      // Per-message try/catch keeps a single broken row from aborting the
-      // batch; unprocessed messages stay UNREAD and are retried next cycle.
-      // T-39 will gate mark-read on a successful ingest result.
-      try {
-        await ingest(app, payload, inbox.config, inbox.defaultBotId ?? null);
-      } catch (err) {
-        app.log.warn(
-          { err, inboxId, gmailMessageId: raw.id },
-          'gmail-sync: ingest failed for message',
-        );
-      }
-    }
-
-    // Persist the cursor regardless of per-message ingest outcomes — a single
-    // broken message must not block the cursor or the inbox would be stuck
-    // re-bootstrapping the same window forever. Re-running the bootstrap on
-    // the same data is dedup-safe (channelMsgId match).
-    const newHistoryId = await fetchGmailHistoryCursor(accessToken, fetchImpl);
-    const patchedConfig = {
-      ...parsedConfig,
-      gmailHistoryId: newHistoryId,
-    };
-    await app.db
-      .update(schema.inboxes)
-      .set({ config: patchedConfig, updatedAt: new Date() })
-      .where(eq(schema.inboxes.id, inboxId));
-    return;
+    messageIds = messages.map((m) => m.id);
+    await processMessageIds(
+      app,
+      inbox,
+      messageIds,
+      accessToken,
+      fetchImpl,
+      ingest,
+    );
+    newHistoryId = await fetchGmailHistoryCursor(accessToken, fetchImpl);
+  } else {
+    // Incremental branch: read events since the stored cursor. The response's
+    // `historyId` is the new cursor value (Gmail returns the latest snapshot id
+    // at request time — a single advance covers the entire processed window).
+    const result = await listHistoryEvents(
+      accessToken,
+      parsedConfig.gmailHistoryId,
+      fetchImpl,
+    );
+    messageIds = result.messageIds;
+    await processMessageIds(
+      app,
+      inbox,
+      messageIds,
+      accessToken,
+      fetchImpl,
+      ingest,
+    );
+    newHistoryId = result.historyId;
   }
 
-  // T-37: incremental path via `users.history.list?startHistoryId=<id>`.
+  // Persist the cursor regardless of per-message ingest outcomes — a single
+  // broken message must not block the cursor or the inbox would be stuck
+  // reading the same window forever. Re-processing on the next run is
+  // dedup-safe via `channelMsgId` matching in `ingestWithHooks`.
+  const patchedConfig = {
+    ...parsedConfig,
+    gmailHistoryId: newHistoryId,
+  };
+  await app.db
+    .update(schema.inboxes)
+    .set({ config: patchedConfig, updatedAt: new Date() })
+    .where(eq(schema.inboxes.id, inboxId));
+}
+
+/**
+ * Per-message worker pass shared by bootstrap and incremental branches:
+ * fetch each id in `format=full`, parse, ingest. A single broken message
+ * (parser or downstream ingest failure) is logged but does NOT abort the
+ * batch — Gmail keeps the message UNREAD until T-39's mark-read fires, so
+ * the next cycle naturally retries.
+ */
+async function processMessageIds(
+  app: FastifyInstance,
+  inbox: { id: string; config: unknown; defaultBotId: string | null },
+  messageIds: string[],
+  accessToken: string,
+  fetchImpl: typeof fetch,
+  ingest: typeof ingestWithHooks,
+): Promise<void> {
+  for (const id of messageIds) {
+    const raw = await fetchFullGmailMessage(id, accessToken, fetchImpl);
+    const payload = buildIngestPayload(inbox.id, raw);
+    if (!payload) {
+      app.log.warn(
+        { inboxId: inbox.id, gmailMessageId: raw.id },
+        'gmail-sync: no From header, skipping message',
+      );
+      continue;
+    }
+    try {
+      await ingest(app, payload, inbox.config, inbox.defaultBotId ?? null);
+    } catch (err) {
+      app.log.warn(
+        { err, inboxId: inbox.id, gmailMessageId: raw.id },
+        'gmail-sync: ingest failed for message',
+      );
+    }
+  }
 }
 
 /**
