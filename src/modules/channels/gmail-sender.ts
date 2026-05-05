@@ -147,6 +147,7 @@ export async function sendViaGmail(
   const data = (await res.json().catch(() => ({}))) as {
     id?: string;
     threadId?: string;
+    error?: { code?: number; message?: string; status?: string };
   };
 
   if (res.ok) {
@@ -160,7 +161,52 @@ export async function sendViaGmail(
     return;
   }
 
-  // Non-2xx error policy lands in T-46. Until then, surface as a generic throw
-  // so BullMQ retries (no permanent-fail path is wired yet).
-  throw new Error(`gmail ${res.status}`);
+  // 401 Unauthorized after a freshly-resolved access token means the refresh
+  // token itself is no longer trusted by Google (revoked, scopes pulled,
+  // account suspended). Flip `needsReauth` so the UI surfaces the banner
+  // and permanently fail the message — BullMQ must NOT retry a credential
+  // problem.
+  if (res.status === 401) {
+    const patchedConfig = { ...(config as GmailConfig), needsReauth: true };
+    await db
+      .update(schema.inboxes)
+      .set({ config: patchedConfig, updatedAt: new Date() })
+      .where(eq(schema.inboxes.id, input.inboxId));
+    await db
+      .update(schema.messages)
+      .set({
+        failedAt: new Date(),
+        failureReason: 'gmail oauth expired — reauthorize',
+      })
+      .where(eq(schema.messages.id, input.messageId));
+    log.error(
+      { inboxId: input.inboxId, status: 401 },
+      'gmail.send: 401 — needsReauth set, message marked failed',
+    );
+    return;
+  }
+
+  // Other 4xx (400 invalid argument, 403 forbidden, 404 not found, …) are
+  // permanent failures: mark the message and stop. Reason prefers Google's
+  // error.message so agents can see the actual problem; falls back to
+  // `gmail <status>` when the body is empty or non-JSON.
+  if (res.status >= 400 && res.status < 500) {
+    const reason = data.error?.message ?? `gmail ${res.status}`;
+    await db
+      .update(schema.messages)
+      .set({ failedAt: new Date(), failureReason: reason })
+      .where(eq(schema.messages.id, input.messageId));
+    log.error(
+      { inboxId: input.inboxId, status: res.status, data },
+      'gmail.send: 4xx (permanent)',
+    );
+    return;
+  }
+
+  // 5xx — transient. Throw so BullMQ retries with the configured backoff.
+  log.warn(
+    { inboxId: input.inboxId, status: res.status, data },
+    'gmail.send: 5xx — will retry',
+  );
+  throw new Error(`gmail ${res.status}: ${data.error?.message ?? 'server error'}`);
 }

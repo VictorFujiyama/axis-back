@@ -1,5 +1,5 @@
 import type { FastifyBaseLogger } from 'fastify';
-import type { DB } from '@blossom/db';
+import { schema, type DB } from '@blossom/db';
 import { describe, expect, it, vi } from 'vitest';
 import {
   composeMimeRfc5322,
@@ -459,5 +459,209 @@ describe('sendViaGmail — happy path (T-45)', () => {
     const body = JSON.parse(init.body as string) as { raw: string };
     const decoded = Buffer.from(body.raw, 'base64url').toString('utf8');
     expect(decoded).toContain(text);
+  });
+});
+
+describe('sendViaGmail — error handling (T-46)', () => {
+  describe('401 Unauthorized → reauth + permanent fail', () => {
+    it('patches inboxes.config setting needsReauth: true (preserving other fields)', async () => {
+      const { deps, dbStub, fetchImpl } = buildDeps();
+      fetchImpl.mockResolvedValueOnce(
+        jsonResponse(
+          { error: { code: 401, message: 'Invalid Credentials', status: 'UNAUTHENTICATED' } },
+          401,
+        ),
+      );
+      const config = {
+        provider: 'gmail' as const,
+        gmailEmail: 'support@example.com',
+        gmailHistoryId: '987654321',
+        fromName: 'Atendimento Acme',
+      };
+
+      await sendViaGmail(buildInput(), config, null, null, deps);
+
+      // Two updates: inbox config first, then message failure-mark.
+      expect(dbStub.update).toHaveBeenCalledTimes(2);
+      expect(dbStub.update).toHaveBeenNthCalledWith(1, schema.inboxes);
+      expect(dbStub.update).toHaveBeenNthCalledWith(2, schema.messages);
+
+      const inboxPatch = dbStub.updateSet.mock.calls[0]![0] as {
+        config?: {
+          needsReauth?: boolean;
+          provider?: string;
+          gmailEmail?: string;
+          gmailHistoryId?: string;
+          fromName?: string;
+        };
+      };
+      expect(inboxPatch.config?.needsReauth).toBe(true);
+      // Other config fields survive the patch.
+      expect(inboxPatch.config?.provider).toBe('gmail');
+      expect(inboxPatch.config?.gmailEmail).toBe('support@example.com');
+      expect(inboxPatch.config?.gmailHistoryId).toBe('987654321');
+      expect(inboxPatch.config?.fromName).toBe('Atendimento Acme');
+    });
+
+    it('marks the message failedAt with reason "gmail oauth expired — reauthorize"', async () => {
+      const { deps, dbStub, fetchImpl } = buildDeps();
+      fetchImpl.mockResolvedValueOnce(
+        jsonResponse({ error: { code: 401, message: 'Invalid Credentials' } }, 401),
+      );
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await sendViaGmail(buildInput(), config, null, null, deps);
+
+      const messagePatch = dbStub.updateSet.mock.calls[1]![0] as {
+        failedAt?: Date;
+        failureReason?: string;
+      };
+      expect(messagePatch.failedAt).toBeInstanceOf(Date);
+      expect(messagePatch.failureReason).toBe('gmail oauth expired — reauthorize');
+    });
+
+    it('does NOT throw — permanent fail, no BullMQ retry', async () => {
+      const { deps, fetchImpl } = buildDeps();
+      fetchImpl.mockResolvedValueOnce(
+        jsonResponse({ error: { code: 401, message: 'Invalid Credentials' } }, 401),
+      );
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await expect(
+        sendViaGmail(buildInput(), config, null, null, deps),
+      ).resolves.toBeUndefined();
+    });
+
+    it('does NOT set deliveredAt or channelMsgId on a 401', async () => {
+      const { deps, dbStub, fetchImpl } = buildDeps();
+      fetchImpl.mockResolvedValueOnce(
+        jsonResponse({ error: { code: 401, message: 'Invalid Credentials' } }, 401),
+      );
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await sendViaGmail(buildInput(), config, null, null, deps);
+
+      // Neither update payload should look like a delivery success.
+      for (const call of dbStub.updateSet.mock.calls) {
+        const patch = call[0] as { deliveredAt?: Date; channelMsgId?: string | null };
+        expect(patch.deliveredAt).toBeUndefined();
+        expect(patch.channelMsgId).toBeUndefined();
+      }
+    });
+  });
+
+  describe('4xx other → permanent fail (no reauth)', () => {
+    it('400: marks message failedAt with the Gmail error message', async () => {
+      const { deps, dbStub, fetchImpl } = buildDeps();
+      fetchImpl.mockResolvedValueOnce(
+        jsonResponse(
+          { error: { code: 400, message: 'Invalid To header', status: 'INVALID_ARGUMENT' } },
+          400,
+        ),
+      );
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await sendViaGmail(buildInput(), config, null, null, deps);
+
+      // Single update: message only — inboxes is NOT touched.
+      expect(dbStub.update).toHaveBeenCalledTimes(1);
+      expect(dbStub.update).toHaveBeenNthCalledWith(1, schema.messages);
+      const patch = dbStub.updateSet.mock.calls[0]![0] as {
+        failedAt?: Date;
+        failureReason?: string;
+      };
+      expect(patch.failedAt).toBeInstanceOf(Date);
+      expect(patch.failureReason).toBe('Invalid To header');
+    });
+
+    it('400: falls back to "gmail 400" when the response body has no message', async () => {
+      const { deps, dbStub, fetchImpl } = buildDeps();
+      fetchImpl.mockResolvedValueOnce(new Response('', { status: 400 }));
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await sendViaGmail(buildInput(), config, null, null, deps);
+
+      const patch = dbStub.updateSet.mock.calls[0]![0] as { failureReason?: string };
+      expect(patch.failureReason).toBe('gmail 400');
+    });
+
+    it('does NOT throw on 400 — permanent fail', async () => {
+      const { deps, fetchImpl } = buildDeps();
+      fetchImpl.mockResolvedValueOnce(
+        jsonResponse({ error: { code: 400, message: 'Bad' } }, 400),
+      );
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await expect(
+        sendViaGmail(buildInput(), config, null, null, deps),
+      ).resolves.toBeUndefined();
+    });
+
+    it('does NOT touch inboxes.config on 400 (no reauth flag)', async () => {
+      const { deps, dbStub, fetchImpl } = buildDeps();
+      fetchImpl.mockResolvedValueOnce(
+        jsonResponse({ error: { code: 400, message: 'Bad' } }, 400),
+      );
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await sendViaGmail(buildInput(), config, null, null, deps);
+
+      // Only one update — to schema.messages, never schema.inboxes.
+      expect(dbStub.update).toHaveBeenCalledTimes(1);
+      expect(dbStub.update.mock.calls[0]![0]).toBe(schema.messages);
+    });
+
+    it('404: also treated as permanent fail with "gmail 404" reason', async () => {
+      const { deps, dbStub, fetchImpl } = buildDeps();
+      fetchImpl.mockResolvedValueOnce(new Response('', { status: 404 }));
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await sendViaGmail(buildInput(), config, null, null, deps);
+
+      expect(dbStub.update).toHaveBeenCalledTimes(1);
+      expect(dbStub.update.mock.calls[0]![0]).toBe(schema.messages);
+      const patch = dbStub.updateSet.mock.calls[0]![0] as { failureReason?: string };
+      expect(patch.failureReason).toBe('gmail 404');
+    });
+  });
+
+  describe('5xx → throw (BullMQ retries)', () => {
+    it('503: throws with "gmail 503" so BullMQ retries', async () => {
+      const { deps, fetchImpl } = buildDeps();
+      fetchImpl.mockResolvedValueOnce(
+        jsonResponse({ error: { code: 503, message: 'Backend Error' } }, 503),
+      );
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await expect(
+        sendViaGmail(buildInput(), config, null, null, deps),
+      ).rejects.toThrow(/gmail 503/);
+    });
+
+    it('503: makes NO DB writes (no failedAt, no needsReauth)', async () => {
+      const { deps, dbStub, fetchImpl } = buildDeps();
+      fetchImpl.mockResolvedValueOnce(
+        jsonResponse({ error: { code: 503, message: 'Backend Error' } }, 503),
+      );
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await expect(
+        sendViaGmail(buildInput(), config, null, null, deps),
+      ).rejects.toThrow();
+      // Pre-check select runs, but no failure-mark or reauth update should fire.
+      expect(dbStub.update).not.toHaveBeenCalled();
+    });
+
+    it('500: throws with "gmail 500"', async () => {
+      const { deps, fetchImpl } = buildDeps();
+      fetchImpl.mockResolvedValueOnce(
+        jsonResponse({ error: { code: 500, message: 'Internal' } }, 500),
+      );
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await expect(
+        sendViaGmail(buildInput(), config, null, null, deps),
+      ).rejects.toThrow(/gmail 500/);
+    });
   });
 });
