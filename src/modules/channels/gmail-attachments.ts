@@ -5,6 +5,9 @@
  * have already validated/refreshed.
  */
 
+import { randomUUID } from 'node:crypto';
+import { extname } from 'node:path';
+import { uploadFile } from '../../lib/storage.js';
 import type { ParsedGmailAttachment } from './gmail-parse.js';
 
 const GMAIL_API_BASE = 'https://gmail.googleapis.com/gmail/v1';
@@ -122,4 +125,43 @@ export async function downloadGmailAttachmentSafe(
     accessToken,
     deps,
   );
+}
+
+export type UploadFileImpl = (
+  buffer: Buffer,
+  key: string,
+  contentType: string,
+) => Promise<{ url: string; key: string }>;
+
+export interface UploadGmailAttachmentDeps {
+  /** Override the storage backend for testing. Defaults to `lib/storage.uploadFile`. */
+  uploadFileImpl?: UploadFileImpl;
+}
+
+const DEFAULT_FILENAME = 'attachment';
+const DEFAULT_EXT = '.bin';
+
+/**
+ * Uploads an attachment buffer to R2 and returns its public URL. Mirrors the
+ * `mirrorTwilioMedia` key convention `<accountId>/inbound/<uuid><ext>` so
+ * inbound media from every channel share a single addressing scheme — easy to
+ * audit, bill, or purge per-tenant.
+ *
+ * `filename` is used only to derive the file extension. Empty filenames fall
+ * back to a sentinel ('attachment'); when no extension can be lifted, '.bin'
+ * is used. `mimeType` becomes the R2 object's Content-Type header verbatim.
+ */
+export async function uploadGmailAttachment(
+  buffer: Buffer,
+  filename: string,
+  mimeType: string,
+  accountId: string,
+  deps: UploadGmailAttachmentDeps = {},
+): Promise<string> {
+  const upload = deps.uploadFileImpl ?? uploadFile;
+  const safeName = filename || DEFAULT_FILENAME;
+  const ext = extname(safeName).toLowerCase() || DEFAULT_EXT;
+  const key = `${accountId}/inbound/${randomUUID()}${ext}`;
+  const result = await upload(buffer, key, mimeType);
+  return result.url;
 }

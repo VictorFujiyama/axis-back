@@ -3,6 +3,7 @@ import {
   downloadGmailAttachment,
   downloadGmailAttachmentSafe,
   GmailApiError,
+  uploadGmailAttachment,
 } from '../gmail-attachments.js';
 import type { ParsedGmailAttachment } from '../gmail-parse.js';
 
@@ -240,5 +241,154 @@ describe('downloadGmailAttachmentSafe', () => {
         { fetchImpl: fetchImpl as unknown as typeof fetch },
       ),
     ).rejects.toBeInstanceOf(GmailApiError);
+  });
+});
+
+describe('uploadGmailAttachment', () => {
+  it('uploads via R2 and returns the public URL', async () => {
+    const uploadFileImpl = vi.fn(async () => ({
+      url: 'https://cdn.example.com/uploads/acc-1/inbound/abc.pdf',
+      key: 'acc-1/inbound/abc.pdf',
+    }));
+    const url = await uploadGmailAttachment(
+      Buffer.from('hi'),
+      'invoice.pdf',
+      'application/pdf',
+      'acc-1',
+      { uploadFileImpl },
+    );
+    expect(url).toBe('https://cdn.example.com/uploads/acc-1/inbound/abc.pdf');
+    expect(uploadFileImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('builds key as <accountId>/inbound/<uuid><ext> (mirrors mirrorTwilioMedia convention)', async () => {
+    let capturedKey: string | undefined;
+    const uploadFileImpl = vi.fn(
+      async (_buf: Buffer, key: string, _mime: string) => {
+        capturedKey = key;
+        return { url: 'u', key };
+      },
+    );
+    await uploadGmailAttachment(
+      Buffer.from('x'),
+      'invoice.pdf',
+      'application/pdf',
+      'acc-9',
+      { uploadFileImpl },
+    );
+    expect(capturedKey).toMatch(
+      /^acc-9\/inbound\/[0-9a-f-]{36}\.pdf$/i,
+    );
+  });
+
+  it('lowercases the extension derived from filename', async () => {
+    let capturedKey: string | undefined;
+    const uploadFileImpl = vi.fn(
+      async (_buf: Buffer, key: string, _mime: string) => {
+        capturedKey = key;
+        return { url: 'u', key };
+      },
+    );
+    await uploadGmailAttachment(
+      Buffer.from('x'),
+      'PHOTO.JPG',
+      'image/jpeg',
+      'acc-1',
+      { uploadFileImpl },
+    );
+    expect(capturedKey).toMatch(/\.jpg$/);
+  });
+
+  it('falls back to .bin when filename has no extension', async () => {
+    let capturedKey: string | undefined;
+    const uploadFileImpl = vi.fn(
+      async (_buf: Buffer, key: string, _mime: string) => {
+        capturedKey = key;
+        return { url: 'u', key };
+      },
+    );
+    await uploadGmailAttachment(
+      Buffer.from('x'),
+      'README',
+      'text/plain',
+      'acc-1',
+      { uploadFileImpl },
+    );
+    expect(capturedKey).toMatch(/\.bin$/);
+  });
+
+  it('coerces empty filename to a default and emits .bin extension', async () => {
+    let capturedKey: string | undefined;
+    const uploadFileImpl = vi.fn(
+      async (_buf: Buffer, key: string, _mime: string) => {
+        capturedKey = key;
+        return { url: 'u', key };
+      },
+    );
+    await uploadGmailAttachment(
+      Buffer.from('x'),
+      '',
+      'application/octet-stream',
+      'acc-1',
+      { uploadFileImpl },
+    );
+    expect(capturedKey).toMatch(/\.bin$/);
+  });
+
+  it('passes mimeType verbatim as ContentType to the R2 client', async () => {
+    let capturedMime: string | undefined;
+    const uploadFileImpl = vi.fn(
+      async (_buf: Buffer, _key: string, mime: string) => {
+        capturedMime = mime;
+        return { url: 'u', key: 'k' };
+      },
+    );
+    await uploadGmailAttachment(
+      Buffer.from('x'),
+      'note.txt',
+      'text/plain; charset=utf-8',
+      'acc-1',
+      { uploadFileImpl },
+    );
+    expect(capturedMime).toBe('text/plain; charset=utf-8');
+  });
+
+  it('passes the buffer through to the R2 client unchanged', async () => {
+    const buffer = Buffer.from([0xde, 0xad, 0xbe, 0xef]);
+    let capturedBuf: Buffer | undefined;
+    const uploadFileImpl = vi.fn(
+      async (buf: Buffer, _key: string, _mime: string) => {
+        capturedBuf = buf;
+        return { url: 'u', key: 'k' };
+      },
+    );
+    await uploadGmailAttachment(
+      buffer,
+      'binary.bin',
+      'application/octet-stream',
+      'acc-1',
+      { uploadFileImpl },
+    );
+    expect(capturedBuf).toBe(buffer);
+  });
+
+  it('emits unique keys across uploads (UUID is regenerated per call)', async () => {
+    const keys: string[] = [];
+    const uploadFileImpl = vi.fn(
+      async (_buf: Buffer, key: string, _mime: string) => {
+        keys.push(key);
+        return { url: 'u', key };
+      },
+    );
+    for (let i = 0; i < 3; i++) {
+      await uploadGmailAttachment(
+        Buffer.from('x'),
+        'doc.pdf',
+        'application/pdf',
+        'acc-1',
+        { uploadFileImpl },
+      );
+    }
+    expect(new Set(keys).size).toBe(3);
   });
 });
