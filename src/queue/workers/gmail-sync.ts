@@ -146,6 +146,10 @@ async function fetchGmailHistoryCursor(
   return body.historyId;
 }
 
+type HistoryListResult =
+  | { expired: true }
+  | { expired: false; messageIds: string[]; historyId: string };
+
 /**
  * Issues `users.history.list?startHistoryId=<id>&historyTypes=messageAdded` and
  * collects the deduped set of new message ids the cursor revealed. The same
@@ -155,16 +159,18 @@ async function fetchGmailHistoryCursor(
  * already-known to be the latest snapshot id at request time, NOT a per-record
  * id, so a single advance covers the entire window.
  *
- * Throws on non-2xx so BullMQ retries (T-38 will discriminate the 404 case to
- * clear the cursor and force a bootstrap). Throws on missing `historyId` to
- * avoid persisting a partial / undefined cursor that would brick subsequent
- * runs.
+ * Throws on non-2xx so BullMQ retries, with one exception (T-38): a 404 means
+ * the stored cursor is older than Gmail's ~7-day history retention. There is
+ * no point retrying — the cursor is permanently invalid until cleared. Returns
+ * `{ expired: true }` so the worker can null `gmailHistoryId` and let the
+ * next run take the bootstrap branch. Throws on missing `historyId` to avoid
+ * persisting a partial / undefined cursor that would brick subsequent runs.
  */
 async function listHistoryEvents(
   accessToken: string,
   startHistoryId: string,
   fetchImpl: typeof fetch,
-): Promise<{ messageIds: string[]; historyId: string }> {
+): Promise<HistoryListResult> {
   const url = new URL(`${GMAIL_API_BASE}/users/me/history`);
   url.searchParams.set('startHistoryId', startHistoryId);
   url.searchParams.set('historyTypes', 'messageAdded');
@@ -179,6 +185,9 @@ async function listHistoryEvents(
     },
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
+  if (res.status === 404) {
+    return { expired: true };
+  }
   if (!res.ok) {
     throw new Error(`gmail history.list ${res.status}`);
   }
@@ -198,7 +207,7 @@ async function listHistoryEvents(
       }
     }
   }
-  return { messageIds, historyId: body.historyId };
+  return { expired: false, messageIds, historyId: body.historyId };
 }
 
 /**
@@ -317,6 +326,21 @@ export async function processGmailSyncJob(
       parsedConfig.gmailHistoryId,
       fetchImpl,
     );
+    if (result.expired) {
+      // Spec § 7 "Sync worker / Incremental path": 404 from history.list means
+      // the cursor is older than Gmail's history retention. Null it and let
+      // the next minute's run take the bootstrap branch.
+      app.log.warn(
+        { inboxId, staleHistoryId: parsedConfig.gmailHistoryId },
+        'gmail-sync: history expired, clearing cursor to force bootstrap on next run',
+      );
+      const resetConfig = { ...parsedConfig, gmailHistoryId: null };
+      await app.db
+        .update(schema.inboxes)
+        .set({ config: resetConfig, updatedAt: new Date() })
+        .where(eq(schema.inboxes.id, inboxId));
+      return;
+    }
     messageIds = result.messageIds;
     await processMessageIds(
       app,

@@ -485,6 +485,99 @@ describe('processGmailSyncJob — incremental path', () => {
     expect(setArg.config.gmailHistoryId).toBe('h-after-failure');
   });
 
+  it('on 404 from history.list, clears gmailHistoryId to force a bootstrap on next run', async () => {
+    // Spec § 7 "Sync worker / Incremental path": 404 means the cursor expired
+    // (Gmail discards history entries after ~7 days). Clear the cursor so the
+    // next minute's run takes the bootstrap branch — do NOT throw, otherwise
+    // BullMQ would retry forever against a permanently-404'ing endpoint.
+    const inbox = buildHealthyInbox();
+    const { app, db } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }));
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn();
+
+    await expect(
+      processGmailSyncJob(
+        app,
+        { data: { inboxId: INBOX_ID } },
+        { fetchImpl, getAccessToken, ingest },
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(ingest).not.toHaveBeenCalled();
+    // Only the history.list call — no message gets, no profile call.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    expect(db.update).toHaveBeenCalledTimes(1);
+    const setArg = db.updateSet.mock.calls[0]![0] as {
+      config: { gmailHistoryId: string | null };
+      updatedAt: Date;
+    };
+    expect(setArg.config.gmailHistoryId).toBeNull();
+    expect(setArg.updatedAt).toBeInstanceOf(Date);
+  });
+
+  it('on 404 from history.list, preserves other config fields when clearing the cursor', async () => {
+    const inbox = buildHealthyInbox({
+      config: {
+        provider: 'gmail',
+        gmailEmail: 'support@example.com',
+        fromName: 'Support Team',
+        needsReauth: false,
+        gmailHistoryId: 'h-stale',
+      },
+    });
+    const { app, db } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }));
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn();
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    const setArg = db.updateSet.mock.calls[0]![0] as {
+      config: Record<string, unknown>;
+    };
+    expect(setArg.config).toEqual({
+      provider: 'gmail',
+      gmailEmail: 'support@example.com',
+      fromName: 'Support Team',
+      needsReauth: false,
+      gmailHistoryId: null,
+    });
+  });
+
+  it('on 404 from history.list, logs the expiry so operators can spot the bootstrap reset', async () => {
+    const inbox = buildHealthyInbox();
+    const { app, log } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }));
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn();
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    const allLogs = [...log.info.mock.calls, ...log.warn.mock.calls];
+    const matched = allLogs.some(
+      (call) =>
+        typeof call[1] === 'string' &&
+        /history.*(expired|reset|bootstrap)/i.test(call[1] as string),
+    );
+    expect(matched).toBe(true);
+  });
+
   it('threads inbox.defaultBotId through to ingestWithHooks (4th argument)', async () => {
     const inbox = buildHealthyInbox({ defaultBotId: 'bot-123' });
     const { app } = buildApp([inbox]);
