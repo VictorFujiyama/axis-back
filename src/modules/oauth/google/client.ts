@@ -33,6 +33,10 @@ export interface RefreshAccessTokenResult {
   expiresIn: number;
 }
 
+export interface UserInfoResult {
+  email: string;
+}
+
 export interface GoogleClientDeps {
   /** Override `fetch` for testing. Defaults to global `fetch`. */
   fetchImpl?: typeof fetch;
@@ -45,6 +49,7 @@ export interface GoogleClientDeps {
 }
 
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
 const FETCH_TIMEOUT_MS = 15_000;
 
 interface ResolvedDeps {
@@ -209,4 +214,62 @@ export async function refreshAccessToken(
     accessToken: data.access_token,
     expiresIn: data.expires_in,
   };
+}
+
+interface UserInfoResponseBody {
+  sub?: string;
+  email?: string;
+  email_verified?: boolean;
+  name?: string;
+}
+
+/**
+ * Fetches the authenticated user's email from Google's userinfo endpoint.
+ * Authenticates via the access token alone — no `GOOGLE_OAUTH_*` config required.
+ */
+export async function getUserInfo(
+  accessToken: string,
+  deps: Pick<GoogleClientDeps, 'fetchImpl'> = {},
+): Promise<UserInfoResult> {
+  const fetchImpl = deps.fetchImpl ?? fetch;
+
+  let res: Response;
+  try {
+    res = await fetchImpl(USERINFO_URL, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new GoogleOAuthError(
+      `network error: ${(err as Error).message}`,
+      undefined,
+      'network',
+    );
+  }
+
+  const data = (await res.json().catch(() => ({}))) as UserInfoResponseBody & {
+    error?: { message?: string; status?: string } | string;
+  };
+
+  if (!res.ok) {
+    const errorMessage =
+      typeof data.error === 'string'
+        ? data.error
+        : data.error?.message ?? `google ${res.status}`;
+    throw new GoogleOAuthError(errorMessage, res.status);
+  }
+
+  if (!data.email) {
+    throw new GoogleOAuthError(
+      'invalid userinfo response from google',
+      res.status,
+      'invalid_response',
+    );
+  }
+
+  return { email: data.email };
 }

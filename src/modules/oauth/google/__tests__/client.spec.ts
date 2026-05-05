@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   exchangeCode,
+  getUserInfo,
   GoogleOAuthError,
   InvalidGrantError,
   refreshAccessToken,
@@ -238,5 +239,104 @@ describe('refreshAccessToken', () => {
     }).catch((e) => e as Error);
     expect(err).toBeInstanceOf(GoogleOAuthError);
     expect((err as GoogleOAuthError).code).toBe('network');
+  });
+});
+
+describe('getUserInfo', () => {
+  it('GETs the userinfo endpoint with a Bearer token and returns the email', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({
+        sub: '1234567890',
+        email: 'support@example.com',
+        email_verified: true,
+        name: 'Support',
+      }),
+    );
+
+    const out = await getUserInfo('ya29.access', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    expect(out).toEqual({ email: 'support@example.com' });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const call = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    const [url, init] = call;
+    expect(url).toBe('https://www.googleapis.com/oauth2/v3/userinfo');
+    expect(init.method ?? 'GET').toBe('GET');
+    expect((init.headers as Record<string, string>).Authorization).toBe(
+      'Bearer ya29.access',
+    );
+    expect((init.headers as Record<string, string>).Accept).toBe(
+      'application/json',
+    );
+    // GET should not have a body
+    expect(init.body).toBeUndefined();
+  });
+
+  it('throws GoogleOAuthError carrying status 401 when the access token is invalid', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(
+        {
+          error: {
+            code: 401,
+            message: 'Invalid Credentials',
+            status: 'UNAUTHENTICATED',
+          },
+        },
+        401,
+      ),
+    );
+    const err = await getUserInfo('STALE', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    }).catch((e) => e as Error);
+    expect(err).toBeInstanceOf(GoogleOAuthError);
+    expect((err as GoogleOAuthError).status).toBe(401);
+  });
+
+  it('throws when the 200 response is missing email', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({ sub: '1234567890', email_verified: true }),
+    );
+    const err = await getUserInfo('ya29.x', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    }).catch((e) => e as Error);
+    expect(err).toBeInstanceOf(GoogleOAuthError);
+    expect((err as GoogleOAuthError).code).toBe('invalid_response');
+  });
+
+  it('configures an AbortSignal on the fetch call (15s timeout)', async () => {
+    let observedSignal: AbortSignal | undefined;
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+      observedSignal = init.signal as AbortSignal;
+      return jsonResponse({ email: 'x@example.com' });
+    });
+    await getUserInfo('ya29.x', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(observedSignal).toBeInstanceOf(AbortSignal);
+    expect(observedSignal!.aborted).toBe(false);
+  });
+
+  it('wraps network/abort errors in GoogleOAuthError with code "network"', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('connect ECONNREFUSED');
+    });
+    const err = await getUserInfo('ya29.x', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    }).catch((e) => e as Error);
+    expect(err).toBeInstanceOf(GoogleOAuthError);
+    expect((err as GoogleOAuthError).code).toBe('network');
+  });
+
+  it('does not require client_id/client_secret/redirect_uri (no GOOGLE_OAUTH_* config used)', async () => {
+    // Note: this is a behavioral guard — getUserInfo authenticates via the access
+    // token alone, so it must not fail with "config_missing" when oauth env is unset.
+    const fetchImpl = vi.fn(async () => jsonResponse({ email: 'a@b.com' }));
+    await expect(
+      getUserInfo('ya29.x', {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      }),
+    ).resolves.toEqual({ email: 'a@b.com' });
   });
 });
