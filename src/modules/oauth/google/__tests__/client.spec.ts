@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { exchangeCode, GoogleOAuthError } from '../client.js';
+import {
+  exchangeCode,
+  GoogleOAuthError,
+  InvalidGrantError,
+  refreshAccessToken,
+} from '../client.js';
 
 const baseCreds = {
   clientId: 'test-client-id',
@@ -110,6 +115,124 @@ describe('exchangeCode', () => {
       throw new Error('connect ECONNREFUSED');
     });
     const err = await exchangeCode('X', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      ...baseCreds,
+    }).catch((e) => e as Error);
+    expect(err).toBeInstanceOf(GoogleOAuthError);
+    expect((err as GoogleOAuthError).code).toBe('network');
+  });
+});
+
+describe('refreshAccessToken', () => {
+  it('refreshes an access token, posting grant_type=refresh_token to the Google token endpoint', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({
+        access_token: 'ya29.refreshed',
+        expires_in: 3599,
+        scope: 'https://www.googleapis.com/auth/gmail.modify',
+        token_type: 'Bearer',
+      }),
+    );
+
+    const out = await refreshAccessToken('1//rtoken', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      ...baseCreds,
+    });
+
+    expect(out).toEqual({
+      accessToken: 'ya29.refreshed',
+      expiresIn: 3599,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const call = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    const [url, init] = call;
+    expect(url).toBe('https://oauth2.googleapis.com/token');
+    expect(init.method).toBe('POST');
+    expect((init.headers as Record<string, string>)['Content-Type']).toBe(
+      'application/x-www-form-urlencoded',
+    );
+    const body = new URLSearchParams(init.body as string);
+    expect(body.get('refresh_token')).toBe('1//rtoken');
+    expect(body.get('client_id')).toBe(baseCreds.clientId);
+    expect(body.get('client_secret')).toBe(baseCreds.clientSecret);
+    expect(body.get('grant_type')).toBe('refresh_token');
+    // refresh flow does not need redirect_uri (Google ignores it; absence is fine)
+    expect(body.get('code')).toBeNull();
+  });
+
+  it('throws typed InvalidGrantError on 4xx with error="invalid_grant"', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(
+        { error: 'invalid_grant', error_description: 'Token has been expired or revoked.' },
+        400,
+      ),
+    );
+    const err = await refreshAccessToken('STALE', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      ...baseCreds,
+    }).catch((e) => e as Error);
+    expect(err).toBeInstanceOf(InvalidGrantError);
+    // sub-class of GoogleOAuthError, so callers can still catch the parent
+    expect(err).toBeInstanceOf(GoogleOAuthError);
+    expect((err as InvalidGrantError).status).toBe(400);
+    expect((err as InvalidGrantError).code).toBe('invalid_grant');
+    expect((err as InvalidGrantError).name).toBe('InvalidGrantError');
+  });
+
+  it('throws generic GoogleOAuthError (NOT InvalidGrantError) on other 4xx', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({ error: 'unauthorized_client' }, 401),
+    );
+    const err = await refreshAccessToken('X', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      ...baseCreds,
+    }).catch((e) => e as Error);
+    expect(err).toBeInstanceOf(GoogleOAuthError);
+    expect(err).not.toBeInstanceOf(InvalidGrantError);
+    expect((err as GoogleOAuthError).status).toBe(401);
+    expect((err as GoogleOAuthError).code).toBe('unauthorized_client');
+  });
+
+  it('throws when the 200 response is missing access_token or expires_in', async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ access_token: 'x' }));
+    await expect(
+      refreshAccessToken('X', {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        ...baseCreds,
+      }),
+    ).rejects.toBeInstanceOf(GoogleOAuthError);
+  });
+
+  it('configures an AbortSignal on the fetch call (15s timeout)', async () => {
+    let observedSignal: AbortSignal | undefined;
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+      observedSignal = init.signal as AbortSignal;
+      return jsonResponse({ access_token: 'a', expires_in: 1 });
+    });
+    await refreshAccessToken('X', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      ...baseCreds,
+    });
+    expect(observedSignal).toBeInstanceOf(AbortSignal);
+    expect(observedSignal!.aborted).toBe(false);
+  });
+
+  it('refuses to call fetch when client credentials are not configured', async () => {
+    const fetchImpl = vi.fn();
+    await expect(
+      refreshAccessToken('X', {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      }),
+    ).rejects.toBeInstanceOf(GoogleOAuthError);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('wraps network/abort errors in GoogleOAuthError with code "network"', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('connect ECONNREFUSED');
+    });
+    const err = await refreshAccessToken('X', {
       fetchImpl: fetchImpl as unknown as typeof fetch,
       ...baseCreds,
     }).catch((e) => e as Error);

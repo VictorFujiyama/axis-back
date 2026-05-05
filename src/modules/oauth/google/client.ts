@@ -11,8 +11,24 @@ export class GoogleOAuthError extends Error {
   }
 }
 
+/**
+ * Thrown by `refreshAccessToken` when Google responds with `error: 'invalid_grant'`.
+ * Indicates the refresh token has been revoked or expired and the user must re-consent.
+ */
+export class InvalidGrantError extends GoogleOAuthError {
+  constructor(message: string, status?: number) {
+    super(message, status, 'invalid_grant');
+    this.name = 'InvalidGrantError';
+  }
+}
+
 export interface ExchangeCodeResult {
   refreshToken: string;
+  accessToken: string;
+  expiresIn: number;
+}
+
+export interface RefreshAccessTokenResult {
   accessToken: string;
   expiresIn: number;
 }
@@ -127,6 +143,69 @@ export async function exchangeCode(
 
   return {
     refreshToken: data.refresh_token,
+    accessToken: data.access_token,
+    expiresIn: data.expires_in,
+  };
+}
+
+/**
+ * Exchanges a refresh token for a new access token.
+ * Wraps `https://oauth2.googleapis.com/token` with `grant_type=refresh_token` and a 15s abort.
+ *
+ * Throws `InvalidGrantError` (a sub-class of `GoogleOAuthError`) when the refresh token
+ * has been revoked or expired (`error: 'invalid_grant'`) — the caller must trigger reauth.
+ * Other 4xx responses surface as plain `GoogleOAuthError`.
+ */
+export async function refreshAccessToken(
+  refreshToken: string,
+  deps: GoogleClientDeps = {},
+): Promise<RefreshAccessTokenResult> {
+  const { fetchImpl, clientId, clientSecret } = resolveDeps(deps);
+
+  const body = new URLSearchParams();
+  body.set('client_id', clientId);
+  body.set('client_secret', clientSecret);
+  body.set('refresh_token', refreshToken);
+  body.set('grant_type', 'refresh_token');
+
+  let res: Response;
+  try {
+    res = await fetchImpl(TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+      },
+      body: body.toString(),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new GoogleOAuthError(
+      `network error: ${(err as Error).message}`,
+      undefined,
+      'network',
+    );
+  }
+
+  const data = (await res.json().catch(() => ({}))) as TokenResponseBody;
+
+  if (!res.ok) {
+    const message = data.error_description ?? data.error ?? `google ${res.status}`;
+    if (data.error === 'invalid_grant') {
+      throw new InvalidGrantError(message, res.status);
+    }
+    throw new GoogleOAuthError(message, res.status, data.error);
+  }
+
+  if (!data.access_token || typeof data.expires_in !== 'number') {
+    throw new GoogleOAuthError(
+      'invalid token response from google',
+      res.status,
+      'invalid_response',
+    );
+  }
+
+  return {
     accessToken: data.access_token,
     expiresIn: data.expires_in,
   };
