@@ -2,6 +2,8 @@ import type { FastifyBaseLogger } from 'fastify';
 import { and, desc, eq, isNotNull } from 'drizzle-orm';
 import { z } from 'zod';
 import { schema, type DB } from '@blossom/db';
+import { parseGmailConfig } from './gmail-config.js';
+import { sendViaGmail } from './gmail-sender.js';
 
 const EmailSecretsSchema = z
   .object({ serverToken: z.string().min(1).optional() })
@@ -174,6 +176,14 @@ export interface DispatchEmailDeps {
   log: FastifyBaseLogger;
   /** Test seam — defaults to `sendViaPostmark` in production. */
   sendPostmarkImpl?: typeof sendViaPostmark;
+  /** Test seam — defaults to `sendViaGmail` in production. */
+  sendGmailImpl?: typeof sendViaGmail;
+  /**
+   * Required when dispatching to a Gmail inbox. Production wraps
+   * `getValidAccessToken(app, inbox)` from the Gmail tokens module so the
+   * Redis SETNX lock and DB rotation stay encapsulated there.
+   */
+  getGmailAccessToken?: () => Promise<string>;
 }
 
 function readProvider(raw: unknown): string | undefined {
@@ -187,7 +197,8 @@ function readProvider(raw: unknown): string | undefined {
 /**
  * Routes an outbound email send to the right provider based on `config.provider`.
  * Legacy inboxes (no `provider` field) and `'postmark'` route to Postmark.
- * `'gmail'` is reserved for T-48; until then it throws.
+ * `'gmail'` routes to `sendViaGmail`; the caller must supply
+ * `getGmailAccessToken` in deps (production: wraps `getValidAccessToken`).
  */
 export async function dispatchEmailSend(
   input: SendEmailInput,
@@ -199,7 +210,18 @@ export async function dispatchEmailSend(
   const provider = readProvider(rawConfig);
 
   if (provider === 'gmail') {
-    throw new Error('dispatchEmailSend: gmail provider not implemented');
+    if (!deps.getGmailAccessToken) {
+      throw new Error(
+        'dispatchEmailSend: gmail provider requires getGmailAccessToken in deps',
+      );
+    }
+    const gmailConfig = parseGmailConfig(rawConfig);
+    const sendGmail = deps.sendGmailImpl ?? sendViaGmail;
+    return sendGmail(input, gmailConfig, inReplyToMessageId, null, {
+      db: deps.db,
+      log: deps.log,
+      getAccessToken: deps.getGmailAccessToken,
+    });
   }
 
   const config = parseEmailConfig(rawConfig);

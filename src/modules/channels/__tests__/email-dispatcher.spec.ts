@@ -33,6 +33,8 @@ const buildDeps = (overrides: Partial<DispatchEmailDeps> = {}): DispatchEmailDep
   db: {} as unknown as DB,
   log: buildLog(),
   sendPostmarkImpl: vi.fn().mockResolvedValue(undefined),
+  sendGmailImpl: vi.fn().mockResolvedValue(undefined),
+  getGmailAccessToken: vi.fn().mockResolvedValue('ya29.test-access-token'),
   ...overrides,
 });
 
@@ -130,25 +132,158 @@ describe('dispatchEmailSend', () => {
     });
   });
 
-  describe('Gmail routing (T-43: not yet implemented)', () => {
-    it('throws "not implemented" for provider: "gmail"', async () => {
-      const config = { provider: 'gmail', gmailEmail: 'support@example.com' };
+  describe('Gmail routing (T-48)', () => {
+    it('routes provider: "gmail" → sendViaGmail', async () => {
+      const config = {
+        provider: 'gmail',
+        gmailEmail: 'support@example.com',
+        fromName: 'Acme',
+      };
       const secrets = {
         refreshToken: '[REDACTED]',
         accessToken: '[REDACTED]',
         expiresAt: '2026-05-05T13:00:00.000Z',
       };
+      const input = buildInput();
 
-      await expect(
-        dispatchEmailSend(buildInput(), config, secrets, null, deps),
-      ).rejects.toThrow(/not implemented/i);
+      await dispatchEmailSend(input, config, secrets, 'reply-id-1', deps);
+
+      expect(deps.sendGmailImpl).toHaveBeenCalledTimes(1);
       expect(deps.sendPostmarkImpl).not.toHaveBeenCalled();
     });
 
-    it('mentions "gmail" in the not-implemented error message (debuggability)', async () => {
+    it('passes parsed Gmail config (provider + gmailEmail + fromName) to sendViaGmail', async () => {
+      const config = {
+        provider: 'gmail',
+        gmailEmail: 'support@example.com',
+        fromName: 'Acme',
+        gmailHistoryId: '12345',
+        needsReauth: false,
+      };
+
+      await dispatchEmailSend(buildInput(), config, {}, null, deps);
+
+      expect(deps.sendGmailImpl).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          provider: 'gmail',
+          gmailEmail: 'support@example.com',
+          fromName: 'Acme',
+          gmailHistoryId: '12345',
+          needsReauth: false,
+        }),
+        null,
+        null,
+        expect.anything(),
+      );
+    });
+
+    it('forwards inReplyToMessageId unchanged to sendViaGmail', async () => {
+      await dispatchEmailSend(
+        buildInput(),
+        { provider: 'gmail', gmailEmail: 'a@b.com' },
+        {},
+        'mid-xyz',
+        deps,
+      );
+
+      expect(deps.sendGmailImpl).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        'mid-xyz',
+        null,
+        expect.anything(),
+      );
+    });
+
+    it('passes threadId = null (worker-side wiring is a follow-up)', async () => {
+      // Spec § 7: `threadId` is optional in `users.messages.send` ("if present").
+      // The dispatcher's API today does not carry a Gmail thread id (the
+      // EmailOutboundJob shape predates Gmail). Wiring per-conversation
+      // gmailThreadId from inbound metadata is a separate task — for now,
+      // outbound replies still thread via In-Reply-To headers, which Gmail
+      // honors even without a server-side threadId hint.
+      await dispatchEmailSend(
+        buildInput(),
+        { provider: 'gmail', gmailEmail: 'a@b.com' },
+        {},
+        null,
+        deps,
+      );
+
+      const mockFn = deps.sendGmailImpl as ReturnType<typeof vi.fn>;
+      const call = mockFn.mock.calls[0];
+      expect(call).toBeDefined();
+      const threadIdArg = call![3];
+      expect(threadIdArg).toBeNull();
+    });
+
+    it('forwards db, log, and getAccessToken into sendViaGmail deps; does not leak test seams', async () => {
+      await dispatchEmailSend(
+        buildInput(),
+        { provider: 'gmail', gmailEmail: 'a@b.com' },
+        {},
+        null,
+        deps,
+      );
+
+      const mockFn = deps.sendGmailImpl as ReturnType<typeof vi.fn>;
+      const callDeps = mockFn.mock.calls[0]![4] as Record<string, unknown>;
+      expect(callDeps).toHaveProperty('db', deps.db);
+      expect(callDeps).toHaveProperty('log', deps.log);
+      expect(callDeps).toHaveProperty('getAccessToken');
+      expect(typeof callDeps.getAccessToken).toBe('function');
+      // Test seams must not bleed into the production callee.
+      expect(callDeps).not.toHaveProperty('sendGmailImpl');
+      expect(callDeps).not.toHaveProperty('sendPostmarkImpl');
+      expect(callDeps).not.toHaveProperty('getGmailAccessToken');
+    });
+
+    it('the forwarded getAccessToken delegates to deps.getGmailAccessToken', async () => {
+      // Wiring proof: the closure passed to sendViaGmail.deps.getAccessToken
+      // resolves to the dispatcher's getGmailAccessToken — that's what
+      // production uses to drive `getValidAccessToken(app, inbox)`.
+      await dispatchEmailSend(
+        buildInput(),
+        { provider: 'gmail', gmailEmail: 'a@b.com' },
+        {},
+        null,
+        deps,
+      );
+
+      const mockFn = deps.sendGmailImpl as ReturnType<typeof vi.fn>;
+      const callDeps = mockFn.mock.calls[0]![4] as { getAccessToken: () => Promise<string> };
+      const token = await callDeps.getAccessToken();
+      expect(token).toBe('ya29.test-access-token');
+      expect(deps.getGmailAccessToken).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws when provider is "gmail" but getGmailAccessToken is missing from deps', async () => {
+      const depsWithoutAccessToken = buildDeps({ getGmailAccessToken: undefined });
+
       await expect(
-        dispatchEmailSend(buildInput(), { provider: 'gmail' }, {}, null, deps),
-      ).rejects.toThrow(/gmail/i);
+        dispatchEmailSend(
+          buildInput(),
+          { provider: 'gmail', gmailEmail: 'a@b.com' },
+          {},
+          null,
+          depsWithoutAccessToken,
+        ),
+      ).rejects.toThrow(/getGmailAccessToken/i);
+      expect(depsWithoutAccessToken.sendGmailImpl).not.toHaveBeenCalled();
+      expect(depsWithoutAccessToken.sendPostmarkImpl).not.toHaveBeenCalled();
+    });
+
+    it('does NOT call Postmark for gmail provider', async () => {
+      await dispatchEmailSend(
+        buildInput(),
+        { provider: 'gmail', gmailEmail: 'a@b.com' },
+        { refreshToken: '[REDACTED]' },
+        null,
+        deps,
+      );
+
+      expect(deps.sendPostmarkImpl).not.toHaveBeenCalled();
     });
   });
 
