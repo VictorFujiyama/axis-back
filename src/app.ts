@@ -60,6 +60,7 @@ import { registerWebhookEventHook } from './modules/webhooks/event-hook';
 import { uploadRoutes } from './modules/uploads/routes';
 import { loadModules } from './modules/plugins/loader';
 import { modulesRoutes } from './modules/plugins/routes';
+import { googleOAuthRoutes } from './modules/oauth/google/routes';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -219,6 +220,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(widgetWsRoutes);
   await app.register(uploadRoutes);
   await app.register(modulesRoutes);
+  await app.register(googleOAuthRoutes);
 
   // Load pluggable modules (ENABLED_MODULES) — after core routes so modules can
   // safely depend on app.requireAuth / app.db / app.queues decorators.
