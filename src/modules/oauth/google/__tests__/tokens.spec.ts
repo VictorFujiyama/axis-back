@@ -1,15 +1,21 @@
 import type { FastifyInstance } from 'fastify';
 import { describe, expect, it, vi } from 'vitest';
 import { decryptJSON, encryptJSON } from '../../../../crypto.js';
+import { GoogleOAuthError, InvalidGrantError } from '../client.js';
+import { GmailReauthRequiredError } from '../errors.js';
 import type { GmailInboxLike } from '../tokens.js';
 import { getValidAccessToken } from '../tokens.js';
 
 const ACCESS_TOKEN = 'ya29.fresh-access-token';
 const REFRESH_TOKEN = 'REDACTED-refresh-token';
 
-function buildInbox(expiresAt: string): GmailInboxLike {
+function buildInbox(
+  expiresAt: string,
+  config: Record<string, unknown> = { provider: 'gmail' },
+): GmailInboxLike {
   return {
     id: '11111111-1111-1111-1111-111111111111',
+    config,
     secrets: encryptJSON({
       refreshToken: REFRESH_TOKEN,
       accessToken: ACCESS_TOKEN,
@@ -335,5 +341,102 @@ describe('getValidAccessToken — Redis lock for concurrent refresh (T-13)', () 
     // token re-read from the rotated DB row.
     expect(a).toBe(NEW_ACCESS_TOKEN);
     expect(b).toBe(NEW_ACCESS_TOKEN);
+  });
+});
+
+describe('getValidAccessToken — invalid_grant → reauth (T-14)', () => {
+  it('catches InvalidGrantError, patches config.needsReauth=true, and throws GmailReauthRequiredError', async () => {
+    const now = Date.parse('2026-05-05T12:00:00.000Z');
+    const inbox = buildInbox('2026-05-05T12:00:30.000Z', {
+      provider: 'gmail',
+      gmailEmail: 'support@example.com',
+      fromName: 'Support',
+    });
+    const refresh = vi.fn().mockRejectedValue(
+      new InvalidGrantError('Token has been expired or revoked.', 400),
+    );
+    const { app, db, redis } = buildAppWithDb();
+
+    await expect(
+      getValidAccessToken(app, inbox, { now: () => now, refresh }),
+    ).rejects.toBeInstanceOf(GmailReauthRequiredError);
+
+    // No access-token write happened.
+    // Only one update call: the config patch flipping needsReauth.
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(db.set).toHaveBeenCalledTimes(1);
+    const setArg = db.set.mock.calls[0]![0] as {
+      config: Record<string, unknown>;
+      secrets?: string;
+      updatedAt: Date;
+    };
+    expect(setArg.secrets).toBeUndefined();
+    expect(setArg.updatedAt).toBeInstanceOf(Date);
+    // Existing config fields preserved; needsReauth flipped on.
+    expect(setArg.config).toEqual({
+      provider: 'gmail',
+      gmailEmail: 'support@example.com',
+      fromName: 'Support',
+      needsReauth: true,
+    });
+
+    // Lock acquired AND released even on the failure path.
+    expect(redis.set).toHaveBeenCalledTimes(1);
+    expect(redis.del).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts from an empty/legacy config object and still emits needsReauth: true', async () => {
+    const now = Date.parse('2026-05-05T12:00:00.000Z');
+    // Legacy row with no `config.provider` set — parseGmailConfig returns {}.
+    const inbox = buildInbox('2026-05-05T12:00:30.000Z', {});
+    const refresh = vi.fn().mockRejectedValue(
+      new InvalidGrantError('Token has been expired or revoked.', 400),
+    );
+    const { app, db } = buildAppWithDb();
+
+    await expect(
+      getValidAccessToken(app, inbox, { now: () => now, refresh }),
+    ).rejects.toBeInstanceOf(GmailReauthRequiredError);
+
+    const setArg = db.set.mock.calls[0]![0] as {
+      config: Record<string, unknown>;
+    };
+    expect(setArg.config.needsReauth).toBe(true);
+  });
+
+  it('non-invalid_grant 4xx errors propagate without flipping needsReauth', async () => {
+    const now = Date.parse('2026-05-05T12:00:00.000Z');
+    const inbox = buildInbox('2026-05-05T12:00:30.000Z', { provider: 'gmail' });
+    const refresh = vi.fn().mockRejectedValue(
+      new GoogleOAuthError('unauthorized_client', 401, 'unauthorized_client'),
+    );
+    const { app, db, redis } = buildAppWithDb();
+
+    await expect(
+      getValidAccessToken(app, inbox, { now: () => now, refresh }),
+    ).rejects.toBeInstanceOf(GoogleOAuthError);
+
+    // Did NOT patch needsReauth.
+    expect(db.update).not.toHaveBeenCalled();
+    expect(db.set).not.toHaveBeenCalled();
+    // Lock still released.
+    expect(redis.set).toHaveBeenCalledTimes(1);
+    expect(redis.del).toHaveBeenCalledTimes(1);
+  });
+
+  it('GmailReauthRequiredError exposes inboxId so callers can identify the row', async () => {
+    const now = Date.parse('2026-05-05T12:00:00.000Z');
+    const inbox = buildInbox('2026-05-05T12:00:30.000Z');
+    const refresh = vi.fn().mockRejectedValue(
+      new InvalidGrantError('Token has been expired or revoked.', 400),
+    );
+    const { app } = buildAppWithDb();
+
+    await expect(
+      getValidAccessToken(app, inbox, { now: () => now, refresh }),
+    ).rejects.toMatchObject({
+      name: 'GmailReauthRequiredError',
+      inboxId: inbox.id,
+    });
   });
 });

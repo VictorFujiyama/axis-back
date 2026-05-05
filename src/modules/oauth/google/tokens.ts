@@ -2,16 +2,19 @@ import { schema } from '@blossom/db';
 import { eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { decryptJSON, encryptJSON } from '../../../crypto.js';
-import { parseGmailSecrets } from '../../channels/gmail-config.js';
-import { refreshAccessToken } from './client.js';
+import { parseGmailConfig, parseGmailSecrets } from '../../channels/gmail-config.js';
+import { InvalidGrantError, refreshAccessToken } from './client.js';
+import { GmailReauthRequiredError } from './errors.js';
 
 /**
  * Minimal shape of an inbox row that `getValidAccessToken` operates on.
  * Kept intentionally narrow so tests don't need to fabricate the full
- * Drizzle row. Will grow as later tasks (T-13/T-14) need more fields.
+ * Drizzle row.
  */
 export interface GmailInboxLike {
   id: string;
+  /** `inboxes.config` jsonb — used to patch `needsReauth` on invalid_grant. */
+  config: unknown;
   secrets: string | null;
 }
 
@@ -96,7 +99,27 @@ export async function getValidAccessToken(
 
   try {
     const refresh = deps.refresh ?? refreshAccessToken;
-    const result = await refresh(parsed.refreshToken);
+    let result;
+    try {
+      result = await refresh(parsed.refreshToken);
+    } catch (err) {
+      if (err instanceof InvalidGrantError) {
+        // Google rejected the refresh token — the user has revoked access or
+        // the token has expired. Flip `config.needsReauth = true` so the UI
+        // surfaces the reauth banner; sync worker / outbound dispatcher will
+        // catch the typed error below and stop retrying.
+        const patchedConfig = {
+          ...parseGmailConfig(inbox.config),
+          needsReauth: true,
+        };
+        await app.db
+          .update(schema.inboxes)
+          .set({ config: patchedConfig, updatedAt: new Date() })
+          .where(eq(schema.inboxes.id, inbox.id));
+        throw new GmailReauthRequiredError(inbox.id);
+      }
+      throw err;
+    }
 
     const newExpiresAt = new Date(now + result.expiresIn * 1000).toISOString();
     // Google sometimes does not re-issue a refresh token on refresh — keep the
