@@ -4,6 +4,12 @@ import { schema } from '@blossom/db';
 
 import { parseGmailConfig } from '../../modules/channels/gmail-config.js';
 import {
+  parseGmailMessage,
+  type GmailMessage,
+} from '../../modules/channels/gmail-parse.js';
+import { type IncomingMessage } from '../../modules/channels/helpers.js';
+import { ingestWithHooks } from '../../modules/channels/post-ingest.js';
+import {
   getValidAccessToken,
   type GmailInboxLike,
 } from '../../modules/oauth/google/tokens.js';
@@ -35,6 +41,8 @@ export interface ProcessGmailSyncJobDeps {
     app: FastifyInstance,
     inbox: GmailInboxLike,
   ) => Promise<string>;
+  /** Override `ingestWithHooks` for testing. Production uses the real helper. */
+  ingest?: typeof ingestWithHooks;
 }
 
 /**
@@ -76,7 +84,7 @@ async function fetchFullGmailMessage(
   messageId: string,
   accessToken: string,
   fetchImpl: typeof fetch,
-): Promise<unknown> {
+): Promise<GmailMessage> {
   const url = new URL(
     `${GMAIL_API_BASE}/users/me/messages/${encodeURIComponent(messageId)}`,
   );
@@ -93,7 +101,41 @@ async function fetchFullGmailMessage(
   if (!res.ok) {
     throw new Error(`gmail messages.get ${res.status}`);
   }
-  return await res.json();
+  return (await res.json()) as GmailMessage;
+}
+
+/**
+ * Maps a parsed Gmail message into the channel-agnostic `IncomingMessage` shape
+ * `ingestWithHooks` accepts. Returns `null` when the message lacks a parseable
+ * `From` (no identifier → cannot route to a contact). The `channelMsgId`
+ * prefers the RFC `Message-ID` header (matches Postmark dedup) and falls back
+ * to Gmail's opaque message id, which is always present.
+ */
+function buildIngestPayload(
+  inboxId: string,
+  raw: GmailMessage,
+): IncomingMessage | null {
+  const parsed = parseGmailMessage(raw);
+  if (!parsed.from) return null;
+
+  const email = parsed.from.email.toLowerCase();
+  const name = parsed.from.name?.trim() || (email.split('@')[0] ?? email);
+
+  return {
+    inboxId,
+    channel: 'email',
+    from: { identifier: email, email, name, metadata: {} },
+    content: parsed.content || '(sem conteúdo)',
+    contentType: 'text',
+    channelMsgId: parsed.messageId ?? raw.id,
+    threadHints: parsed.threadHints,
+    metadata: {
+      subject: parsed.subject,
+      gmailMessageId: raw.id,
+      gmailThreadId: parsed.metadata.gmailThreadId,
+      gmailHistoryId: raw.historyId,
+    },
+  };
 }
 
 /**
@@ -154,12 +196,31 @@ export async function processGmailSyncJob(
     // after a successful run.
     const fetchImpl = deps.fetchImpl ?? fetch;
     const getAccessToken = deps.getAccessToken ?? getValidAccessToken;
+    const ingest = deps.ingest ?? ingestWithHooks;
     const accessToken = await getAccessToken(app, inbox as GmailInboxLike);
 
     const messages = await listBootstrapMessages(accessToken, fetchImpl);
     for (const message of messages) {
-      await fetchFullGmailMessage(message.id, accessToken, fetchImpl);
-      // T-35: parse the full message and pass it to `ingestWithHooks`.
+      const raw = await fetchFullGmailMessage(message.id, accessToken, fetchImpl);
+      const payload = buildIngestPayload(inboxId, raw);
+      if (!payload) {
+        app.log.warn(
+          { inboxId, gmailMessageId: raw.id },
+          'gmail-sync: no From header, skipping message',
+        );
+        continue;
+      }
+      // Per-message try/catch keeps a single broken row from aborting the
+      // batch; unprocessed messages stay UNREAD and are retried next cycle.
+      // T-39 will gate mark-read on a successful ingest result.
+      try {
+        await ingest(app, payload, inbox.config, inbox.defaultBotId ?? null);
+      } catch (err) {
+        app.log.warn(
+          { err, inboxId, gmailMessageId: raw.id },
+          'gmail-sync: ingest failed for message',
+        );
+      }
     }
     return;
   }
