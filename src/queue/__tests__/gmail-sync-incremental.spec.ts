@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { describe, expect, it, vi } from 'vitest';
 
+import type { ParsedGmailAttachment } from '../../modules/channels/gmail-parse.js';
 import { processGmailSyncJob } from '../workers/gmail-sync.js';
 
 const INBOX_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
@@ -874,4 +875,381 @@ describe('processGmailSyncJob — incremental path → mark-read (T-39)', () => 
     );
     expect(hadModify).toBe(true);
   });
+});
+
+/** Build a Gmail `messages.get?format=full` body with one or more attachment
+ * parts plus a text/plain body part. Mirrors the shape of
+ * `src/__tests__/fixtures/gmail/with-attachment.json` but lets each test pick
+ * its own filename / mime / size so the attachment-resolution branches are
+ * driven explicitly rather than via shared fixture state. */
+function buildMessageWithAttachments(
+  id: string,
+  attachments: Array<{
+    partId: string;
+    attachmentId: string;
+    filename: string;
+    mimeType: string;
+    size?: number;
+  }>,
+  overrides: {
+    headers?: Array<{ name: string; value: string }>;
+    bodyText?: string;
+    historyId?: string;
+  } = {},
+): Record<string, unknown> {
+  const headers = overrides.headers ?? [
+    { name: 'From', value: '"Alice Example" <alice@example.com>' },
+    { name: 'Subject', value: 'With attachment' },
+    { name: 'Message-ID', value: `<rfc-${id}@example.com>` },
+  ];
+  const bodyText = overrides.bodyText ?? `Body of ${id}`;
+  const attachmentParts = attachments.map((a) => ({
+    partId: a.partId,
+    mimeType: a.mimeType,
+    filename: a.filename,
+    body: {
+      size: a.size ?? 1024,
+      attachmentId: a.attachmentId,
+    },
+  }));
+  return {
+    id,
+    threadId: 'thr-1',
+    historyId: overrides.historyId ?? 'h-msg',
+    payload: {
+      mimeType: 'multipart/mixed',
+      headers,
+      parts: [
+        {
+          partId: '0',
+          mimeType: 'text/plain',
+          body: { data: Buffer.from(bodyText).toString('base64url') },
+        },
+        ...attachmentParts,
+      ],
+    },
+  };
+}
+
+describe('processGmailSyncJob — incremental path → attachments (T-40)', () => {
+  /** Small helper to drive the standard incremental flow with one fetched
+   * message that has the supplied attachment parts. Returns the spies that
+   * each test asserts on. */
+  function setupAttachmentRun(opts: {
+    inboxOverrides?: Parameters<typeof buildHealthyInbox>[0];
+    attachments: Array<{
+      partId: string;
+      attachmentId: string;
+      filename: string;
+      mimeType: string;
+      size?: number;
+    }>;
+    /** What `downloadAttachment` resolves to per call. `null` simulates the
+     * 25-MB skip. Buffers simulate a successful download. */
+    downloadResults?: Array<Buffer | null>;
+    /** Override the default upload behavior (returns a synthetic R2 URL). */
+    uploadImpl?: (
+      buffer: Buffer,
+      filename: string,
+      mimeType: string,
+      accountId: string,
+    ) => Promise<string>;
+    /** When true, the first download throws so we can assert fault-tolerance. */
+    downloadThrows?: Error;
+  }) {
+    const inbox = buildHealthyInbox(opts.inboxOverrides);
+    const stub = buildApp([inbox]);
+    const messageBody = buildMessageWithAttachments(
+      'msg-with-attach',
+      opts.attachments,
+    );
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [
+            {
+              id: 'r-1',
+              messagesAdded: [
+                {
+                  message: { id: 'msg-with-attach', threadId: 'thr-1' },
+                },
+              ],
+            },
+          ],
+          historyId: 'h-end',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(messageBody))
+      .mockResolvedValueOnce(modifyResponse());
+
+    const downloadAttachment = vi.fn();
+    if (opts.downloadThrows) {
+      downloadAttachment.mockRejectedValueOnce(opts.downloadThrows);
+    } else {
+      const results = opts.downloadResults ?? [Buffer.from('FAKE-BYTES')];
+      for (const r of results) {
+        downloadAttachment.mockResolvedValueOnce(r);
+      }
+    }
+
+    const uploadAttachment = vi.fn(
+      opts.uploadImpl ??
+        (async (
+          _buf: Buffer,
+          filename: string,
+          _mimeType: string,
+          accountId: string,
+        ) => `https://r2.example/${accountId}/inbound/${filename}`),
+    );
+
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockResolvedValue({ deduped: false });
+
+    return {
+      inbox,
+      ...stub,
+      fetchImpl,
+      downloadAttachment,
+      uploadAttachment,
+      getAccessToken,
+      ingest,
+    };
+  }
+
+  it('downloads + uploads a single attachment and the ingest payload carries mediaUrl/mediaMimeType/contentType', async () => {
+    // Use an image mime to also lock the contentType-from-mime mapping
+    // ('image/png' → 'image'). The PDF/document branch is covered in the
+    // multi-attachment test below.
+    const {
+      app,
+      fetchImpl,
+      downloadAttachment,
+      uploadAttachment,
+      getAccessToken,
+      ingest,
+    } = setupAttachmentRun({
+      attachments: [
+        {
+          partId: '1',
+          attachmentId: 'att-img',
+          filename: 'logo.png',
+          mimeType: 'image/png',
+          size: 8192,
+        },
+      ],
+    });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      {
+        fetchImpl,
+        getAccessToken,
+        ingest,
+        downloadAttachment,
+        uploadAttachment,
+      },
+    );
+
+    expect(downloadAttachment).toHaveBeenCalledTimes(1);
+    const dlArgs = downloadAttachment.mock.calls[0]!;
+    expect(dlArgs[0]).toBe('msg-with-attach'); // raw message id
+    const passedAttachment = dlArgs[1] as ParsedGmailAttachment;
+    expect(passedAttachment.attachmentId).toBe('att-img');
+    expect(passedAttachment.filename).toBe('logo.png');
+    expect(passedAttachment.mimeType).toBe('image/png');
+    expect(dlArgs[2]).toBe(ACCESS_TOKEN);
+
+    expect(uploadAttachment).toHaveBeenCalledTimes(1);
+    const upArgs = uploadAttachment.mock.calls[0]!;
+    expect(upArgs[0]).toBeInstanceOf(Buffer); // bytes
+    expect(upArgs[1]).toBe('logo.png'); // filename
+    expect(upArgs[2]).toBe('image/png'); // mime
+    expect(upArgs[3]).toBe(ACCOUNT_ID); // accountId from inbox row
+
+    expect(ingest).toHaveBeenCalledTimes(1);
+    const payload = ingest.mock.calls[0]![1] as {
+      mediaUrl?: string;
+      mediaMimeType?: string;
+      contentType?: string;
+    };
+    expect(payload.mediaUrl).toBe(
+      `https://r2.example/${ACCOUNT_ID}/inbound/logo.png`,
+    );
+    expect(payload.mediaMimeType).toBe('image/png');
+    expect(payload.contentType).toBe('image');
+  });
+
+  it('takes the first attachment as mediaUrl when multiple are present (mirrors Twilio MediaUrl0 convention)', async () => {
+    const {
+      app,
+      log,
+      fetchImpl,
+      downloadAttachment,
+      uploadAttachment,
+      getAccessToken,
+      ingest,
+    } = setupAttachmentRun({
+      attachments: [
+        {
+          partId: '1',
+          attachmentId: 'att-pdf',
+          filename: 'invoice.pdf',
+          mimeType: 'application/pdf',
+          size: 24576,
+        },
+        {
+          partId: '2',
+          attachmentId: 'att-png',
+          filename: 'logo.png',
+          mimeType: 'image/png',
+          size: 8192,
+        },
+      ],
+    });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest, downloadAttachment, uploadAttachment },
+    );
+
+    expect(downloadAttachment).toHaveBeenCalledTimes(1);
+    expect(uploadAttachment).toHaveBeenCalledTimes(1);
+    const passedAttachment = downloadAttachment.mock.calls[0]![1] as ParsedGmailAttachment;
+    expect(passedAttachment.attachmentId).toBe('att-pdf');
+
+    const payload = ingest.mock.calls[0]![1] as {
+      mediaUrl?: string;
+      contentType?: string;
+    };
+    expect(payload.mediaUrl).toContain('invoice.pdf');
+    expect(payload.contentType).toBe('document'); // PDF mime → document
+
+    // Operators should be able to spot when extra attachments were dropped.
+    const droppedLog = log.warn.mock.calls.some(
+      (call) =>
+        typeof call[1] === 'string' &&
+        /attachment.*(drop|skip|extra|additional)/i.test(call[1] as string),
+    );
+    expect(droppedLog).toBe(true);
+  });
+
+  it('skips an oversized attachment (downloadAttachment returns null) and ingests without mediaUrl', async () => {
+    // The 25-MB cap lives inside `downloadGmailAttachmentSafe`; the worker just
+    // propagates a `null` return as "no media for this message".
+    const {
+      app,
+      fetchImpl,
+      downloadAttachment,
+      uploadAttachment,
+      getAccessToken,
+      ingest,
+    } = setupAttachmentRun({
+      attachments: [
+        {
+          partId: '1',
+          attachmentId: 'att-big',
+          filename: 'huge.zip',
+          mimeType: 'application/zip',
+          size: 30 * 1024 * 1024,
+        },
+      ],
+      downloadResults: [null],
+    });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest, downloadAttachment, uploadAttachment },
+    );
+
+    expect(downloadAttachment).toHaveBeenCalledTimes(1);
+    expect(uploadAttachment).not.toHaveBeenCalled();
+
+    expect(ingest).toHaveBeenCalledTimes(1);
+    const payload = ingest.mock.calls[0]![1] as {
+      mediaUrl?: string;
+      contentType?: string;
+    };
+    expect(payload.mediaUrl).toBeUndefined();
+    expect(payload.contentType).toBe('text');
+  });
+
+  it('logs and continues when downloadAttachment throws (text-only ingest still happens)', async () => {
+    const {
+      app,
+      log,
+      fetchImpl,
+      downloadAttachment,
+      uploadAttachment,
+      getAccessToken,
+      ingest,
+    } = setupAttachmentRun({
+      attachments: [
+        {
+          partId: '1',
+          attachmentId: 'att-pdf',
+          filename: 'invoice.pdf',
+          mimeType: 'application/pdf',
+        },
+      ],
+      downloadThrows: new Error('gmail attachments.get 503'),
+    });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest, downloadAttachment, uploadAttachment },
+    );
+
+    expect(uploadAttachment).not.toHaveBeenCalled();
+    expect(ingest).toHaveBeenCalledTimes(1);
+    const payload = ingest.mock.calls[0]![1] as { mediaUrl?: string };
+    expect(payload.mediaUrl).toBeUndefined();
+
+    const loggedFailure = log.warn.mock.calls.some(
+      (call) =>
+        typeof call[1] === 'string' &&
+        /attachment.*(fail|download|skip)/i.test(call[1] as string),
+    );
+    expect(loggedFailure).toBe(true);
+  });
+
+  it('does nothing attachment-related when the parsed message has no attachments', async () => {
+    // Regression: a plain text-only message must not invoke download/upload.
+    const inbox = buildHealthyInbox();
+    const { app } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [
+            {
+              id: 'r-1',
+              messagesAdded: [{ message: { id: 'noatt', threadId: 't' } }],
+            },
+          ],
+          historyId: 'h-end',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('noatt')))
+      .mockResolvedValueOnce(modifyResponse());
+    const downloadAttachment = vi.fn();
+    const uploadAttachment = vi.fn();
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockResolvedValue({ deduped: false });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest, downloadAttachment, uploadAttachment },
+    );
+
+    expect(downloadAttachment).not.toHaveBeenCalled();
+    expect(uploadAttachment).not.toHaveBeenCalled();
+    expect(ingest).toHaveBeenCalledTimes(1);
+  });
+
 });

@@ -4,8 +4,13 @@ import { schema } from '@blossom/db';
 
 import { parseGmailConfig } from '../../modules/channels/gmail-config.js';
 import {
+  downloadGmailAttachmentSafe,
+  uploadGmailAttachment,
+} from '../../modules/channels/gmail-attachments.js';
+import {
   parseGmailMessage,
   type GmailMessage,
+  type ParsedGmailAttachment,
 } from '../../modules/channels/gmail-parse.js';
 import { type IncomingMessage } from '../../modules/channels/helpers.js';
 import { ingestWithHooks } from '../../modules/channels/post-ingest.js';
@@ -44,6 +49,19 @@ interface GmailHistoryListResponse {
   nextPageToken?: string;
 }
 
+export type DownloadAttachmentImpl = (
+  messageId: string,
+  attachment: ParsedGmailAttachment,
+  accessToken: string,
+) => Promise<Buffer | null>;
+
+export type UploadAttachmentImpl = (
+  buffer: Buffer,
+  filename: string,
+  mimeType: string,
+  accountId: string,
+) => Promise<string>;
+
 export interface ProcessGmailSyncJobDeps {
   /** Override `fetch` for testing. Defaults to global `fetch`. */
   fetchImpl?: typeof fetch;
@@ -54,6 +72,11 @@ export interface ProcessGmailSyncJobDeps {
   ) => Promise<string>;
   /** Override `ingestWithHooks` for testing. Production uses the real helper. */
   ingest?: typeof ingestWithHooks;
+  /** Override the attachment download (used by tests / future polyfills).
+   * Defaults to `downloadGmailAttachmentSafe`, which enforces the 25 MB cap. */
+  downloadAttachment?: DownloadAttachmentImpl;
+  /** Override the R2 upload. Defaults to `uploadGmailAttachment`. */
+  uploadAttachment?: UploadAttachmentImpl;
 }
 
 /**
@@ -220,14 +243,14 @@ async function listHistoryEvents(
 function buildIngestPayload(
   inboxId: string,
   raw: GmailMessage,
-): IncomingMessage | null {
+): { payload: IncomingMessage; attachments: ParsedGmailAttachment[] } | null {
   const parsed = parseGmailMessage(raw);
   if (!parsed.from) return null;
 
   const email = parsed.from.email.toLowerCase();
   const name = parsed.from.name?.trim() || (email.split('@')[0] ?? email);
 
-  return {
+  const payload: IncomingMessage = {
     inboxId,
     channel: 'email',
     from: { identifier: email, email, name, metadata: {} },
@@ -242,6 +265,7 @@ function buildIngestPayload(
       gmailHistoryId: raw.historyId,
     },
   };
+  return { payload, attachments: parsed.attachments };
 }
 
 /**
@@ -292,13 +316,46 @@ export async function processGmailSyncJob(
     app.log.info({ inboxId }, 'gmail-sync: inbox needsReauth, skipping');
     return;
   }
+  if (!inbox.accountId) {
+    // Defensive: a Gmail inbox created via the OAuth callback always carries
+    // accountId, but legacy / corrupted rows could lack it. Skip rather than
+    // throw — `ingestWithHooks` would refuse anyway, and ingest-side throws
+    // would loop the BullMQ retry forever.
+    app.log.warn(
+      { inboxId },
+      'gmail-sync: inbox missing accountId, skipping',
+    );
+    return;
+  }
+  const inboxAccountId = inbox.accountId;
 
   const parsedConfig = parseGmailConfig(rawConfig);
 
   const fetchImpl = deps.fetchImpl ?? fetch;
   const getAccessToken = deps.getAccessToken ?? getValidAccessToken;
   const ingest = deps.ingest ?? ingestWithHooks;
+  const downloadAttachment: DownloadAttachmentImpl =
+    deps.downloadAttachment ??
+    ((messageId, attachment, accessToken) =>
+      downloadGmailAttachmentSafe(messageId, attachment, accessToken, {
+        fetchImpl,
+        logger: app.log,
+      }));
+  const uploadAttachment: UploadAttachmentImpl =
+    deps.uploadAttachment ??
+    ((buffer, filename, mimeType, accountId) =>
+      uploadGmailAttachment(buffer, filename, mimeType, accountId));
   const accessToken = await getAccessToken(app, inbox as GmailInboxLike);
+
+  // Narrow the inbox for the message-processing helper: `inbox.accountId` was
+  // checked above, so we promote it to non-nullable here in one place rather
+  // than threading the assertion through every helper signature.
+  const inboxForMessages = {
+    id: inbox.id,
+    accountId: inboxAccountId,
+    config: inbox.config,
+    defaultBotId: inbox.defaultBotId,
+  };
 
   let messageIds: string[];
   let newHistoryId: string;
@@ -310,11 +367,13 @@ export async function processGmailSyncJob(
     messageIds = messages.map((m) => m.id);
     await processMessageIds(
       app,
-      inbox,
+      inboxForMessages,
       messageIds,
       accessToken,
       fetchImpl,
       ingest,
+      downloadAttachment,
+      uploadAttachment,
     );
     newHistoryId = await fetchGmailHistoryCursor(accessToken, fetchImpl);
   } else {
@@ -344,11 +403,13 @@ export async function processGmailSyncJob(
     messageIds = result.messageIds;
     await processMessageIds(
       app,
-      inbox,
+      inboxForMessages,
       messageIds,
       accessToken,
       fetchImpl,
       ingest,
+      downloadAttachment,
+      uploadAttachment,
     );
     newHistoryId = result.historyId;
   }
@@ -382,22 +443,42 @@ export async function processGmailSyncJob(
  */
 async function processMessageIds(
   app: FastifyInstance,
-  inbox: { id: string; config: unknown; defaultBotId: string | null },
+  inbox: {
+    id: string;
+    accountId: string;
+    config: unknown;
+    defaultBotId: string | null;
+  },
   messageIds: string[],
   accessToken: string,
   fetchImpl: typeof fetch,
   ingest: typeof ingestWithHooks,
+  downloadAttachment: DownloadAttachmentImpl,
+  uploadAttachment: UploadAttachmentImpl,
 ): Promise<void> {
   for (const id of messageIds) {
     const raw = await fetchFullGmailMessage(id, accessToken, fetchImpl);
-    const payload = buildIngestPayload(inbox.id, raw);
-    if (!payload) {
+    const built = buildIngestPayload(inbox.id, raw);
+    if (!built) {
       app.log.warn(
         { inboxId: inbox.id, gmailMessageId: raw.id },
         'gmail-sync: no From header, skipping message',
       );
       continue;
     }
+    const { payload, attachments } = built;
+
+    await attachPrimaryMedia(
+      app,
+      payload,
+      raw.id,
+      attachments,
+      inbox.accountId,
+      accessToken,
+      downloadAttachment,
+      uploadAttachment,
+    );
+
     try {
       await ingest(app, payload, inbox.config, inbox.defaultBotId ?? null);
     } catch (err) {
@@ -409,6 +490,90 @@ async function processMessageIds(
     }
     await markGmailMessageRead(app, raw.id, accessToken, fetchImpl);
   }
+}
+
+/**
+ * Mutates `payload` to carry the first downloadable attachment as
+ * `mediaUrl` + `mediaMimeType` + `contentType`. The schema only models a
+ * single media slot per message (mirrors Twilio `MediaUrl0`), so additional
+ * attachments are dropped with a warn log so operators can spot when a
+ * Gmail message arrived with multi-attachments and only one made it through.
+ *
+ * Per-attachment failures (download throws, upload throws, > 25 MB skip) are
+ * logged and swallowed: the message still ingests, just text-only. The
+ * alternative (abort ingest on any attachment error) would brick a message
+ * forever on a transient `attachments.get` blip.
+ */
+async function attachPrimaryMedia(
+  app: FastifyInstance,
+  payload: IncomingMessage,
+  gmailMessageId: string,
+  attachments: ParsedGmailAttachment[],
+  accountId: string,
+  accessToken: string,
+  downloadAttachment: DownloadAttachmentImpl,
+  uploadAttachment: UploadAttachmentImpl,
+): Promise<void> {
+  if (!attachments.length) return;
+
+  const [primary, ...rest] = attachments;
+  if (!primary) return;
+  if (rest.length) {
+    app.log.warn(
+      {
+        inboxId: payload.inboxId,
+        gmailMessageId,
+        droppedCount: rest.length,
+      },
+      'gmail-sync: multiple attachments — only the first is attached as mediaUrl, additional dropped',
+    );
+  }
+
+  let buffer: Buffer | null;
+  try {
+    buffer = await downloadAttachment(gmailMessageId, primary, accessToken);
+  } catch (err) {
+    app.log.warn(
+      { err, inboxId: payload.inboxId, gmailMessageId },
+      'gmail-sync: attachment download failed, skipping media on this message',
+    );
+    return;
+  }
+  if (!buffer) {
+    // `downloadGmailAttachmentSafe` already logged the > 25 MB skip — nothing
+    // more to do; the message still ingests, just without media.
+    return;
+  }
+
+  let url: string;
+  try {
+    url = await uploadAttachment(
+      buffer,
+      primary.filename || 'attachment',
+      primary.mimeType || 'application/octet-stream',
+      accountId,
+    );
+  } catch (err) {
+    app.log.warn(
+      { err, inboxId: payload.inboxId, gmailMessageId },
+      'gmail-sync: attachment upload failed, skipping media on this message',
+    );
+    return;
+  }
+
+  payload.mediaUrl = url;
+  payload.mediaMimeType = primary.mimeType;
+  payload.contentType = contentTypeFromMime(primary.mimeType);
+}
+
+function contentTypeFromMime(
+  mime: string | undefined,
+): 'text' | 'image' | 'audio' | 'video' | 'document' {
+  if (!mime) return 'document';
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime.startsWith('video/')) return 'video';
+  return 'document';
 }
 
 /**
