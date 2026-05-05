@@ -5,11 +5,28 @@ import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { config } from '../../../config.js';
 import {
+  exchangeCode,
+  type ExchangeCodeResult,
+  getUserInfo,
+  GoogleOAuthError,
+  type UserInfoResult,
+} from './client.js';
+import {
   ExpiredStateError,
   InvalidStateError,
   signState,
   verifyState,
 } from './state.js';
+
+export type ExchangeCodeImpl = (code: string) => Promise<ExchangeCodeResult>;
+export type GetUserInfoImpl = (accessToken: string) => Promise<UserInfoResult>;
+
+export interface GoogleOAuthRoutesOptions {
+  /** Override the Google token-exchange wrapper. Test-only DI. */
+  exchangeCodeImpl?: ExchangeCodeImpl;
+  /** Override the Google userinfo wrapper. Test-only DI. */
+  getUserInfoImpl?: GetUserInfoImpl;
+}
 
 const GOOGLE_AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 
@@ -35,7 +52,13 @@ const callbackQuery = z.object({
   error: z.string().optional(),
 });
 
-export async function googleOAuthRoutes(app: FastifyInstance): Promise<void> {
+export async function googleOAuthRoutes(
+  app: FastifyInstance,
+  opts: GoogleOAuthRoutesOptions = {},
+): Promise<void> {
+  const exchange: ExchangeCodeImpl = opts.exchangeCodeImpl ?? exchangeCode;
+  const fetchUserInfo: GetUserInfoImpl = opts.getUserInfoImpl ?? getUserInfo;
+
   app.get(
     '/api/v1/oauth/google/authorize',
     { preHandler: app.requireAuth },
@@ -136,9 +159,43 @@ export async function googleOAuthRoutes(app: FastifyInstance): Promise<void> {
       );
     }
 
-    // T-18 will exchange the code here. Until then, surface a 501 so any
-    // accidental hit (e.g. a manual run with a real Google round-trip) fails
-    // loudly rather than hanging.
-    return reply.notImplemented('code exchange not implemented (T-18)');
+    const { code } = parsed.data;
+    if (!code) {
+      return reply.badRequest('code-missing');
+    }
+
+    let tokens: ExchangeCodeResult;
+    try {
+      tokens = await exchange(code);
+    } catch (err) {
+      if (err instanceof GoogleOAuthError) {
+        req.log.warn(
+          { status: err.status, code: err.code },
+          'gmail callback: code exchange failed',
+        );
+        return reply.badGateway('google oauth exchange failed');
+      }
+      throw err;
+    }
+
+    let userInfo: UserInfoResult;
+    try {
+      userInfo = await fetchUserInfo(tokens.accessToken);
+    } catch (err) {
+      if (err instanceof GoogleOAuthError) {
+        req.log.warn(
+          { status: err.status, code: err.code },
+          'gmail callback: userinfo failed',
+        );
+        return reply.badGateway('google userinfo failed');
+      }
+      throw err;
+    }
+
+    // T-19 will persist the inbox here using `tokens` + `userInfo.email` and
+    // `state.inboxName` / `state.accountId`. Until then, surface a 501 so any
+    // accidental hit fails loudly rather than silently dropping the tokens.
+    void userInfo;
+    return reply.notImplemented('persist not implemented (T-19)');
   });
 }

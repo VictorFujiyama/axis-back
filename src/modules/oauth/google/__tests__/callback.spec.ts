@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
+import type {
+  ExchangeCodeImpl,
+  GetUserInfoImpl,
+} from '../routes.js';
 
 interface DbStub {
   select: ReturnType<typeof vi.fn>;
@@ -10,6 +14,8 @@ interface DbStub {
 
 interface AppBuildOptions {
   selectRows?: unknown[];
+  exchangeCodeImpl?: ExchangeCodeImpl;
+  getUserInfoImpl?: GetUserInfoImpl;
 }
 
 interface AppBuildResult {
@@ -40,7 +46,10 @@ async function buildTestApp(
   const select = vi.fn().mockReturnValue({ from });
   app.decorate('db', { select } as unknown as FastifyInstance['db']);
 
-  await app.register(googleOAuthRoutes);
+  await app.register(googleOAuthRoutes, {
+    exchangeCodeImpl: options.exchangeCodeImpl,
+    getUserInfoImpl: options.getUserInfoImpl,
+  });
   await app.ready();
   return { app, db: { select, from, where, limit } };
 }
@@ -257,6 +266,153 @@ describe('GET /api/v1/oauth/google/callback — env not configured (T-17)', () =
         url: `/api/v1/oauth/google/callback?error=access_denied&state=${encodeURIComponent(state)}`,
       });
       expect(res.statusCode).toBe(503);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('GET /api/v1/oauth/google/callback — code exchange (T-18)', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+    stubAllEnv();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('happy path: calls exchangeCode + getUserInfo exactly once with the right args', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//refresh-test',
+      accessToken: 'ya29.access-test',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'test@gmail.com',
+    });
+    const { app } = await buildTestApp({ exchangeCodeImpl, getUserInfoImpl });
+    try {
+      const state = await makeValidState();
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH_CODE_123&state=${encodeURIComponent(state)}`,
+      });
+      // T-19 will replace the persist fall-through; until then the route
+      // returns 501. T-18's contract is "Google calls happen exactly once
+      // each with the right args" — the persist branch is out of scope.
+      expect(res.statusCode).toBe(501);
+      expect(exchangeCodeImpl).toHaveBeenCalledTimes(1);
+      expect(exchangeCodeImpl).toHaveBeenCalledWith('AUTH_CODE_123');
+      expect(getUserInfoImpl).toHaveBeenCalledTimes(1);
+      expect(getUserInfoImpl).toHaveBeenCalledWith('ya29.access-test');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('returns 400 "code-missing" when code is absent (state valid, no error)', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>();
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>();
+    const { app } = await buildTestApp({ exchangeCodeImpl, getUserInfoImpl });
+    try {
+      const state = await makeValidState();
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.body).toContain('code-missing');
+      expect(exchangeCodeImpl).not.toHaveBeenCalled();
+      expect(getUserInfoImpl).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('returns 502 when exchangeCode throws GoogleOAuthError', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>();
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>();
+    const { app } = await buildTestApp({ exchangeCodeImpl, getUserInfoImpl });
+    // Import client AFTER buildTestApp so we share the same module-cache
+    // instance the route imported — `instanceof GoogleOAuthError` only
+    // matches when both sides reference the same class.
+    const { GoogleOAuthError } = await import('../client.js');
+    exchangeCodeImpl.mockRejectedValueOnce(
+      new GoogleOAuthError('bad request', 400, 'invalid_grant'),
+    );
+    try {
+      const state = await makeValidState();
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH_CODE&state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(502);
+      expect(exchangeCodeImpl).toHaveBeenCalledTimes(1);
+      // userinfo must NOT be reached when the token exchange fails.
+      expect(getUserInfoImpl).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('returns 502 when getUserInfo throws GoogleOAuthError', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//refresh-test',
+      accessToken: 'ya29.access-test',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>();
+    const { app } = await buildTestApp({ exchangeCodeImpl, getUserInfoImpl });
+    const { GoogleOAuthError } = await import('../client.js');
+    getUserInfoImpl.mockRejectedValueOnce(
+      new GoogleOAuthError('unauthorized', 401),
+    );
+    try {
+      const state = await makeValidState();
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH_CODE&state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(502);
+      expect(exchangeCodeImpl).toHaveBeenCalledTimes(1);
+      expect(getUserInfoImpl).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not call exchangeCode when state is invalid', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>();
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>();
+    const { app } = await buildTestApp({ exchangeCodeImpl, getUserInfoImpl });
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/v1/oauth/google/callback?code=AUTH_CODE&state=garbage',
+      });
+      expect(res.statusCode).toBe(400);
+      expect(exchangeCodeImpl).not.toHaveBeenCalled();
+      expect(getUserInfoImpl).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not call exchangeCode when ?error= is present (front error redirect)', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>();
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>();
+    const { app } = await buildTestApp({ exchangeCodeImpl, getUserInfoImpl });
+    try {
+      const state = await makeValidState();
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?error=access_denied&state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(302);
+      expect(exchangeCodeImpl).not.toHaveBeenCalled();
+      expect(getUserInfoImpl).not.toHaveBeenCalled();
     } finally {
       await app.close();
     }
