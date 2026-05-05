@@ -34,6 +34,7 @@ export const QUEUE_NAMES = {
   CAMPAIGN_RUNNER: 'campaign-runner',
   CAMPAIGN_SEND: 'campaign-send',
   MEDIA_MIRROR: 'media-mirror',
+  GMAIL_SYNC: 'gmail-sync',
 } as const;
 
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
@@ -131,6 +132,16 @@ export interface WhatsAppOutboundJob {
   contactPhone: string;
   text: string;
   mediaUrl: string | null;
+}
+
+/**
+ * Repeating poll for a Gmail-OAuth inbox. The scheduler key is
+ * `gmail-sync:<inboxId>` (one job per inbox, repeating every 60s) — see
+ * spec § "Sync worker". The job carries only the inbox id; the worker
+ * looks up everything else (config, secrets, historyId) at run time.
+ */
+export interface GmailSyncJob {
+  inboxId: string;
 }
 
 export class QueueRegistry {
