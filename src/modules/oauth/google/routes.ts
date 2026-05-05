@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { config } from '../../../config.js';
 import { encryptJSON } from '../../../crypto.js';
+import { parseGmailConfig } from '../../channels/gmail-config.js';
 import {
   exchangeCode,
   type ExchangeCodeResult,
@@ -194,11 +195,6 @@ export async function googleOAuthRoutes(
       throw err;
     }
 
-    if (payload.inboxId) {
-      // Reauth update branch is T-20.
-      return reply.notImplemented('reauth update not implemented (T-20)');
-    }
-
     const expiresAt = new Date(
       Date.now() + tokens.expiresIn * 1000,
     ).toISOString();
@@ -207,6 +203,40 @@ export async function googleOAuthRoutes(
       accessToken: tokens.accessToken,
       expiresAt,
     });
+
+    if (payload.inboxId) {
+      // Reauth: rotate secrets and clear needsReauth on the existing row.
+      // The accountId+deletedAt filters are defense-in-depth — authorize
+      // already gated ownership before issuing the state, but the row could
+      // have been deleted in the 10-minute state TTL.
+      const [existing] = await app.db
+        .select()
+        .from(schema.inboxes)
+        .where(
+          and(
+            eq(schema.inboxes.id, payload.inboxId),
+            eq(schema.inboxes.accountId, payload.accountId),
+            isNull(schema.inboxes.deletedAt),
+          ),
+        )
+        .limit(1);
+      if (!existing) {
+        return reply.notFound('inbox not found');
+      }
+
+      const patchedConfig = {
+        ...parseGmailConfig(existing.config),
+        needsReauth: false,
+      };
+
+      await app.db
+        .update(schema.inboxes)
+        .set({ secrets, config: patchedConfig, updatedAt: new Date() })
+        .where(eq(schema.inboxes.id, payload.inboxId));
+
+      // T-21 will replace this with the front-success redirect.
+      return reply.notImplemented('redirect not implemented (T-21)');
+    }
 
     const [created] = await app.db
       .insert(schema.inboxes)

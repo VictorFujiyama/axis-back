@@ -13,6 +13,9 @@ interface DbStub {
   insert: ReturnType<typeof vi.fn>;
   values: ReturnType<typeof vi.fn>;
   returning: ReturnType<typeof vi.fn>;
+  update: ReturnType<typeof vi.fn>;
+  set: ReturnType<typeof vi.fn>;
+  updateWhere: ReturnType<typeof vi.fn>;
 }
 
 interface AppBuildOptions {
@@ -54,7 +57,13 @@ async function buildTestApp(
     );
   const values = vi.fn().mockReturnValue({ returning });
   const insert = vi.fn().mockReturnValue({ values });
-  app.decorate('db', { select, insert } as unknown as FastifyInstance['db']);
+  const updateWhere = vi.fn().mockResolvedValue(undefined);
+  const set = vi.fn().mockReturnValue({ where: updateWhere });
+  const update = vi.fn().mockReturnValue({ set });
+  app.decorate(
+    'db',
+    { select, insert, update } as unknown as FastifyInstance['db'],
+  );
 
   await app.register(googleOAuthRoutes, {
     exchangeCodeImpl: options.exchangeCodeImpl,
@@ -63,7 +72,18 @@ async function buildTestApp(
   await app.ready();
   return {
     app,
-    db: { select, from, where, limit, insert, values, returning },
+    db: {
+      select,
+      from,
+      where,
+      limit,
+      insert,
+      values,
+      returning,
+      update,
+      set,
+      updateWhere,
+    },
   };
 }
 
@@ -534,9 +554,20 @@ describe('GET /api/v1/oauth/google/callback — create inbox (T-19)', () => {
     const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
       email: 'support@example.com',
     });
+    const existingRow = {
+      id: '00000000-0000-4000-8000-000000000001',
+      accountId: 'acc-callback',
+      config: {
+        provider: 'gmail',
+        gmailEmail: 'support@example.com',
+        gmailHistoryId: '987',
+        needsReauth: true,
+      },
+    };
     const { app, db } = await buildTestApp({
       exchangeCodeImpl,
       getUserInfoImpl,
+      selectRows: [existingRow],
     });
     try {
       const state = await makeValidState({
@@ -546,10 +577,11 @@ describe('GET /api/v1/oauth/google/callback — create inbox (T-19)', () => {
         method: 'GET',
         url: `/api/v1/oauth/google/callback?code=AUTH_REAUTH&state=${encodeURIComponent(state)}`,
       });
-      // Reauth update branch is T-20. For T-19 it must short-circuit before
-      // the insert path is reached.
+      // T-20 routes the reauth branch through update; the insert path must
+      // never fire. The redirect is still T-21, so the response is 501.
       expect(res.statusCode).toBe(501);
       expect(db.insert).not.toHaveBeenCalled();
+      expect(db.update).toHaveBeenCalledTimes(1);
     } finally {
       await app.close();
     }
@@ -613,6 +645,201 @@ describe('GET /api/v1/oauth/google/callback — create inbox (T-19)', () => {
       const expiresAtMs = Date.parse(decrypted.expiresAt);
       expect(expiresAtMs).toBeGreaterThanOrEqual(before + 7_200_000 - 1_000);
       expect(expiresAtMs).toBeLessThanOrEqual(after + 7_200_000 + 1_000);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('GET /api/v1/oauth/google/callback — reauth update (T-20)', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+    stubAllEnv();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('updates existing row: secrets rotated + needsReauth cleared, no insert', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//refresh-reauth',
+      accessToken: 'ya29.access-reauth',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const existingRow = {
+      id: '00000000-0000-4000-8000-aaaa00000001',
+      accountId: 'acc-reauth-123',
+      config: {
+        provider: 'gmail',
+        gmailEmail: 'support@example.com',
+        gmailHistoryId: '987654321',
+        needsReauth: true,
+      },
+    };
+    const { app, db } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+      selectRows: [existingRow],
+    });
+    const { schema } = await import('@blossom/db');
+    const { decryptJSON } = await import('../../../../crypto.js');
+    try {
+      const before = Date.now();
+      const state = await makeValidState({
+        accountId: 'acc-reauth-123',
+        userId: 'usr-reauth-456',
+        inboxId: existingRow.id,
+        inboxName: 'Gmail Teste',
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH_REAUTH&state=${encodeURIComponent(state)}`,
+      });
+      const after = Date.now();
+
+      // No new row created.
+      expect(db.insert).not.toHaveBeenCalled();
+
+      // Existing row read once and patched once.
+      expect(db.select).toHaveBeenCalledTimes(1);
+      expect(db.from).toHaveBeenCalledWith(schema.inboxes);
+      expect(db.update).toHaveBeenCalledTimes(1);
+      expect(db.update).toHaveBeenCalledWith(schema.inboxes);
+      expect(db.set).toHaveBeenCalledTimes(1);
+
+      const patch = db.set.mock.calls[0]![0] as {
+        secrets: string;
+        config: Record<string, unknown>;
+        updatedAt: Date;
+      };
+
+      // needsReauth cleared; other config fields preserved verbatim.
+      expect(patch.config).toEqual({
+        provider: 'gmail',
+        gmailEmail: 'support@example.com',
+        gmailHistoryId: '987654321',
+        needsReauth: false,
+      });
+      expect(patch.updatedAt).toBeInstanceOf(Date);
+
+      // Secrets rotated to the freshly exchanged tokens.
+      const decrypted = decryptJSON<{
+        refreshToken: string;
+        accessToken: string;
+        expiresAt: string;
+      }>(patch.secrets);
+      expect(decrypted.refreshToken).toBe('1//refresh-reauth');
+      expect(decrypted.accessToken).toBe('ya29.access-reauth');
+      const expiresAtMs = Date.parse(decrypted.expiresAt);
+      expect(expiresAtMs).toBeGreaterThanOrEqual(before + 3_600_000 - 1_000);
+      expect(expiresAtMs).toBeLessThanOrEqual(after + 3_600_000 + 1_000);
+
+      // T-21 will replace this with the front-success redirect.
+      expect(res.statusCode).toBe(501);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('flips needsReauth from true to false (regression on the patch shape)', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//rt',
+      accessToken: 'ya29.at',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const existingRow = {
+      id: '00000000-0000-4000-8000-aaaa00000002',
+      accountId: 'acc-reauth-123',
+      config: {
+        provider: 'gmail',
+        gmailEmail: 'support@example.com',
+        gmailHistoryId: null,
+        needsReauth: true,
+      },
+    };
+    const { app, db } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+      selectRows: [existingRow],
+    });
+    try {
+      const state = await makeValidState({
+        accountId: 'acc-reauth-123',
+        inboxId: existingRow.id,
+      });
+      await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH_REAUTH&state=${encodeURIComponent(state)}`,
+      });
+      const patch = db.set.mock.calls[0]![0] as {
+        config: { needsReauth: boolean };
+      };
+      expect(patch.config.needsReauth).toBe(false);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('returns 404 when the targeted inbox row no longer exists', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//rt',
+      accessToken: 'ya29.at',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const { app, db } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+      selectRows: [],
+    });
+    try {
+      const state = await makeValidState({
+        accountId: 'acc-reauth-123',
+        inboxId: '00000000-0000-4000-8000-aaaa00000003',
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH_REAUTH&state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(404);
+      expect(db.update).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not touch update on the create branch (no inboxId)', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//rt',
+      accessToken: 'ya29.at',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const { app, db } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+    });
+    try {
+      const state = await makeValidState({ inboxId: null });
+      await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH_CREATE&state=${encodeURIComponent(state)}`,
+      });
+      expect(db.update).not.toHaveBeenCalled();
+      expect(db.insert).toHaveBeenCalledTimes(1);
     } finally {
       await app.close();
     }
