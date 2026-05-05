@@ -54,6 +54,10 @@ const callbackQuery = z.object({
   error: z.string().optional(),
 });
 
+const reauthorizeBody = z.object({
+  inboxId: z.string().uuid(),
+});
+
 export async function googleOAuthRoutes(
   app: FastifyInstance,
   opts: GoogleOAuthRoutesOptions = {},
@@ -261,6 +265,46 @@ export async function googleOAuthRoutes(
 
     return reply.redirect(buildSuccessRedirect(created.id), 302);
   });
+
+  app.post(
+    '/api/v1/oauth/google/reauthorize',
+    { preHandler: app.requireAuth },
+    async (req, reply) => {
+      const parsed = reauthorizeBody.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.badRequest(
+          parsed.error.issues[0]?.message ?? 'invalid body',
+        );
+      }
+      const { inboxId } = parsed.data;
+
+      // Same ownership shape as the authorize reauth branch: a missing row
+      // (deleted, wrong account) surfaces as 403 — don't leak existence.
+      const [owned] = await app.db
+        .select()
+        .from(schema.inboxes)
+        .where(
+          and(
+            eq(schema.inboxes.id, inboxId),
+            eq(schema.inboxes.accountId, req.user.accountId),
+            isNull(schema.inboxes.deletedAt),
+          ),
+        )
+        .limit(1);
+      if (!owned) {
+        return reply.forbidden('Inbox not found or not owned by caller');
+      }
+
+      const params = new URLSearchParams({
+        inboxName: owned.name,
+        inboxId,
+      });
+      return reply.redirect(
+        `/api/v1/oauth/google/authorize?${params.toString()}`,
+        302,
+      );
+    },
+  );
 }
 
 function buildSuccessRedirect(inboxId: string): string {
