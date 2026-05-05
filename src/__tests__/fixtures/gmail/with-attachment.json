@@ -1,0 +1,61 @@
+{
+  "id": "1932abcd0042",
+  "threadId": "1932abcd0042",
+  "labelIds": ["INBOX", "UNREAD"],
+  "snippet": "Body next to an attachment",
+  "historyId": "12345",
+  "internalDate": "1714900900000",
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/mixed",
+    "filename": "",
+    "headers": [
+      { "name": "From", "value": "Carol <carol@example.com>" },
+      { "name": "To", "value": "support@example.com" },
+      { "name": "Subject", "value": "Invoice attached" },
+      { "name": "Message-ID", "value": "<msg-42@mail.gmail.com>" }
+    ],
+    "body": { "size": 0 },
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "text/plain",
+        "filename": "",
+        "headers": [
+          { "name": "Content-Type", "value": "text/plain; charset=UTF-8" }
+        ],
+        "body": {
+          "size": 21,
+          "data": "U2VlIGF0dGFjaGVkIGludm9pY2Uu"
+        }
+      },
+      {
+        "partId": "1",
+        "mimeType": "application/pdf",
+        "filename": "invoice.pdf",
+        "headers": [
+          { "name": "Content-Type", "value": "application/pdf; name=\"invoice.pdf\"" },
+          { "name": "Content-Disposition", "value": "attachment; filename=\"invoice.pdf\"" }
+        ],
+        "body": {
+          "size": 24576,
+          "attachmentId": "ANGjdJ-attachment-id-pdf"
+        }
+      },
+      {
+        "partId": "2",
+        "mimeType": "image/png",
+        "filename": "logo.png",
+        "headers": [
+          { "name": "Content-Type", "value": "image/png; name=\"logo.png\"" },
+          { "name": "Content-Disposition", "value": "attachment; filename=\"logo.png\"" }
+        ],
+        "body": {
+          "size": 8192,
+          "attachmentId": "ANGjdJ-attachment-id-png"
+        }
+      }
+    ]
+  },
+  "sizeEstimate": 33000
+}

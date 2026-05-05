@@ -297,4 +297,126 @@ describe('parseGmailMessage', () => {
       expect(parsed.metadata.gmailThreadId).toBeUndefined();
     });
   });
+
+  describe('attachments', () => {
+    it('returns attachments: [] when no part has body.attachmentId', () => {
+      const parsed = parseGmailMessage(loadFixture('plain.json'));
+      expect(parsed.attachments).toEqual([]);
+    });
+
+    it('flags every part whose body.attachmentId is set, preserving partId order', () => {
+      const parsed = parseGmailMessage(loadFixture('with-attachment.json'));
+      expect(parsed.attachments).toEqual([
+        {
+          partId: '1',
+          attachmentId: 'ANGjdJ-attachment-id-pdf',
+          filename: 'invoice.pdf',
+          mimeType: 'application/pdf',
+          size: 24576,
+        },
+        {
+          partId: '2',
+          attachmentId: 'ANGjdJ-attachment-id-png',
+          filename: 'logo.png',
+          mimeType: 'image/png',
+          size: 8192,
+        },
+      ]);
+    });
+
+    it('still extracts the body alongside attachments from the same fixture', () => {
+      const parsed = parseGmailMessage(loadFixture('with-attachment.json'));
+      expect(parsed.content).toBe('See attached invoice.');
+    });
+
+    it('walks nested multipart trees to find attachments at any depth', () => {
+      const raw: GmailMessage = {
+        id: 'nested-attach',
+        payload: {
+          mimeType: 'multipart/mixed',
+          parts: [
+            {
+              mimeType: 'multipart/alternative',
+              parts: [
+                {
+                  partId: '0.0',
+                  mimeType: 'text/plain',
+                  body: { size: 4, data: encode('body') },
+                },
+              ],
+            },
+            {
+              partId: '1',
+              mimeType: 'application/zip',
+              filename: 'bundle.zip',
+              body: { size: 1024, attachmentId: 'deep-attach' },
+            },
+          ],
+        },
+      };
+      const parsed = parseGmailMessage(raw);
+      expect(parsed.attachments).toEqual([
+        {
+          partId: '1',
+          attachmentId: 'deep-attach',
+          filename: 'bundle.zip',
+          mimeType: 'application/zip',
+          size: 1024,
+        },
+      ]);
+      expect(parsed.content).toBe('body');
+    });
+
+    it('falls back to empty string for filename / mimeType when missing on the part', () => {
+      const raw: GmailMessage = {
+        id: 'sparse-attach',
+        payload: {
+          mimeType: 'multipart/mixed',
+          parts: [
+            {
+              partId: '0',
+              mimeType: 'text/plain',
+              body: { size: 4, data: encode('body') },
+            },
+            {
+              partId: '1',
+              body: { size: 0, attachmentId: 'minimal' },
+            },
+          ],
+        },
+      };
+      const parsed = parseGmailMessage(raw);
+      expect(parsed.attachments).toEqual([
+        {
+          partId: '1',
+          attachmentId: 'minimal',
+          filename: '',
+          mimeType: '',
+          size: 0,
+        },
+      ]);
+    });
+
+    it('does not pick up parts whose body has data but no attachmentId', () => {
+      const raw: GmailMessage = {
+        id: 'no-attach',
+        payload: {
+          mimeType: 'multipart/alternative',
+          parts: [
+            {
+              partId: '0',
+              mimeType: 'text/plain',
+              body: { size: 4, data: encode('body') },
+            },
+            {
+              partId: '1',
+              mimeType: 'text/html',
+              body: { size: 13, data: encode('<p>html</p>') },
+            },
+          ],
+        },
+      };
+      expect(parseGmailMessage(raw).attachments).toEqual([]);
+    });
+  });
 });

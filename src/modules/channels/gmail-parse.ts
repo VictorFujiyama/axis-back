@@ -29,6 +29,14 @@ export interface ParsedGmailMetadata {
   gmailThreadId?: string;
 }
 
+export interface ParsedGmailAttachment {
+  partId: string;
+  attachmentId: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+}
+
 export interface ParsedGmailMessage {
   content: string;
   subject?: string;
@@ -36,6 +44,7 @@ export interface ParsedGmailMessage {
   threadHints: string[];
   from?: ParsedAddress;
   metadata: ParsedGmailMetadata;
+  attachments: ParsedGmailAttachment[];
 }
 
 function findFirstPart(
@@ -71,6 +80,25 @@ function parseMessageIds(value: string | undefined): string[] {
   return value.match(/<[^>]+>/g) ?? [];
 }
 
+function collectAttachments(
+  part: GmailMessagePart | undefined,
+  out: ParsedGmailAttachment[],
+): void {
+  if (!part) return;
+  if (part.body?.attachmentId) {
+    out.push({
+      partId: part.partId ?? '',
+      attachmentId: part.body.attachmentId,
+      filename: part.filename ?? '',
+      mimeType: part.mimeType ?? '',
+      size: part.body.size ?? 0,
+    });
+  }
+  if (part.parts) {
+    for (const child of part.parts) collectAttachments(child, out);
+  }
+}
+
 function extractContent(root: GmailMessagePart | undefined): string {
   const plain = findFirstPart(root, 'text/plain');
   if (plain?.body?.data) return decodeBase64url(plain.body.data);
@@ -100,6 +128,9 @@ export function parseGmailMessage(raw: GmailMessage): ParsedGmailMessage {
   ];
   const from = parseRfc5322Address(getHeader(root, 'From')) ?? undefined;
 
+  const attachments: ParsedGmailAttachment[] = [];
+  collectAttachments(root, attachments);
+
   return {
     content: extractContent(root),
     subject,
@@ -107,5 +138,6 @@ export function parseGmailMessage(raw: GmailMessage): ParsedGmailMessage {
     threadHints,
     from,
     metadata: { gmailThreadId: raw.threadId },
+    attachments,
   };
 }
