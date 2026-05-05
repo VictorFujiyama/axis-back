@@ -50,6 +50,7 @@ export interface GoogleClientDeps {
 
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
+const REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
 const FETCH_TIMEOUT_MS = 15_000;
 
 interface ResolvedDeps {
@@ -272,4 +273,50 @@ export async function getUserInfo(
   }
 
   return { email: data.email };
+}
+
+/** Minimal logger shape compatible with Fastify's `app.log`. */
+export interface RevokeLogger {
+  warn(payload: Record<string, unknown>, msg?: string): void;
+}
+
+const noopLogger: RevokeLogger = { warn: () => undefined };
+
+/**
+ * Revokes a Google refresh token (best-effort).
+ *
+ * Per spec, this is called when a Gmail inbox is deleted. The endpoint is fire-and-forget:
+ * any non-2xx response, network error, or abort is logged and swallowed so that the caller
+ * (the `DELETE /inboxes/:id` route) can still proceed with the soft-delete.
+ *
+ * Never throws. Never logs the refresh token itself.
+ */
+export async function revokeToken(
+  refreshToken: string,
+  deps: Pick<GoogleClientDeps, 'fetchImpl'> & { logger?: RevokeLogger } = {},
+): Promise<void> {
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const logger = deps.logger ?? noopLogger;
+  const url = `${REVOKE_URL}?token=${encodeURIComponent(refreshToken)}`;
+
+  let res: Response;
+  try {
+    res = await fetchImpl(url, {
+      method: 'POST',
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message },
+      'gmail revokeToken: network error',
+    );
+    return;
+  }
+
+  if (!res.ok) {
+    logger.warn(
+      { status: res.status },
+      'gmail revokeToken: non-2xx response',
+    );
+  }
 }

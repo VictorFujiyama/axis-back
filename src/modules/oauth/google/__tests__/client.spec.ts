@@ -5,6 +5,7 @@ import {
   GoogleOAuthError,
   InvalidGrantError,
   refreshAccessToken,
+  revokeToken,
 } from '../client.js';
 
 const baseCreds = {
@@ -338,5 +339,105 @@ describe('getUserInfo', () => {
         fetchImpl: fetchImpl as unknown as typeof fetch,
       }),
     ).resolves.toEqual({ email: 'a@b.com' });
+  });
+});
+
+describe('revokeToken', () => {
+  function makeLogger() {
+    return {
+      warn: vi.fn(),
+    };
+  }
+
+  it('POSTs to the revoke endpoint with the refresh token as a query parameter', async () => {
+    const fetchImpl = vi.fn(async () => new Response('', { status: 200 }));
+    await revokeToken('1//rtoken', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const call = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    const [url, init] = call;
+    expect(url).toBe('https://oauth2.googleapis.com/revoke?token=1%2F%2Frtoken');
+    expect(init.method).toBe('POST');
+  });
+
+  it('resolves silently on a 200 response (best-effort, no log)', async () => {
+    const logger = makeLogger();
+    const fetchImpl = vi.fn(async () => new Response('', { status: 200 }));
+    await expect(
+      revokeToken('1//rtoken', {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        logger,
+      }),
+    ).resolves.toBeUndefined();
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('resolves on a 4xx response and logs a warning (best-effort, never throws)', async () => {
+    const logger = makeLogger();
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({ error: 'invalid_token' }, 400),
+    );
+    await expect(
+      revokeToken('STALE', {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        logger,
+      }),
+    ).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    // payload contains the upstream status; never the raw refresh token
+    const [payload] = logger.warn.mock.calls[0] as [Record<string, unknown>, string];
+    expect(payload.status).toBe(400);
+    expect(JSON.stringify(payload)).not.toContain('STALE');
+  });
+
+  it('resolves on a network/abort error and logs a warning (never throws)', async () => {
+    const logger = makeLogger();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('connect ECONNREFUSED');
+    });
+    await expect(
+      revokeToken('R', {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        logger,
+      }),
+    ).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('configures an AbortSignal on the fetch call (15s timeout)', async () => {
+    let observedSignal: AbortSignal | undefined;
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+      observedSignal = init.signal as AbortSignal;
+      return new Response('', { status: 200 });
+    });
+    await revokeToken('R', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(observedSignal).toBeInstanceOf(AbortSignal);
+    expect(observedSignal!.aborted).toBe(false);
+  });
+
+  it('does not require client_id/client_secret/redirect_uri (no GOOGLE_OAUTH_* config used)', async () => {
+    // The revoke endpoint authenticates the request by the token itself; it does
+    // not need the OAuth client credentials.
+    const fetchImpl = vi.fn(async () => new Response('', { status: 200 }));
+    await expect(
+      revokeToken('R', {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('works without an injected logger (default no-op logger)', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({ error: 'invalid_token' }, 400),
+    );
+    await expect(
+      revokeToken('R', {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      }),
+    ).resolves.toBeUndefined();
   });
 });
