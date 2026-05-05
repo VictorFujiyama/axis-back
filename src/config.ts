@@ -49,6 +49,11 @@ const envSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   ANTHROPIC_API_KEY: z.string().optional(),
   BOT_LLM_TIMEOUT_MS: z.coerce.number().default(30_000),
+  // Google OAuth (only required when a Gmail email channel is in use).
+  // Routes under /api/v1/oauth/google/* return 503 when any of these is missing.
+  GOOGLE_OAUTH_CLIENT_ID: z.string().optional(),
+  GOOGLE_OAUTH_CLIENT_SECRET: z.string().optional(),
+  GOOGLE_OAUTH_REDIRECT_URI: z.string().url().optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
