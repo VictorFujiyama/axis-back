@@ -665,3 +665,107 @@ describe('sendViaGmail — error handling (T-46)', () => {
     });
   });
 });
+
+describe('sendViaGmail — idempotency (T-47)', () => {
+  describe('already delivered → skip', () => {
+    it('does not call fetch, getAccessToken, or any DB update', async () => {
+      const { deps, dbStub, getAccessToken, fetchImpl } = buildDeps({
+        selectRows: [{ deliveredAt: new Date('2026-05-01T10:00:00Z'), failedAt: null }],
+      });
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await expect(
+        sendViaGmail(buildInput(), config, null, null, deps),
+      ).resolves.toBeUndefined();
+
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(getAccessToken).not.toHaveBeenCalled();
+      expect(dbStub.update).not.toHaveBeenCalled();
+    });
+
+    it('emits a debug log with "already delivered, skip"', async () => {
+      const log = buildLog();
+      const { deps } = buildDeps({
+        log,
+        selectRows: [{ deliveredAt: new Date('2026-05-01T10:00:00Z'), failedAt: null }],
+      });
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await sendViaGmail(buildInput(), config, null, null, deps);
+
+      const debugMock = log.debug as unknown as ReturnType<typeof vi.fn>;
+      expect(debugMock).toHaveBeenCalled();
+      const messages = debugMock.mock.calls.map((call) => call[1]).filter(
+        (m): m is string => typeof m === 'string',
+      );
+      expect(messages.some((m) => /already delivered, skip/.test(m))).toBe(true);
+    });
+  });
+
+  describe('already failed → skip', () => {
+    it('does not call fetch, getAccessToken, or any DB update', async () => {
+      const { deps, dbStub, getAccessToken, fetchImpl } = buildDeps({
+        selectRows: [{ deliveredAt: null, failedAt: new Date('2026-05-01T10:00:00Z') }],
+      });
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await expect(
+        sendViaGmail(buildInput(), config, null, null, deps),
+      ).resolves.toBeUndefined();
+
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(getAccessToken).not.toHaveBeenCalled();
+      expect(dbStub.update).not.toHaveBeenCalled();
+    });
+
+    it('emits a debug log with "terminally failed, skip"', async () => {
+      const log = buildLog();
+      const { deps } = buildDeps({
+        log,
+        selectRows: [{ deliveredAt: null, failedAt: new Date('2026-05-01T10:00:00Z') }],
+      });
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await sendViaGmail(buildInput(), config, null, null, deps);
+
+      const debugMock = log.debug as unknown as ReturnType<typeof vi.fn>;
+      expect(debugMock).toHaveBeenCalled();
+      const messages = debugMock.mock.calls.map((call) => call[1]).filter(
+        (m): m is string => typeof m === 'string',
+      );
+      expect(messages.some((m) => /terminally failed, skip/.test(m))).toBe(true);
+    });
+  });
+
+  describe('guard ordering', () => {
+    it('skips even when both deliveredAt and failedAt are set (deliveredAt wins)', async () => {
+      // Pathological row state — both timestamps populated. The deliveredAt guard
+      // fires first; either outcome (skip via delivered or skip via failed) is
+      // operationally correct, but locking deliveredAt-first matches Postmark.
+      const log = buildLog();
+      const { deps, dbStub, getAccessToken, fetchImpl } = buildDeps({
+        log,
+        selectRows: [
+          {
+            deliveredAt: new Date('2026-05-01T10:00:00Z'),
+            failedAt: new Date('2026-05-01T11:00:00Z'),
+          },
+        ],
+      });
+      const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+      await sendViaGmail(buildInput(), config, null, null, deps);
+
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(getAccessToken).not.toHaveBeenCalled();
+      expect(dbStub.update).not.toHaveBeenCalled();
+
+      const debugMock = log.debug as unknown as ReturnType<typeof vi.fn>;
+      const messages = debugMock.mock.calls.map((call) => call[1]).filter(
+        (m): m is string => typeof m === 'string',
+      );
+      expect(messages.some((m) => /already delivered, skip/.test(m))).toBe(true);
+      expect(messages.some((m) => /terminally failed, skip/.test(m))).toBe(false);
+    });
+  });
+});
