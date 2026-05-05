@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   downloadGmailAttachment,
+  downloadGmailAttachmentSafe,
   GmailApiError,
 } from '../gmail-attachments.js';
+import type { ParsedGmailAttachment } from '../gmail-parse.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -119,5 +121,124 @@ describe('downloadGmailAttachment', () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(buf.toString('utf-8')).toBe('fo');
+  });
+});
+
+const MEGABYTE = 1024 * 1024;
+
+function makeAttachment(
+  overrides: Partial<ParsedGmailAttachment> = {},
+): ParsedGmailAttachment {
+  return {
+    partId: '1',
+    attachmentId: 'att-1',
+    filename: 'invoice.pdf',
+    mimeType: 'application/pdf',
+    size: 1024,
+    ...overrides,
+  };
+}
+
+describe('downloadGmailAttachmentSafe', () => {
+  it('returns null and logs a warning when size exceeds 25 MB', async () => {
+    const fetchImpl = vi.fn();
+    const warn = vi.fn();
+    const attachment = makeAttachment({
+      filename: 'huge.zip',
+      size: 26 * MEGABYTE,
+    });
+    const result = await downloadGmailAttachmentSafe(
+      'msg-1',
+      attachment,
+      'access-token',
+      {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        logger: { warn },
+      },
+    );
+    expect(result).toBeNull();
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      { filename: 'huge.zip', size: 26 * MEGABYTE },
+      expect.any(String),
+    );
+  });
+
+  it('skip threshold is exactly 25 MB (size === cap allowed, cap+1 skipped)', async () => {
+    const fetchImplOk = vi.fn(async () =>
+      jsonResponse({ size: 25 * MEGABYTE, data: 'YQ' }),
+    );
+    const fetchImplSkip = vi.fn();
+
+    const okResult = await downloadGmailAttachmentSafe(
+      'msg-1',
+      makeAttachment({ size: 25 * MEGABYTE }),
+      'tok',
+      { fetchImpl: fetchImplOk as unknown as typeof fetch },
+    );
+    expect(okResult).toBeInstanceOf(Buffer);
+    expect(fetchImplOk).toHaveBeenCalledTimes(1);
+
+    const skipResult = await downloadGmailAttachmentSafe(
+      'msg-1',
+      makeAttachment({ size: 25 * MEGABYTE + 1 }),
+      'tok',
+      { fetchImpl: fetchImplSkip as unknown as typeof fetch },
+    );
+    expect(skipResult).toBeNull();
+    expect(fetchImplSkip).not.toHaveBeenCalled();
+  });
+
+  it('delegates to downloadGmailAttachment when under cap', async () => {
+    const payload = Buffer.from('inline body bytes', 'utf-8');
+    let capturedUrl: string | undefined;
+    let capturedAuth: string | undefined;
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      capturedUrl = url;
+      capturedAuth = (init.headers as Record<string, string>).Authorization;
+      return jsonResponse({
+        size: payload.length,
+        data: payload.toString('base64url'),
+      });
+    });
+    const result = await downloadGmailAttachmentSafe(
+      'msg-42',
+      makeAttachment({ attachmentId: 'att-42', size: 1024 }),
+      'ya29.access',
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    expect(result).not.toBeNull();
+    expect((result as Buffer).equals(payload)).toBe(true);
+    expect(capturedUrl).toBe(
+      'https://gmail.googleapis.com/gmail/v1/users/me/messages/msg-42/attachments/att-42',
+    );
+    expect(capturedAuth).toBe('Bearer ya29.access');
+  });
+
+  it('does not throw when no logger is provided and size is over the cap', async () => {
+    const fetchImpl = vi.fn();
+    const result = await downloadGmailAttachmentSafe(
+      'msg-1',
+      makeAttachment({ size: 50 * MEGABYTE }),
+      'tok',
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    expect(result).toBeNull();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('propagates GmailApiError from the underlying download (under-cap 4xx still throws)', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({ error: { code: 404 } }, 404),
+    );
+    await expect(
+      downloadGmailAttachmentSafe(
+        'msg-1',
+        makeAttachment({ size: 1024 }),
+        'tok',
+        { fetchImpl: fetchImpl as unknown as typeof fetch },
+      ),
+    ).rejects.toBeInstanceOf(GmailApiError);
   });
 });

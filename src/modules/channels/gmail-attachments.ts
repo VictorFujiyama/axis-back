@@ -5,8 +5,12 @@
  * have already validated/refreshed.
  */
 
+import type { ParsedGmailAttachment } from './gmail-parse.js';
+
 const GMAIL_API_BASE = 'https://gmail.googleapis.com/gmail/v1';
 const FETCH_TIMEOUT_MS = 15_000;
+/** Gmail itself caps user-visible attachments at 25 MB. */
+export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
 export class GmailApiError extends Error {
   constructor(
@@ -81,4 +85,41 @@ export async function downloadGmailAttachment(
   }
 
   return Buffer.from(data.data, 'base64url');
+}
+
+/** Minimal logger shape compatible with Fastify's `app.log`. */
+export interface GmailAttachmentLogger {
+  warn(payload: Record<string, unknown>, msg?: string): void;
+}
+
+const noopLogger: GmailAttachmentLogger = { warn: () => undefined };
+
+/**
+ * Size-aware wrapper around `downloadGmailAttachment`. Returns `null` (and logs)
+ * when the parsed attachment exceeds 25 MB so the worker can skip it without
+ * burning a Gmail API call. Under the cap, delegates to the raw HTTP wrapper —
+ * its errors (4xx / 5xx / network) propagate unchanged so the caller can apply
+ * the same retry/permanent-fail policy as direct `downloadGmailAttachment` use.
+ */
+export async function downloadGmailAttachmentSafe(
+  messageId: string,
+  attachment: ParsedGmailAttachment,
+  accessToken: string,
+  deps: GmailAttachmentDeps & { logger?: GmailAttachmentLogger } = {},
+): Promise<Buffer | null> {
+  if (attachment.size > MAX_ATTACHMENT_BYTES) {
+    const logger = deps.logger ?? noopLogger;
+    logger.warn(
+      { filename: attachment.filename, size: attachment.size },
+      'gmail attachment skipped: > 25 MB',
+    );
+    return null;
+  }
+
+  return downloadGmailAttachment(
+    messageId,
+    attachment.attachmentId,
+    accessToken,
+    deps,
+  );
 }
