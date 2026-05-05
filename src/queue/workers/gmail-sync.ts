@@ -371,8 +371,14 @@ export async function processGmailSyncJob(
  * Per-message worker pass shared by bootstrap and incremental branches:
  * fetch each id in `format=full`, parse, ingest. A single broken message
  * (parser or downstream ingest failure) is logged but does NOT abort the
- * batch — Gmail keeps the message UNREAD until T-39's mark-read fires, so
- * the next cycle naturally retries.
+ * batch — Gmail keeps the message UNREAD if mark-read is skipped, so the
+ * next cycle naturally retries.
+ *
+ * After a clean ingest, the worker fires `users.messages.modify` to drop the
+ * `UNREAD` label (spec § 7 "Mark-read"). That call is best-effort: any
+ * failure is logged and swallowed so a transient Gmail blip can't block the
+ * batch or the cursor advance. A re-attempted ingest of the same message on
+ * the next cycle is dedup-safe via `channelMsgId`.
  */
 async function processMessageIds(
   app: FastifyInstance,
@@ -399,7 +405,50 @@ async function processMessageIds(
         { err, inboxId: inbox.id, gmailMessageId: raw.id },
         'gmail-sync: ingest failed for message',
       );
+      continue;
     }
+    await markGmailMessageRead(app, raw.id, accessToken, fetchImpl);
+  }
+}
+
+/**
+ * Best-effort `users.messages.modify` to drop the `UNREAD` label after a
+ * successful ingest. Any failure (non-2xx response or thrown fetch) is logged
+ * and swallowed — the spec ("Failure here is non-fatal — log and continue.")
+ * is explicit. We intentionally do not retry: if mark-read fails, the message
+ * stays UNREAD on Gmail; the incremental path won't re-emit it (history events
+ * fire on label change, not on the still-unread message), but the dedup
+ * contract on `channelMsgId` keeps us safe even on a re-bootstrap.
+ */
+async function markGmailMessageRead(
+  app: FastifyInstance,
+  messageId: string,
+  accessToken: string,
+  fetchImpl: typeof fetch,
+): Promise<void> {
+  const url = `${GMAIL_API_BASE}/users/me/messages/${encodeURIComponent(messageId)}/modify`;
+  try {
+    const res = await fetchImpl(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ removeLabelIds: ['UNREAD'] }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      app.log.warn(
+        { gmailMessageId: messageId, status: res.status },
+        'gmail-sync: failed to mark message read (non-2xx, continuing)',
+      );
+    }
+  } catch (err) {
+    app.log.warn(
+      { err, gmailMessageId: messageId },
+      'gmail-sync: failed to mark message read (threw, continuing)',
+    );
   }
 }
 

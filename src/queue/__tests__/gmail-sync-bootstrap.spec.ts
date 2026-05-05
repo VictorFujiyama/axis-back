@@ -117,6 +117,11 @@ function profileResponse(historyId = 'h-from-profile'): Response {
   });
 }
 
+/** Empty 200 body Gmail returns from `users.messages.modify` (T-39 mark-read). */
+function modifyResponse(): Response {
+  return jsonResponse({ id: 'irrelevant', labelIds: ['INBOX'] });
+}
+
 describe('processGmailSyncJob — bootstrap path', () => {
   it('hits users.messages.list with the spec URL + Bearer when no gmailHistoryId is stored', async () => {
     const inbox = buildHealthyInbox(); // config has provider: 'gmail', no historyId
@@ -168,8 +173,11 @@ describe('processGmailSyncJob — bootstrap path', () => {
         }),
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('msg-aaa')))
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('msg-bbb')))
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('msg-ccc')))
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
@@ -180,9 +188,12 @@ describe('processGmailSyncJob — bootstrap path', () => {
       { fetchImpl, getAccessToken, ingest },
     );
 
-    expect(fetchImpl).toHaveBeenCalledTimes(5); // 1 list + 3 gets + 1 getProfile
+    // 1 list + 3 gets + 3 modifies (T-39 mark-read) + 1 getProfile.
+    expect(fetchImpl).toHaveBeenCalledTimes(8);
 
-    const getCalls = fetchImpl.mock.calls.slice(1, 4);
+    const getCalls = fetchImpl.mock.calls.filter((c) =>
+      /\/messages\/[^/]+$/.test(new URL(c[0] as string).pathname),
+    );
     const getUrls = getCalls.map((c) => new URL(c[0] as string));
     expect(getUrls.map((u) => `${u.origin}${u.pathname}`)).toEqual([
       'https://gmail.googleapis.com/gmail/v1/users/me/messages/msg-aaa',
@@ -251,7 +262,7 @@ describe('processGmailSyncJob — bootstrap path', () => {
           messages: [{ id: 'msg/with slash', threadId: 'thr-1' }],
         }),
       )
-      .mockResolvedValueOnce(jsonResponse({ id: 'msg/with slash' }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'msg/with slash' })) // no headers → no ingest → no modify
       .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn();
@@ -286,6 +297,7 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
           }),
         ),
       )
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({
@@ -347,8 +359,11 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
         }),
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('a')))
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('b')))
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('c')))
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
@@ -383,7 +398,9 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
         }),
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('old')))
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('new')))
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi
@@ -415,6 +432,7 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
           }),
         ),
       )
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
@@ -448,6 +466,7 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
         jsonResponse(buildFullGmailMessage('broken', { headers: [] })),
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('ok')))
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
@@ -484,6 +503,7 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('fail')))
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('next')))
+      .mockResolvedValueOnce(modifyResponse()) // only 'next' is marked-read
       .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi
@@ -523,6 +543,7 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
           },
         }),
       )
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
@@ -547,6 +568,7 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
         jsonResponse({ messages: [{ id: 'a', threadId: 't' }] }),
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('a')))
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
@@ -572,6 +594,7 @@ describe('processGmailSyncJob — bootstrap path → persist gmailHistoryId (T-3
         jsonResponse({ messages: [{ id: 'm-1', threadId: 't' }] }),
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('m-1')))
+      .mockResolvedValueOnce(modifyResponse())
       .mockResolvedValueOnce(profileResponse('h-from-profile'));
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
@@ -582,8 +605,9 @@ describe('processGmailSyncJob — bootstrap path → persist gmailHistoryId (T-3
       { fetchImpl, getAccessToken, ingest },
     );
 
-    expect(fetchImpl).toHaveBeenCalledTimes(3); // list + get + profile
-    const profileCall = fetchImpl.mock.calls[2]!;
+    // list + get + modify + profile.
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+    const profileCall = fetchImpl.mock.calls[3]!;
     const profileUrl = new URL(profileCall[0] as string);
     expect(`${profileUrl.origin}${profileUrl.pathname}`).toBe(
       'https://gmail.googleapis.com/gmail/v1/users/me/profile',

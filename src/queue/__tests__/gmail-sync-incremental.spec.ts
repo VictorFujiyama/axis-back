@@ -108,6 +108,11 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+/** Empty 200 body Gmail returns from `users.messages.modify`. */
+function modifyResponse(): Response {
+  return jsonResponse({ id: 'irrelevant', labelIds: ['INBOX'] });
+}
+
 describe('processGmailSyncJob — incremental path', () => {
   it('hits users.history.list with the spec URL + Bearer when gmailHistoryId is stored', async () => {
     const inbox = buildHealthyInbox(); // gmailHistoryId: 'h-start'
@@ -195,7 +200,9 @@ describe('processGmailSyncJob — incremental path', () => {
         }),
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('gmail-id-aaa')))
-      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('gmail-id-bbb')));
+      .mockResolvedValueOnce(modifyResponse())
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('gmail-id-bbb')))
+      .mockResolvedValueOnce(modifyResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
 
@@ -205,9 +212,12 @@ describe('processGmailSyncJob — incremental path', () => {
       { fetchImpl, getAccessToken, ingest },
     );
 
-    expect(fetchImpl).toHaveBeenCalledTimes(3); // 1 history + 2 gets
+    // 1 history + 2 gets + 2 modifies (T-39 mark-read).
+    expect(fetchImpl).toHaveBeenCalledTimes(5);
 
-    const getUrls = fetchImpl.mock.calls.slice(1).map((c) => new URL(c[0] as string));
+    const getUrls = fetchImpl.mock.calls
+      .filter((c) => /\/messages\/[^/]+$/.test(new URL(c[0] as string).pathname))
+      .map((c) => new URL(c[0] as string));
     expect(getUrls.map((u) => `${u.origin}${u.pathname}`)).toEqual([
       'https://gmail.googleapis.com/gmail/v1/users/me/messages/gmail-id-aaa',
       'https://gmail.googleapis.com/gmail/v1/users/me/messages/gmail-id-bbb',
@@ -240,7 +250,8 @@ describe('processGmailSyncJob — incremental path', () => {
           historyId: 'h-advanced',
         }),
       )
-      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('m-1')));
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('m-1')))
+      .mockResolvedValueOnce(modifyResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
 
@@ -343,7 +354,8 @@ describe('processGmailSyncJob — incremental path', () => {
           historyId: 'h-end',
         }),
       )
-      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('dup')));
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('dup')))
+      .mockResolvedValueOnce(modifyResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
 
@@ -353,7 +365,8 @@ describe('processGmailSyncJob — incremental path', () => {
       { fetchImpl, getAccessToken, ingest },
     );
 
-    expect(fetchImpl).toHaveBeenCalledTimes(2); // 1 history + 1 get
+    // 1 history + 1 get + 1 modify (T-39 mark-read).
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
     expect(ingest).toHaveBeenCalledTimes(1);
   });
 
@@ -418,7 +431,8 @@ describe('processGmailSyncJob — incremental path', () => {
       .mockResolvedValueOnce(
         jsonResponse(buildFullGmailMessage('broken', { headers: [] })),
       )
-      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('ok')));
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('ok')))
+      .mockResolvedValueOnce(modifyResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
 
@@ -459,7 +473,8 @@ describe('processGmailSyncJob — incremental path', () => {
         }),
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('fail')))
-      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('next')));
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('next')))
+      .mockResolvedValueOnce(modifyResponse()); // only 'next' gets marked-read
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi
       .fn()
@@ -594,7 +609,8 @@ describe('processGmailSyncJob — incremental path', () => {
           historyId: 'h-end',
         }),
       )
-      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('a')));
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('a')))
+      .mockResolvedValueOnce(modifyResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
 
@@ -606,5 +622,256 @@ describe('processGmailSyncJob — incremental path', () => {
 
     expect(ingest).toHaveBeenCalledTimes(1);
     expect(ingest.mock.calls[0]![3]).toBe('bot-123');
+  });
+});
+
+describe('processGmailSyncJob — incremental path → mark-read (T-39)', () => {
+  it('POSTs users.messages.modify with removeLabelIds=[UNREAD] after a successful ingest', async () => {
+    const inbox = buildHealthyInbox();
+    const { app } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [
+            {
+              id: 'r-1',
+              messagesAdded: [{ message: { id: 'gmail-id-aaa', threadId: 't' } }],
+            },
+          ],
+          historyId: 'h-end',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('gmail-id-aaa')))
+      .mockResolvedValueOnce(modifyResponse());
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockResolvedValue({ deduped: false });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    expect(fetchImpl).toHaveBeenCalledTimes(3); // history + get + modify
+    const modifyCall = fetchImpl.mock.calls[2]!;
+    const modifyUrl = new URL(modifyCall[0] as string);
+    expect(`${modifyUrl.origin}${modifyUrl.pathname}`).toBe(
+      'https://gmail.googleapis.com/gmail/v1/users/me/messages/gmail-id-aaa/modify',
+    );
+    const init = modifyCall[1] as RequestInit;
+    expect(init.method).toBe('POST');
+    const headers = init.headers as Record<string, string>;
+    expect(headers.Authorization).toBe(`Bearer ${ACCESS_TOKEN}`);
+    expect(headers['Content-Type']).toBe('application/json');
+    expect(JSON.parse(init.body as string)).toEqual({
+      removeLabelIds: ['UNREAD'],
+    });
+  });
+
+  it('marks each successfully-ingested message as read across a multi-message batch', async () => {
+    const inbox = buildHealthyInbox();
+    const { app } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [
+            {
+              id: 'r-1',
+              messagesAdded: [
+                { message: { id: 'a', threadId: 't' } },
+                { message: { id: 'b', threadId: 't' } },
+              ],
+            },
+          ],
+          historyId: 'h-end',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('a')))
+      .mockResolvedValueOnce(modifyResponse())
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('b')))
+      .mockResolvedValueOnce(modifyResponse());
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockResolvedValue({ deduped: false });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    const modifyUrls = fetchImpl.mock.calls
+      .filter((c) => /\/modify$/.test(new URL(c[0] as string).pathname))
+      .map((c) => new URL(c[0] as string).pathname);
+    expect(modifyUrls).toEqual([
+      '/gmail/v1/users/me/messages/a/modify',
+      '/gmail/v1/users/me/messages/b/modify',
+    ]);
+  });
+
+  it('does NOT call modify when ingest threw for that message', async () => {
+    // Ingest failure must leave the message UNREAD on Gmail so the next sync
+    // cycle naturally retries it. Mark-read only fires on a clean ingest.
+    const inbox = buildHealthyInbox();
+    const { app } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [
+            {
+              id: 'r-1',
+              messagesAdded: [{ message: { id: 'fail', threadId: 't' } }],
+            },
+          ],
+          historyId: 'h-end',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('fail')));
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockRejectedValue(new Error('db down'));
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    // history + get only — no modify call after the failed ingest.
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    for (const call of fetchImpl.mock.calls) {
+      expect(new URL(call[0] as string).pathname).not.toMatch(/\/modify$/);
+    }
+  });
+
+  it('does not abort the run when modify itself fails (best-effort)', async () => {
+    // Spec § 7 "Mark-read": "Failure here is non-fatal — log and continue."
+    // First message: modify returns 5xx → log + continue. Second message:
+    // ingest still happens, modify still attempted, cursor still advances.
+    const inbox = buildHealthyInbox();
+    const { app, log, db } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [
+            {
+              id: 'r-1',
+              messagesAdded: [
+                { message: { id: 'first', threadId: 't' } },
+                { message: { id: 'second', threadId: 't' } },
+              ],
+            },
+          ],
+          historyId: 'h-after',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('first')))
+      .mockResolvedValueOnce(new Response('boom', { status: 503 })) // modify 503
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('second')))
+      .mockResolvedValueOnce(modifyResponse());
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockResolvedValue({ deduped: false });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    // Both ingests fired — failed modify does NOT short-circuit the loop.
+    expect(ingest).toHaveBeenCalledTimes(2);
+    // Both modifies attempted.
+    const modifyCalls = fetchImpl.mock.calls.filter((c) =>
+      /\/modify$/.test(new URL(c[0] as string).pathname),
+    );
+    expect(modifyCalls.length).toBe(2);
+    // Cursor still advanced.
+    expect(db.update).toHaveBeenCalledTimes(1);
+    const setArg = db.updateSet.mock.calls[0]![0] as {
+      config: { gmailHistoryId: string };
+    };
+    expect(setArg.config.gmailHistoryId).toBe('h-after');
+    // The failed modify was logged.
+    const matchedWarn = log.warn.mock.calls.some(
+      (call) =>
+        typeof call[1] === 'string' &&
+        /mark.*read|modify/i.test(call[1] as string),
+    );
+    expect(matchedWarn).toBe(true);
+  });
+
+  it('does not abort the run when modify throws (network error / abort)', async () => {
+    // Defensive: a thrown fetch (timeout, abort) is also non-fatal.
+    const inbox = buildHealthyInbox();
+    const { app } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [
+            {
+              id: 'r-1',
+              messagesAdded: [
+                { message: { id: 'x', threadId: 't' } },
+                { message: { id: 'y', threadId: 't' } },
+              ],
+            },
+          ],
+          historyId: 'h-after',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('x')))
+      .mockRejectedValueOnce(new Error('network down')) // modify throws
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('y')))
+      .mockResolvedValueOnce(modifyResponse());
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockResolvedValue({ deduped: false });
+
+    await expect(
+      processGmailSyncJob(
+        app,
+        { data: { inboxId: INBOX_ID } },
+        { fetchImpl, getAccessToken, ingest },
+      ),
+    ).resolves.toBeUndefined();
+    expect(ingest).toHaveBeenCalledTimes(2);
+  });
+
+  it('still calls modify when ingest returns deduped: true (idempotent on Gmail side)', async () => {
+    // A deduped result is still a "successful ingest" per the helper contract;
+    // marking the message read keeps Gmail consistent even if a previous run's
+    // mark-read failed.
+    const inbox = buildHealthyInbox();
+    const { app } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [
+            {
+              id: 'r-1',
+              messagesAdded: [{ message: { id: 'old', threadId: 't' } }],
+            },
+          ],
+          historyId: 'h-end',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('old')))
+      .mockResolvedValueOnce(modifyResponse());
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockResolvedValue({ deduped: true });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    const hadModify = fetchImpl.mock.calls.some((c) =>
+      /\/modify$/.test(new URL(c[0] as string).pathname),
+    );
+    expect(hadModify).toBe(true);
   });
 });
