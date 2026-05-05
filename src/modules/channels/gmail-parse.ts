@@ -1,4 +1,4 @@
-import { htmlToText } from './email-utils.js';
+import { htmlToText, parseRfc5322Address, type ParsedAddress } from './email-utils.js';
 
 export interface GmailMessageHeader {
   name: string;
@@ -25,11 +25,17 @@ export interface GmailMessage {
   sizeEstimate?: number;
 }
 
+export interface ParsedGmailMetadata {
+  gmailThreadId?: string;
+}
+
 export interface ParsedGmailMessage {
   content: string;
   subject?: string;
   messageId?: string;
   threadHints: string[];
+  from?: ParsedAddress;
+  metadata: ParsedGmailMetadata;
 }
 
 function findFirstPart(
@@ -92,11 +98,14 @@ export function parseGmailMessage(raw: GmailMessage): ParsedGmailMessage {
     ...parseMessageIds(getHeader(root, 'In-Reply-To')),
     ...parseMessageIds(getHeader(root, 'References')),
   ];
+  const from = parseRfc5322Address(getHeader(root, 'From')) ?? undefined;
 
   return {
     content: extractContent(root),
     subject,
     messageId,
     threadHints,
+    from,
+    metadata: { gmailThreadId: raw.threadId },
   };
 }

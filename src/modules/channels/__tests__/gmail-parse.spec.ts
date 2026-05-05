@@ -204,4 +204,97 @@ describe('parseGmailMessage', () => {
       ]);
     });
   });
+
+  describe('from + threadId metadata', () => {
+    it('parses From header with display name into { name, email }', () => {
+      const parsed = parseGmailMessage(loadFixture('plain.json'));
+      expect(parsed.from).toEqual({ name: 'Alice', email: 'alice@example.com' });
+    });
+
+    it('parses a bare-email From header into { name: undefined, email }', () => {
+      const raw: GmailMessage = {
+        id: 'bare-from',
+        payload: {
+          mimeType: 'text/plain',
+          headers: [{ name: 'From', value: 'sender@example.com' }],
+          body: { size: 4, data: encode('body') },
+        },
+      };
+      expect(parseGmailMessage(raw).from).toEqual({
+        name: undefined,
+        email: 'sender@example.com',
+      });
+    });
+
+    it('lowercases the From email but preserves the display name case', () => {
+      const raw: GmailMessage = {
+        id: 'mixed-case-from',
+        payload: {
+          mimeType: 'text/plain',
+          headers: [{ name: 'From', value: 'Bob Smith <BOB@EXAMPLE.COM>' }],
+          body: { size: 4, data: encode('body') },
+        },
+      };
+      expect(parseGmailMessage(raw).from).toEqual({
+        name: 'Bob Smith',
+        email: 'bob@example.com',
+      });
+    });
+
+    it('matches the From header case-insensitively', () => {
+      const raw: GmailMessage = {
+        id: 'lowercase-from-header',
+        payload: {
+          mimeType: 'text/plain',
+          headers: [{ name: 'from', value: 'Eve <eve@example.com>' }],
+          body: { size: 4, data: encode('body') },
+        },
+      };
+      expect(parseGmailMessage(raw).from).toEqual({
+        name: 'Eve',
+        email: 'eve@example.com',
+      });
+    });
+
+    it('returns from: undefined when the From header is missing', () => {
+      const raw: GmailMessage = {
+        id: 'no-from',
+        payload: {
+          mimeType: 'text/plain',
+          headers: [{ name: 'Subject', value: 'no sender here' }],
+          body: { size: 4, data: encode('body') },
+        },
+      };
+      expect(parseGmailMessage(raw).from).toBeUndefined();
+    });
+
+    it('returns from: undefined when the From header is malformed', () => {
+      const raw: GmailMessage = {
+        id: 'bad-from',
+        payload: {
+          mimeType: 'text/plain',
+          headers: [{ name: 'From', value: 'not an email' }],
+          body: { size: 4, data: encode('body') },
+        },
+      };
+      expect(parseGmailMessage(raw).from).toBeUndefined();
+    });
+
+    it('exposes raw.threadId as metadata.gmailThreadId', () => {
+      const parsed = parseGmailMessage(loadFixture('plain.json'));
+      expect(parsed.metadata.gmailThreadId).toBe('1932abcd0001');
+    });
+
+    it('leaves metadata.gmailThreadId undefined when raw.threadId is absent', () => {
+      const raw: GmailMessage = {
+        id: 'no-thread',
+        payload: {
+          mimeType: 'text/plain',
+          body: { size: 4, data: encode('body') },
+        },
+      };
+      const parsed = parseGmailMessage(raw);
+      expect(parsed.metadata.gmailThreadId).toBeUndefined();
+    });
+  });
 });
