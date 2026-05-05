@@ -50,7 +50,7 @@ interface SendDeps {
  * the message is marked as failed but the HTTP request still returns success
  * (the message is persisted regardless — that's what agents see).
  */
-export async function sendOutboundEmail(
+export async function sendViaPostmark(
   input: SendEmailInput,
   config: EmailConfig,
   secrets: EmailSecrets,

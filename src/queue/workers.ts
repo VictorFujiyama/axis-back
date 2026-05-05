@@ -16,7 +16,7 @@ import { handleBotFallback } from '../modules/bots/fallback';
 import {
   parseEmailConfig,
   parseEmailSecrets,
-  sendOutboundEmail,
+  sendViaPostmark,
 } from '../modules/channels/email-sender';
 import {
   parseWhatsAppConfig,
@@ -138,7 +138,7 @@ export function registerWorkers(app: FastifyInstance): void {
           throw err;
         }
       }
-      await sendOutboundEmail(
+      await sendViaPostmark(
         {
           messageId: data.messageId,
           conversationId: data.conversationId,
