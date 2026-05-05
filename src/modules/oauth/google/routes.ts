@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { config } from '../../../config.js';
 import { encryptJSON } from '../../../crypto.js';
+import { type GmailSyncJob, QUEUE_NAMES } from '../../../queue/index.js';
 import { parseGmailConfig } from '../../channels/gmail-config.js';
 import {
   exchangeCode,
@@ -238,6 +239,7 @@ export async function googleOAuthRoutes(
         .set({ secrets, config: patchedConfig, updatedAt: new Date() })
         .where(eq(schema.inboxes.id, payload.inboxId));
 
+      await scheduleGmailSync(app, payload.inboxId);
       return reply.redirect(buildSuccessRedirect(payload.inboxId), 302);
     }
 
@@ -263,6 +265,7 @@ export async function googleOAuthRoutes(
       return reply.internalServerError('inbox insert returned no row');
     }
 
+    await scheduleGmailSync(app, created.id);
     return reply.redirect(buildSuccessRedirect(created.id), 302);
   });
 
@@ -314,4 +317,20 @@ function buildSuccessRedirect(inboxId: string): string {
   const base = config.FRONT_URL!.replace(/\/$/, '');
   const params = new URLSearchParams({ ok: '1', inboxId });
   return `${base}/settings/inboxes/oauth/callback?${params.toString()}`;
+}
+
+async function scheduleGmailSync(
+  app: FastifyInstance,
+  inboxId: string,
+): Promise<void> {
+  // upsertJobScheduler is idempotent on the scheduler id — same call works for
+  // create (first time) and reauth (re-arms an inbox whose schedule may have
+  // been drained). Repeats every 60s per spec § "Sync worker".
+  await app.queues
+    .getQueue<GmailSyncJob>(QUEUE_NAMES.GMAIL_SYNC)
+    .upsertJobScheduler(
+      `gmail-sync:${inboxId}`,
+      { every: 60_000 },
+      { name: 'sync', data: { inboxId } },
+    );
 }

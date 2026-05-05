@@ -18,6 +18,12 @@ interface DbStub {
   updateWhere: ReturnType<typeof vi.fn>;
 }
 
+interface QueueStub {
+  getQueue: ReturnType<typeof vi.fn>;
+  upsertJobScheduler: ReturnType<typeof vi.fn>;
+  add: ReturnType<typeof vi.fn>;
+}
+
 interface AppBuildOptions {
   selectRows?: unknown[];
   insertReturning?: unknown[];
@@ -28,6 +34,7 @@ interface AppBuildOptions {
 interface AppBuildResult {
   app: FastifyInstance;
   db: DbStub;
+  queues: QueueStub;
 }
 
 // Same module-reset pattern as authorize.spec.ts — each buildTestApp reads
@@ -65,6 +72,18 @@ async function buildTestApp(
     { select, insert, update } as unknown as FastifyInstance['db'],
   );
 
+  // T-41: callback schedules a repeating gmail-sync job after persisting the
+  // inbox. Tests assert against `getQueue` + `upsertJobScheduler`; existing
+  // tests don't reference these spies so the extension is invisible to them.
+  const upsertJobScheduler = vi.fn().mockResolvedValue(undefined);
+  const queueAdd = vi.fn().mockResolvedValue(undefined);
+  const queueObj = { upsertJobScheduler, add: queueAdd };
+  const getQueue = vi.fn().mockReturnValue(queueObj);
+  app.decorate(
+    'queues',
+    { getQueue } as unknown as FastifyInstance['queues'],
+  );
+
   await app.register(googleOAuthRoutes, {
     exchangeCodeImpl: options.exchangeCodeImpl,
     getUserInfoImpl: options.getUserInfoImpl,
@@ -83,6 +102,11 @@ async function buildTestApp(
       update,
       set,
       updateWhere,
+    },
+    queues: {
+      getQueue,
+      upsertJobScheduler,
+      add: queueAdd,
     },
   };
 }
@@ -963,6 +987,198 @@ describe('GET /api/v1/oauth/google/callback — front success redirect (T-21)', 
       expect(location).toContain(
         'https://axis.example.com/app/settings/inboxes/oauth/callback',
       );
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('GET /api/v1/oauth/google/callback — schedule gmail-sync (T-41)', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+    stubAllEnv();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('create branch: upserts a 60s repeating gmail-sync job keyed by gmail-sync:<inboxId>', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//rt',
+      accessToken: 'ya29.at',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const insertedRow = { id: '33333333-4444-4555-8666-777777777777' };
+    const { app, queues } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+      insertReturning: [insertedRow],
+    });
+    try {
+      const state = await makeValidState({ inboxId: null });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH&state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(302);
+
+      // Routed to the gmail-sync queue exactly once.
+      expect(queues.getQueue).toHaveBeenCalledTimes(1);
+      expect(queues.getQueue).toHaveBeenCalledWith('gmail-sync');
+
+      // Scheduler keyed per inbox, repeats every 60s, carries inboxId payload.
+      expect(queues.upsertJobScheduler).toHaveBeenCalledTimes(1);
+      expect(queues.upsertJobScheduler).toHaveBeenCalledWith(
+        `gmail-sync:${insertedRow.id}`,
+        { every: 60_000 },
+        { name: 'sync', data: { inboxId: insertedRow.id } },
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('reauth branch: upserts the same scheduler for the existing inbox (idempotent on inboxId)', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//rt',
+      accessToken: 'ya29.at',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const stateInboxId = '00000000-0000-4000-8000-cccc00000001';
+    const existingRow = {
+      id: stateInboxId,
+      accountId: 'acc-reauth-sched',
+      config: {
+        provider: 'gmail',
+        gmailEmail: 'support@example.com',
+        gmailHistoryId: '42',
+        needsReauth: true,
+      },
+    };
+    const { app, queues } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+      selectRows: [existingRow],
+    });
+    try {
+      const state = await makeValidState({
+        accountId: 'acc-reauth-sched',
+        inboxId: stateInboxId,
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH_REAUTH&state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(302);
+
+      // upsert is idempotent on the scheduler id — calling it on reauth is
+      // safe and keeps the schedule healthy if BullMQ ever lost the previous
+      // entry (e.g. queue draining for ops).
+      expect(queues.getQueue).toHaveBeenCalledWith('gmail-sync');
+      expect(queues.upsertJobScheduler).toHaveBeenCalledTimes(1);
+      expect(queues.upsertJobScheduler).toHaveBeenCalledWith(
+        `gmail-sync:${stateInboxId}`,
+        { every: 60_000 },
+        { name: 'sync', data: { inboxId: stateInboxId } },
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does NOT schedule when state is invalid', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>();
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>();
+    const { app, queues } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+    });
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/v1/oauth/google/callback?code=AUTH&state=garbage',
+      });
+      expect(res.statusCode).toBe(400);
+      expect(queues.getQueue).not.toHaveBeenCalled();
+      expect(queues.upsertJobScheduler).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does NOT schedule when ?error= is present (front error redirect)', async () => {
+    const { app, queues } = await buildTestApp();
+    try {
+      const state = await makeValidState();
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?error=access_denied&state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(302);
+      expect(queues.getQueue).not.toHaveBeenCalled();
+      expect(queues.upsertJobScheduler).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does NOT schedule when exchangeCode fails (502)', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>();
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>();
+    const { app, queues } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+    });
+    const { GoogleOAuthError } = await import('../client.js');
+    exchangeCodeImpl.mockRejectedValueOnce(
+      new GoogleOAuthError('bad request', 400, 'invalid_grant'),
+    );
+    try {
+      const state = await makeValidState();
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH&state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(502);
+      expect(queues.upsertJobScheduler).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does NOT schedule when reauth target inbox is missing (404)', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//rt',
+      accessToken: 'ya29.at',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const { app, queues } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+      selectRows: [],
+    });
+    try {
+      const state = await makeValidState({
+        accountId: 'acc-missing',
+        inboxId: '00000000-0000-4000-8000-cccc00000099',
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH&state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(404);
+      expect(queues.upsertJobScheduler).not.toHaveBeenCalled();
     } finally {
       await app.close();
     }
