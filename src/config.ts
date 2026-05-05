@@ -54,6 +54,9 @@ const envSchema = z.object({
   GOOGLE_OAUTH_CLIENT_ID: z.string().optional(),
   GOOGLE_OAUTH_CLIENT_SECRET: z.string().optional(),
   GOOGLE_OAUTH_REDIRECT_URI: z.string().url().optional(),
+  // Public base URL of the frontend — used by the OAuth callback to redirect
+  // the user back into the app after Google consent. Required for /oauth/google/*.
+  FRONT_URL: z.string().url().optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
