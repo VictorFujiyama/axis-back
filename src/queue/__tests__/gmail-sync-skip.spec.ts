@@ -125,9 +125,13 @@ describe('processGmailSyncJob — skip guards', () => {
 
   it('does not throw and does not log a skip reason for a healthy gmail inbox', async () => {
     // Spec § "Sync worker": skip-guards should fall through for a healthy
-    // inbox. The bootstrap / incremental Gmail call lands in T-34+. For T-33,
-    // we just want to confirm none of the skip branches fired.
-    const inbox = buildInbox({ config: { provider: 'gmail', needsReauth: false } });
+    // inbox. We seed `gmailHistoryId` so the T-34 bootstrap branch does NOT
+    // fire (and the T-37 incremental branch is still a no-op) — that way the
+    // test stays focused on the skip path. The bootstrap branch has its own
+    // dedicated suite in `gmail-sync-bootstrap.spec.ts`.
+    const inbox = buildInbox({
+      config: { provider: 'gmail', needsReauth: false, gmailHistoryId: 'preset' },
+    });
     const { app, log } = buildApp([inbox]);
 
     await expect(
