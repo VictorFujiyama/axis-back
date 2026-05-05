@@ -169,6 +169,45 @@ export async function sendViaPostmark(
   throw new Error(`postmark ${res.status}: ${data.Message ?? 'server error'}`);
 }
 
+export interface DispatchEmailDeps {
+  db: DB;
+  log: FastifyBaseLogger;
+  /** Test seam — defaults to `sendViaPostmark` in production. */
+  sendPostmarkImpl?: typeof sendViaPostmark;
+}
+
+function readProvider(raw: unknown): string | undefined {
+  if (raw && typeof raw === 'object' && 'provider' in raw) {
+    const value = (raw as { provider?: unknown }).provider;
+    return typeof value === 'string' ? value : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Routes an outbound email send to the right provider based on `config.provider`.
+ * Legacy inboxes (no `provider` field) and `'postmark'` route to Postmark.
+ * `'gmail'` is reserved for T-48; until then it throws.
+ */
+export async function dispatchEmailSend(
+  input: SendEmailInput,
+  rawConfig: unknown,
+  rawSecrets: unknown,
+  inReplyToMessageId: string | null,
+  deps: DispatchEmailDeps,
+): Promise<void> {
+  const provider = readProvider(rawConfig);
+
+  if (provider === 'gmail') {
+    throw new Error('dispatchEmailSend: gmail provider not implemented');
+  }
+
+  const config = parseEmailConfig(rawConfig);
+  const secrets = parseEmailSecrets(rawSecrets);
+  const send = deps.sendPostmarkImpl ?? sendViaPostmark;
+  return send(input, config, secrets, inReplyToMessageId, { db: deps.db, log: deps.log });
+}
+
 /**
  * Returns the last inbound (from=contact) channel message id in a conversation,
  * used for threading outbound replies via In-Reply-To.
