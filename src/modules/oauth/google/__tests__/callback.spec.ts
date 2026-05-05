@@ -332,10 +332,10 @@ describe('GET /api/v1/oauth/google/callback — code exchange (T-18)', () => {
         method: 'GET',
         url: `/api/v1/oauth/google/callback?code=AUTH_CODE_123&state=${encodeURIComponent(state)}`,
       });
-      // T-19 will replace the persist fall-through; until then the route
-      // returns 501. T-18's contract is "Google calls happen exactly once
-      // each with the right args" — the persist branch is out of scope.
-      expect(res.statusCode).toBe(501);
+      // After T-21, the persist branch redirects to the front. T-18's
+      // contract is "Google calls happen exactly once each with the right
+      // args" — the redirect URL is asserted in the T-21 describe.
+      expect(res.statusCode).toBe(302);
       expect(exchangeCodeImpl).toHaveBeenCalledTimes(1);
       expect(exchangeCodeImpl).toHaveBeenCalledWith('AUTH_CODE_123');
       expect(getUserInfoImpl).toHaveBeenCalledTimes(1);
@@ -532,14 +532,11 @@ describe('GET /api/v1/oauth/google/callback — create inbox (T-19)', () => {
       expect(expiresAtMs).toBeGreaterThanOrEqual(before + 3_600_000 - 1_000);
       expect(expiresAtMs).toBeLessThanOrEqual(after + 3_600_000 + 1_000);
 
-      // Persist branch is reached but redirect is not yet wired (T-21).
-      // Until then, the route returns 501 with a "redirect" marker so any
-      // accidental hit fails loudly.
-      expect(res.statusCode).toBe(501);
-      // The new inbox id surfaces somewhere in the response so a future T-21
-      // test can assert the redirect URL contains it. We don't pin location
-      // here — only that the persisted row was the one returned.
-      void insertedRow;
+      // Persist branch is reached and T-21 redirects to the front using
+      // the inserted row's id. The exact URL shape lives in the T-21
+      // describe; here we only need to confirm the persist path runs.
+      expect(res.statusCode).toBe(302);
+      expect(res.headers.location).toContain(`inboxId=${insertedRow.id}`);
     } finally {
       await app.close();
     }
@@ -578,8 +575,8 @@ describe('GET /api/v1/oauth/google/callback — create inbox (T-19)', () => {
         url: `/api/v1/oauth/google/callback?code=AUTH_REAUTH&state=${encodeURIComponent(state)}`,
       });
       // T-20 routes the reauth branch through update; the insert path must
-      // never fire. The redirect is still T-21, so the response is 501.
-      expect(res.statusCode).toBe(501);
+      // never fire. T-21 then 302s to the front-success URL.
+      expect(res.statusCode).toBe(302);
       expect(db.insert).not.toHaveBeenCalled();
       expect(db.update).toHaveBeenCalledTimes(1);
     } finally {
@@ -739,8 +736,8 @@ describe('GET /api/v1/oauth/google/callback — reauth update (T-20)', () => {
       expect(expiresAtMs).toBeGreaterThanOrEqual(before + 3_600_000 - 1_000);
       expect(expiresAtMs).toBeLessThanOrEqual(after + 3_600_000 + 1_000);
 
-      // T-21 will replace this with the front-success redirect.
-      expect(res.statusCode).toBe(501);
+      // T-21 redirects to the front-success URL after the patch lands.
+      expect(res.statusCode).toBe(302);
     } finally {
       await app.close();
     }
@@ -840,6 +837,132 @@ describe('GET /api/v1/oauth/google/callback — reauth update (T-20)', () => {
       });
       expect(db.update).not.toHaveBeenCalled();
       expect(db.insert).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('GET /api/v1/oauth/google/callback — front success redirect (T-21)', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+    stubAllEnv();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('create branch: 302 to FRONT_URL/.../callback?ok=1&inboxId=<created.id>', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//rt',
+      accessToken: 'ya29.at',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const insertedRow = { id: '11111111-2222-4333-8444-cccccccccccc' };
+    const { app } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+      insertReturning: [insertedRow],
+    });
+    try {
+      const state = await makeValidState({ inboxId: null });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH&state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(302);
+      const location = res.headers.location;
+      expect(typeof location).toBe('string');
+      const url = new URL(location as string);
+      expect(`${url.origin}${url.pathname}`).toBe(
+        'https://axis.example.com/settings/inboxes/oauth/callback',
+      );
+      expect(url.searchParams.get('ok')).toBe('1');
+      expect(url.searchParams.get('inboxId')).toBe(insertedRow.id);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('reauth branch: 302 with inboxId pulled from state.inboxId (not from select row)', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//rt',
+      accessToken: 'ya29.at',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const stateInboxId = '00000000-0000-4000-8000-bbbb00000001';
+    const existingRow = {
+      id: stateInboxId,
+      accountId: 'acc-reauth-redir',
+      config: {
+        provider: 'gmail',
+        gmailEmail: 'support@example.com',
+        gmailHistoryId: '321',
+        needsReauth: true,
+      },
+    };
+    const { app } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+      selectRows: [existingRow],
+    });
+    try {
+      const state = await makeValidState({
+        accountId: 'acc-reauth-redir',
+        inboxId: stateInboxId,
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH&state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(302);
+      const url = new URL(res.headers.location as string);
+      expect(`${url.origin}${url.pathname}`).toBe(
+        'https://axis.example.com/settings/inboxes/oauth/callback',
+      );
+      expect(url.searchParams.get('ok')).toBe('1');
+      expect(url.searchParams.get('inboxId')).toBe(stateInboxId);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('redirect URL respects FRONT_URL with a path prefix (no double slash)', async () => {
+    vi.stubEnv('FRONT_URL', 'https://axis.example.com/app');
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//rt',
+      accessToken: 'ya29.at',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const { app } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+      insertReturning: [{ id: '22222222-3333-4444-8555-666666666666' }],
+    });
+    try {
+      const state = await makeValidState({ inboxId: null });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH&state=${encodeURIComponent(state)}`,
+      });
+      expect(res.statusCode).toBe(302);
+      const location = res.headers.location as string;
+      // Must not produce `//settings` even when FRONT_URL has a trailing path.
+      expect(location).not.toContain('//settings');
+      expect(location).toContain(
+        'https://axis.example.com/app/settings/inboxes/oauth/callback',
+      );
     } finally {
       await app.close();
     }

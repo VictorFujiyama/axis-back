@@ -234,11 +234,10 @@ export async function googleOAuthRoutes(
         .set({ secrets, config: patchedConfig, updatedAt: new Date() })
         .where(eq(schema.inboxes.id, payload.inboxId));
 
-      // T-21 will replace this with the front-success redirect.
-      return reply.notImplemented('redirect not implemented (T-21)');
+      return reply.redirect(buildSuccessRedirect(payload.inboxId), 302);
     }
 
-    const [created] = await app.db
+    const inserted = await app.db
       .insert(schema.inboxes)
       .values({
         accountId: payload.accountId,
@@ -253,9 +252,22 @@ export async function googleOAuthRoutes(
         secrets,
       })
       .returning();
-    void created;
+    const created = inserted[0];
+    if (!created) {
+      // Postgres returned no row from a non-conflicting insert — treat as a
+      // server error rather than redirecting with a missing inboxId.
+      return reply.internalServerError('inbox insert returned no row');
+    }
 
-    // T-21 will replace this with the front-success redirect.
-    return reply.notImplemented('redirect not implemented (T-21)');
+    return reply.redirect(buildSuccessRedirect(created.id), 302);
   });
+}
+
+function buildSuccessRedirect(inboxId: string): string {
+  // FRONT_URL is gated by the 503 check at the top of the handler, so it's
+  // guaranteed to be set when we get here. Trim a trailing slash so a value
+  // like `https://app.example.com/` doesn't produce a double slash.
+  const base = config.FRONT_URL!.replace(/\/$/, '');
+  const params = new URLSearchParams({ ok: '1', inboxId });
+  return `${base}/settings/inboxes/oauth/callback?${params.toString()}`;
 }
