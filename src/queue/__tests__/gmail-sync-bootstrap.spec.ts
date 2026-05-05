@@ -14,22 +14,33 @@ interface AppStub {
     warn: ReturnType<typeof vi.fn>;
     error: ReturnType<typeof vi.fn>;
   };
+  db: {
+    update: ReturnType<typeof vi.fn>;
+    updateSet: ReturnType<typeof vi.fn>;
+    updateWhere: ReturnType<typeof vi.fn>;
+  };
 }
 
 /**
  * Fastify-shaped stub whose `db.select().from().where().limit()` chain resolves
- * to the rows we want the worker to see. Only the select chain is stubbed —
- * T-34 does not write to the DB (T-36 will, when persisting `gmailHistoryId`).
+ * to the rows we want the worker to see, and whose `db.update().set().where()`
+ * chain resolves cleanly. T-36 introduced the update path (persisting
+ * `gmailHistoryId` after a successful bootstrap run); the chain captures call
+ * args so tests can assert on the patched `config` payload.
  */
 function buildApp(rows: unknown[]): AppStub {
   const limit = vi.fn().mockResolvedValue(rows);
   const where = vi.fn().mockReturnValue({ limit });
   const from = vi.fn().mockReturnValue({ where });
   const select = vi.fn().mockReturnValue({ from });
+  const updateWhere = vi.fn().mockResolvedValue(undefined);
+  const updateSet = vi.fn().mockReturnValue({ where: updateWhere });
+  const update = vi.fn().mockReturnValue({ set: updateSet });
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
   return {
-    app: { db: { select }, log } as unknown as FastifyInstance,
+    app: { db: { select, update }, log } as unknown as FastifyInstance,
     log,
+    db: { update, updateSet, updateWhere },
   };
 }
 
@@ -92,13 +103,28 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+/**
+ * T-36: every successful bootstrap ends with a `users.getProfile` call so the
+ * worker can persist `gmailHistoryId`. Tests that don't care about the profile
+ * step queue this catch-all default to keep the chain valid.
+ */
+function profileResponse(historyId = 'h-from-profile'): Response {
+  return jsonResponse({
+    emailAddress: 'support@example.com',
+    historyId,
+    messagesTotal: 0,
+    threadsTotal: 0,
+  });
+}
+
 describe('processGmailSyncJob — bootstrap path', () => {
   it('hits users.messages.list with the spec URL + Bearer when no gmailHistoryId is stored', async () => {
     const inbox = buildHealthyInbox(); // config has provider: 'gmail', no historyId
     const { app } = buildApp([inbox]);
     const fetchImpl = vi
       .fn()
-      .mockResolvedValue(jsonResponse({ resultSizeEstimate: 0 }));
+      .mockResolvedValueOnce(jsonResponse({ resultSizeEstimate: 0 }))
+      .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn();
 
@@ -108,7 +134,8 @@ describe('processGmailSyncJob — bootstrap path', () => {
       { fetchImpl, getAccessToken, ingest },
     );
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    // 1 list + 1 getProfile (T-36 end-of-bootstrap persist).
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
     const [rawUrl, init] = fetchImpl.mock.calls[0]!;
     const url = new URL(rawUrl as string);
     expect(`${url.origin}${url.pathname}`).toBe(
@@ -142,7 +169,8 @@ describe('processGmailSyncJob — bootstrap path', () => {
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('msg-aaa')))
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('msg-bbb')))
-      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('msg-ccc')));
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('msg-ccc')))
+      .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
 
@@ -152,9 +180,9 @@ describe('processGmailSyncJob — bootstrap path', () => {
       { fetchImpl, getAccessToken, ingest },
     );
 
-    expect(fetchImpl).toHaveBeenCalledTimes(4); // 1 list + 3 per-message gets
+    expect(fetchImpl).toHaveBeenCalledTimes(5); // 1 list + 3 gets + 1 getProfile
 
-    const getCalls = fetchImpl.mock.calls.slice(1);
+    const getCalls = fetchImpl.mock.calls.slice(1, 4);
     const getUrls = getCalls.map((c) => new URL(c[0] as string));
     expect(getUrls.map((u) => `${u.origin}${u.pathname}`)).toEqual([
       'https://gmail.googleapis.com/gmail/v1/users/me/messages/msg-aaa',
@@ -164,7 +192,7 @@ describe('processGmailSyncJob — bootstrap path', () => {
     for (const u of getUrls) {
       expect(u.searchParams.get('format')).toBe('full');
     }
-    // Bearer header carries through to every per-message GET as well.
+    // Bearer header carries through to every Gmail call (including getProfile).
     for (const call of fetchImpl.mock.calls) {
       const headers = (call[1] as RequestInit).headers as Record<string, string>;
       expect(headers.Authorization).toBe(`Bearer ${ACCESS_TOKEN}`);
@@ -176,7 +204,8 @@ describe('processGmailSyncJob — bootstrap path', () => {
     const { app } = buildApp([inbox]);
     const fetchImpl = vi
       .fn()
-      .mockResolvedValue(jsonResponse({ resultSizeEstimate: 0 }));
+      .mockResolvedValueOnce(jsonResponse({ resultSizeEstimate: 0 }))
+      .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn();
 
@@ -186,7 +215,8 @@ describe('processGmailSyncJob — bootstrap path', () => {
       { fetchImpl, getAccessToken, ingest },
     );
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1); // list only
+    // 1 list + 1 getProfile (T-36 persists historyId even on empty bootstrap).
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(ingest).not.toHaveBeenCalled();
   });
 
@@ -197,7 +227,7 @@ describe('processGmailSyncJob — bootstrap path', () => {
     const inbox = buildHealthyInbox({
       config: { provider: 'gmail', gmailHistoryId: '987654321' },
     });
-    const { app } = buildApp([inbox]);
+    const { app, db } = buildApp([inbox]);
     const fetchImpl = vi.fn();
     const getAccessToken = vi.fn();
     const ingest = vi.fn();
@@ -211,11 +241,13 @@ describe('processGmailSyncJob — bootstrap path', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(getAccessToken).not.toHaveBeenCalled();
     expect(ingest).not.toHaveBeenCalled();
+    // Skipped path: no historyId update fires either (T-36 guard).
+    expect(db.update).not.toHaveBeenCalled();
   });
 
   it('throws when messages.list returns 4xx so BullMQ schedules a retry', async () => {
     const inbox = buildHealthyInbox();
-    const { app } = buildApp([inbox]);
+    const { app, db } = buildApp([inbox]);
     const fetchImpl = vi
       .fn()
       .mockResolvedValue(new Response('forbidden', { status: 403 }));
@@ -230,6 +262,8 @@ describe('processGmailSyncJob — bootstrap path', () => {
       ),
     ).rejects.toThrow(/messages\.list 403/);
     expect(ingest).not.toHaveBeenCalled();
+    // List failed before getProfile could fire → no historyId persisted.
+    expect(db.update).not.toHaveBeenCalled();
   });
 
   it('encodes special characters in the message id when calling messages.get', async () => {
@@ -242,7 +276,8 @@ describe('processGmailSyncJob — bootstrap path', () => {
           messages: [{ id: 'msg/with slash', threadId: 'thr-1' }],
         }),
       )
-      .mockResolvedValueOnce(jsonResponse({ id: 'msg/with slash' }));
+      .mockResolvedValueOnce(jsonResponse({ id: 'msg/with slash' }))
+      .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn();
 
@@ -275,7 +310,8 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
             historyId: 'h-100',
           }),
         ),
-      );
+      )
+      .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({
       deduped: false,
@@ -337,7 +373,8 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('a')))
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('b')))
-      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('c')));
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('c')))
+      .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
 
@@ -371,7 +408,8 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
         }),
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('old')))
-      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('new')));
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('new')))
+      .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi
       .fn()
@@ -401,7 +439,8 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
             headers: [{ name: 'From', value: 'alice@example.com' }],
           }),
         ),
-      );
+      )
+      .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
 
@@ -433,7 +472,8 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
         // No From header → parseGmailMessage returns from: undefined.
         jsonResponse(buildFullGmailMessage('broken', { headers: [] })),
       )
-      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('ok')));
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('ok')))
+      .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
 
@@ -468,7 +508,8 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
         }),
       )
       .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('fail')))
-      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('next')));
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('next')))
+      .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi
       .fn()
@@ -506,7 +547,8 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
             // No body at all (multipart with no usable parts).
           },
         }),
-      );
+      )
+      .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
 
@@ -529,7 +571,8 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
       .mockResolvedValueOnce(
         jsonResponse({ messages: [{ id: 'a', threadId: 't' }] }),
       )
-      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('a')));
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('a')))
+      .mockResolvedValueOnce(profileResponse());
     const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
     const ingest = vi.fn().mockResolvedValue({ deduped: false });
 
@@ -541,5 +584,197 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
 
     expect(ingest).toHaveBeenCalledTimes(1);
     expect(ingest.mock.calls[0]![3]).toBe('bot-123');
+  });
+});
+
+describe('processGmailSyncJob — bootstrap path → persist gmailHistoryId (T-36)', () => {
+  it('calls users.getProfile with Bearer auth at the end of a successful bootstrap', async () => {
+    const inbox = buildHealthyInbox();
+    const { app } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({ messages: [{ id: 'm-1', threadId: 't' }] }),
+      )
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('m-1')))
+      .mockResolvedValueOnce(profileResponse('h-from-profile'));
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockResolvedValue({ deduped: false });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    expect(fetchImpl).toHaveBeenCalledTimes(3); // list + get + profile
+    const profileCall = fetchImpl.mock.calls[2]!;
+    const profileUrl = new URL(profileCall[0] as string);
+    expect(`${profileUrl.origin}${profileUrl.pathname}`).toBe(
+      'https://gmail.googleapis.com/gmail/v1/users/me/profile',
+    );
+    const profileHeaders = (profileCall[1] as RequestInit).headers as Record<
+      string,
+      string
+    >;
+    expect(profileHeaders.Authorization).toBe(`Bearer ${ACCESS_TOKEN}`);
+    expect(profileHeaders.Accept).toBe('application/json');
+  });
+
+  it('persists historyId from the getProfile response into config.gmailHistoryId', async () => {
+    const inbox = buildHealthyInbox();
+    const { app, db } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ resultSizeEstimate: 0 }))
+      .mockResolvedValueOnce(profileResponse('h-12345'));
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn();
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(db.updateSet).toHaveBeenCalledTimes(1);
+    expect(db.updateWhere).toHaveBeenCalledTimes(1);
+
+    const setArg = db.updateSet.mock.calls[0]![0] as {
+      config: Record<string, unknown>;
+      updatedAt: Date;
+    };
+    expect(setArg.updatedAt).toBeInstanceOf(Date);
+    expect(setArg.config.gmailHistoryId).toBe('h-12345');
+  });
+
+  it('preserves existing config fields alongside the new gmailHistoryId', async () => {
+    const inbox = buildHealthyInbox({
+      config: {
+        provider: 'gmail',
+        gmailEmail: 'support@example.com',
+        fromName: 'Support Team',
+        needsReauth: false,
+      },
+    });
+    const { app, db } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ resultSizeEstimate: 0 }))
+      .mockResolvedValueOnce(profileResponse('h-77'));
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn();
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    const setArg = db.updateSet.mock.calls[0]![0] as {
+      config: Record<string, unknown>;
+    };
+    expect(setArg.config).toEqual({
+      provider: 'gmail',
+      gmailEmail: 'support@example.com',
+      fromName: 'Support Team',
+      needsReauth: false,
+      gmailHistoryId: 'h-77',
+    });
+  });
+
+  it('persists historyId even when the bootstrap list is empty', async () => {
+    // Spec § "Sync worker / Bootstrap path": "After all ingest, call
+    // users.getProfile and store historyId" — fires even with zero messages.
+    const inbox = buildHealthyInbox();
+    const { app, db } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ resultSizeEstimate: 0 }))
+      .mockResolvedValueOnce(profileResponse('h-99'));
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn();
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    expect(ingest).not.toHaveBeenCalled();
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(
+      (db.updateSet.mock.calls[0]![0] as { config: { gmailHistoryId: string } })
+        .config.gmailHistoryId,
+    ).toBe('h-99');
+  });
+
+  it('still persists historyId when an ingest call throws (per-message failures do not block the cursor)', async () => {
+    const inbox = buildHealthyInbox();
+    const { app, db } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({ messages: [{ id: 'fail', threadId: 't' }] }),
+      )
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('fail')))
+      .mockResolvedValueOnce(profileResponse('h-after-failure'));
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockRejectedValue(new Error('db down'));
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(
+      (db.updateSet.mock.calls[0]![0] as { config: { gmailHistoryId: string } })
+        .config.gmailHistoryId,
+    ).toBe('h-after-failure');
+  });
+
+  it('throws when getProfile returns non-2xx so BullMQ retries and no DB write happens', async () => {
+    const inbox = buildHealthyInbox();
+    const { app, db } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ resultSizeEstimate: 0 }))
+      .mockResolvedValueOnce(new Response('boom', { status: 503 }));
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn();
+
+    await expect(
+      processGmailSyncJob(
+        app,
+        { data: { inboxId: INBOX_ID } },
+        { fetchImpl, getAccessToken, ingest },
+      ),
+    ).rejects.toThrow(/getProfile 503/);
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it('throws when getProfile body is missing historyId so we never persist a partial cursor', async () => {
+    const inbox = buildHealthyInbox();
+    const { app, db } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ resultSizeEstimate: 0 }))
+      .mockResolvedValueOnce(
+        jsonResponse({ emailAddress: 'support@example.com' }),
+      );
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn();
+
+    await expect(
+      processGmailSyncJob(
+        app,
+        { data: { inboxId: INBOX_ID } },
+        { fetchImpl, getAccessToken, ingest },
+      ),
+    ).rejects.toThrow(/historyId/i);
+    expect(db.update).not.toHaveBeenCalled();
   });
 });

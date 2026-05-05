@@ -105,6 +105,37 @@ async function fetchFullGmailMessage(
 }
 
 /**
+ * Calls `users.getProfile` to read the current per-mailbox `historyId`. We
+ * persist this value at the end of a bootstrap run so the next iteration can
+ * use the incremental `users.history.list` path instead of re-listing
+ * `is:unread newer_than:7d`. Throws on non-2xx so BullMQ retries; throws when
+ * the response body is missing `historyId` so we never persist a partial
+ * cursor that would silently force another bootstrap next minute.
+ */
+async function fetchGmailHistoryCursor(
+  accessToken: string,
+  fetchImpl: typeof fetch,
+): Promise<string> {
+  const url = `${GMAIL_API_BASE}/users/me/profile`;
+  const res = await fetchImpl(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    throw new Error(`gmail users.getProfile ${res.status}`);
+  }
+  const body = (await res.json()) as { historyId?: string };
+  if (!body.historyId) {
+    throw new Error('gmail users.getProfile response missing historyId');
+  }
+  return body.historyId;
+}
+
+/**
  * Maps a parsed Gmail message into the channel-agnostic `IncomingMessage` shape
  * `ingestWithHooks` accepts. Returns `null` when the message lacks a parseable
  * `From` (no identifier → cannot route to a contact). The `channelMsgId`
@@ -191,9 +222,8 @@ export async function processGmailSyncJob(
 
   if (!parsedConfig.gmailHistoryId) {
     // Bootstrap branch: no cursor stored yet, list recent unread + fetch each
-    // message in `format=full`. T-35 will feed each parsed message into
-    // `ingestWithHooks`; T-36 will persist `gmailHistoryId` via `users.getProfile`
-    // after a successful run.
+    // message in `format=full`, ingest each, then persist `gmailHistoryId` via
+    // `users.getProfile` so the next iteration uses the incremental path.
     const fetchImpl = deps.fetchImpl ?? fetch;
     const getAccessToken = deps.getAccessToken ?? getValidAccessToken;
     const ingest = deps.ingest ?? ingestWithHooks;
@@ -222,6 +252,20 @@ export async function processGmailSyncJob(
         );
       }
     }
+
+    // Persist the cursor regardless of per-message ingest outcomes — a single
+    // broken message must not block the cursor or the inbox would be stuck
+    // re-bootstrapping the same window forever. Re-running the bootstrap on
+    // the same data is dedup-safe (channelMsgId match).
+    const newHistoryId = await fetchGmailHistoryCursor(accessToken, fetchImpl);
+    const patchedConfig = {
+      ...parsedConfig,
+      gmailHistoryId: newHistoryId,
+    };
+    await app.db
+      .update(schema.inboxes)
+      .set({ config: patchedConfig, updatedAt: new Date() })
+      .where(eq(schema.inboxes.id, inboxId));
     return;
   }
 
