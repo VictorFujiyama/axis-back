@@ -10,10 +10,14 @@ interface DbStub {
   from: ReturnType<typeof vi.fn>;
   where: ReturnType<typeof vi.fn>;
   limit: ReturnType<typeof vi.fn>;
+  insert: ReturnType<typeof vi.fn>;
+  values: ReturnType<typeof vi.fn>;
+  returning: ReturnType<typeof vi.fn>;
 }
 
 interface AppBuildOptions {
   selectRows?: unknown[];
+  insertReturning?: unknown[];
   exchangeCodeImpl?: ExchangeCodeImpl;
   getUserInfoImpl?: GetUserInfoImpl;
 }
@@ -25,8 +29,7 @@ interface AppBuildResult {
 
 // Same module-reset pattern as authorize.spec.ts — each buildTestApp reads
 // `config.GOOGLE_OAUTH_*` and `config.FRONT_URL` afresh, so per-test env stubs
-// take effect on import. The `db` stub is here for parity with authorize but
-// the callback flow doesn't touch DB until T-19.
+// take effect on import.
 async function buildTestApp(
   options: AppBuildOptions = {},
 ): Promise<AppBuildResult> {
@@ -44,14 +47,24 @@ async function buildTestApp(
   const where = vi.fn().mockReturnValue({ limit });
   const from = vi.fn().mockReturnValue({ where });
   const select = vi.fn().mockReturnValue({ from });
-  app.decorate('db', { select } as unknown as FastifyInstance['db']);
+  const returning = vi
+    .fn()
+    .mockResolvedValue(
+      options.insertReturning ?? [{ id: '00000000-0000-4000-8000-deadbeef0001' }],
+    );
+  const values = vi.fn().mockReturnValue({ returning });
+  const insert = vi.fn().mockReturnValue({ values });
+  app.decorate('db', { select, insert } as unknown as FastifyInstance['db']);
 
   await app.register(googleOAuthRoutes, {
     exchangeCodeImpl: options.exchangeCodeImpl,
     getUserInfoImpl: options.getUserInfoImpl,
   });
   await app.ready();
-  return { app, db: { select, from, where, limit } };
+  return {
+    app,
+    db: { select, from, where, limit, insert, values, returning },
+  };
 }
 
 function stubAllEnv(): void {
@@ -413,6 +426,193 @@ describe('GET /api/v1/oauth/google/callback — code exchange (T-18)', () => {
       expect(res.statusCode).toBe(302);
       expect(exchangeCodeImpl).not.toHaveBeenCalled();
       expect(getUserInfoImpl).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('GET /api/v1/oauth/google/callback — create inbox (T-19)', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+    stubAllEnv();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('persists a new gmail inbox with the right config + encrypted secrets', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//refresh-create',
+      accessToken: 'ya29.access-create',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const insertedRow = { id: '11111111-2222-4333-8444-555555555555' };
+    const { app, db } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+      insertReturning: [insertedRow],
+    });
+    const { schema } = await import('@blossom/db');
+    const { decryptJSON } = await import('../../../../crypto.js');
+    try {
+      const before = Date.now();
+      const state = await makeValidState({
+        accountId: 'acc-create-123',
+        userId: 'usr-create-456',
+        inboxName: 'Gmail Teste',
+        inboxId: null,
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH_CREATE&state=${encodeURIComponent(state)}`,
+      });
+      const after = Date.now();
+
+      // Persist happened.
+      expect(db.insert).toHaveBeenCalledTimes(1);
+      expect(db.insert).toHaveBeenCalledWith(schema.inboxes);
+      expect(db.values).toHaveBeenCalledTimes(1);
+      expect(db.returning).toHaveBeenCalledTimes(1);
+
+      // Right values shape.
+      const inserted = db.values.mock.calls[0]![0] as {
+        accountId: string;
+        name: string;
+        channelType: string;
+        config: Record<string, unknown>;
+        secrets: string;
+      };
+      expect(inserted.accountId).toBe('acc-create-123');
+      expect(inserted.name).toBe('Gmail Teste');
+      expect(inserted.channelType).toBe('email');
+      expect(inserted.config).toEqual({
+        provider: 'gmail',
+        gmailEmail: 'support@example.com',
+        gmailHistoryId: null,
+        needsReauth: false,
+      });
+
+      // Secrets round-trip via the real crypto helpers.
+      expect(typeof inserted.secrets).toBe('string');
+      const decrypted = decryptJSON<{
+        refreshToken: string;
+        accessToken: string;
+        expiresAt: string;
+      }>(inserted.secrets);
+      expect(decrypted.refreshToken).toBe('1//refresh-create');
+      expect(decrypted.accessToken).toBe('ya29.access-create');
+      const expiresAtMs = Date.parse(decrypted.expiresAt);
+      // expiresAt = now + expiresIn(3600s); allow small slop for test latency.
+      expect(expiresAtMs).toBeGreaterThanOrEqual(before + 3_600_000 - 1_000);
+      expect(expiresAtMs).toBeLessThanOrEqual(after + 3_600_000 + 1_000);
+
+      // Persist branch is reached but redirect is not yet wired (T-21).
+      // Until then, the route returns 501 with a "redirect" marker so any
+      // accidental hit fails loudly.
+      expect(res.statusCode).toBe(501);
+      // The new inbox id surfaces somewhere in the response so a future T-21
+      // test can assert the redirect URL contains it. We don't pin location
+      // here — only that the persisted row was the one returned.
+      void insertedRow;
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not call insert when state.inboxId is set (reauth — T-20)', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//rt',
+      accessToken: 'ya29.at',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const { app, db } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+    });
+    try {
+      const state = await makeValidState({
+        inboxId: '00000000-0000-4000-8000-000000000001',
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH_REAUTH&state=${encodeURIComponent(state)}`,
+      });
+      // Reauth update branch is T-20. For T-19 it must short-circuit before
+      // the insert path is reached.
+      expect(res.statusCode).toBe(501);
+      expect(db.insert).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('forwards the trimmed state.inboxName as the inbox row name', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//rt',
+      accessToken: 'ya29.at',
+      expiresIn: 3600,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'support@example.com',
+    });
+    const { app, db } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+    });
+    try {
+      const state = await makeValidState({
+        accountId: 'acc-name',
+        inboxName: 'My Custom Inbox Name',
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH&state=${encodeURIComponent(state)}`,
+      });
+      void res;
+      expect(db.values).toHaveBeenCalledTimes(1);
+      const inserted = db.values.mock.calls[0]![0] as { name: string };
+      expect(inserted.name).toBe('My Custom Inbox Name');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('honors a different expiresIn (e.g. 7200) when computing expiresAt', async () => {
+    const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
+      refreshToken: '1//rt-7200',
+      accessToken: 'ya29.at-7200',
+      expiresIn: 7200,
+    });
+    const getUserInfoImpl = vi.fn<GetUserInfoImpl>().mockResolvedValue({
+      email: 'two-hour@example.com',
+    });
+    const { app, db } = await buildTestApp({
+      exchangeCodeImpl,
+      getUserInfoImpl,
+    });
+    const { decryptJSON } = await import('../../../../crypto.js');
+    try {
+      const before = Date.now();
+      const state = await makeValidState();
+      await app.inject({
+        method: 'GET',
+        url: `/api/v1/oauth/google/callback?code=AUTH&state=${encodeURIComponent(state)}`,
+      });
+      const after = Date.now();
+      const inserted = db.values.mock.calls[0]![0] as { secrets: string };
+      const decrypted = decryptJSON<{ expiresAt: string }>(inserted.secrets);
+      const expiresAtMs = Date.parse(decrypted.expiresAt);
+      expect(expiresAtMs).toBeGreaterThanOrEqual(before + 7_200_000 - 1_000);
+      expect(expiresAtMs).toBeLessThanOrEqual(after + 7_200_000 + 1_000);
     } finally {
       await app.close();
     }

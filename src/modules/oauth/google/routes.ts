@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { config } from '../../../config.js';
+import { encryptJSON } from '../../../crypto.js';
 import {
   exchangeCode,
   type ExchangeCodeResult,
@@ -142,8 +143,9 @@ export async function googleOAuthRoutes(
     // State validation runs first — even when ?error= is present, an attacker
     // could otherwise bounce off a forged callback to phish the user back to
     // the frontend.
+    let payload;
     try {
-      verifyState(state);
+      payload = verifyState(state);
     } catch (err) {
       if (err instanceof InvalidStateError || err instanceof ExpiredStateError) {
         return reply.badRequest('state-invalid');
@@ -192,10 +194,38 @@ export async function googleOAuthRoutes(
       throw err;
     }
 
-    // T-19 will persist the inbox here using `tokens` + `userInfo.email` and
-    // `state.inboxName` / `state.accountId`. Until then, surface a 501 so any
-    // accidental hit fails loudly rather than silently dropping the tokens.
-    void userInfo;
-    return reply.notImplemented('persist not implemented (T-19)');
+    if (payload.inboxId) {
+      // Reauth update branch is T-20.
+      return reply.notImplemented('reauth update not implemented (T-20)');
+    }
+
+    const expiresAt = new Date(
+      Date.now() + tokens.expiresIn * 1000,
+    ).toISOString();
+    const secrets = encryptJSON({
+      refreshToken: tokens.refreshToken,
+      accessToken: tokens.accessToken,
+      expiresAt,
+    });
+
+    const [created] = await app.db
+      .insert(schema.inboxes)
+      .values({
+        accountId: payload.accountId,
+        name: payload.inboxName,
+        channelType: 'email',
+        config: {
+          provider: 'gmail',
+          gmailEmail: userInfo.email,
+          gmailHistoryId: null,
+          needsReauth: false,
+        },
+        secrets,
+      })
+      .returning();
+    void created;
+
+    // T-21 will replace this with the front-success redirect.
+    return reply.notImplemented('redirect not implemented (T-21)');
   });
 }
