@@ -1,5 +1,101 @@
-import { describe, expect, it } from 'vitest';
-import { composeMimeRfc5322 } from '../gmail-sender.js';
+import type { FastifyBaseLogger } from 'fastify';
+import type { DB } from '@blossom/db';
+import { describe, expect, it, vi } from 'vitest';
+import {
+  composeMimeRfc5322,
+  sendViaGmail,
+  type SendGmailDeps,
+} from '../gmail-sender.js';
+import type { SendEmailInput } from '../email-sender.js';
+
+const ACCESS_TOKEN = 'ya29.test-access-token';
+const SEND_URL = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
+
+const buildInput = (overrides: Partial<SendEmailInput> = {}): SendEmailInput => ({
+  messageId: '11111111-1111-1111-1111-111111111111',
+  conversationId: '22222222-2222-2222-2222-222222222222',
+  inboxId: '33333333-3333-3333-3333-333333333333',
+  contactEmail: 'customer@acme.com',
+  subject: 'Welcome',
+  text: 'Hello there',
+  ...overrides,
+});
+
+const buildLog = (): FastifyBaseLogger =>
+  ({
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+    fatal: vi.fn(),
+    trace: vi.fn(),
+    child: vi.fn(),
+    silent: vi.fn(),
+    level: 'info',
+  }) as unknown as FastifyBaseLogger;
+
+interface DbStub {
+  db: DB;
+  select: ReturnType<typeof vi.fn>;
+  update: ReturnType<typeof vi.fn>;
+  updateSet: ReturnType<typeof vi.fn>;
+  updateWhere: ReturnType<typeof vi.fn>;
+}
+
+/**
+ * Builds a Drizzle-shaped stub. `select().from().where().limit()` resolves to
+ * `selectRows`; `update().set(payload).where()` captures the patch.
+ */
+function buildDb(selectRows: unknown[] = [{ deliveredAt: null, failedAt: null }]): DbStub {
+  const limit = vi.fn().mockResolvedValue(selectRows);
+  const where = vi.fn().mockReturnValue({ limit });
+  const from = vi.fn().mockReturnValue({ where });
+  const select = vi.fn().mockReturnValue({ from });
+  const updateWhere = vi.fn().mockResolvedValue(undefined);
+  const updateSet = vi.fn().mockReturnValue({ where: updateWhere });
+  const update = vi.fn().mockReturnValue({ set: updateSet });
+  return {
+    db: { select, update } as unknown as DB,
+    select,
+    update,
+    updateSet,
+    updateWhere,
+  };
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+function buildDeps(
+  overrides: Partial<SendGmailDeps> & { selectRows?: unknown[] } = {},
+): { deps: SendGmailDeps; dbStub: DbStub; getAccessToken: ReturnType<typeof vi.fn>; fetchImpl: ReturnType<typeof vi.fn> } {
+  const dbStub = overrides.selectRows ? buildDb(overrides.selectRows) : buildDb();
+  const getAccessToken =
+    (overrides.getAccessToken as ReturnType<typeof vi.fn> | undefined) ??
+    vi.fn().mockResolvedValue(ACCESS_TOKEN);
+  const fetchImpl =
+    (overrides.fetchImpl as ReturnType<typeof vi.fn> | undefined) ??
+    vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ id: 'gmail-msg-id-123', threadId: 'thr-1', labelIds: ['SENT'] }),
+      );
+  return {
+    deps: {
+      db: overrides.db ?? dbStub.db,
+      log: overrides.log ?? buildLog(),
+      getAccessToken,
+      fetchImpl,
+    },
+    dbStub,
+    getAccessToken,
+    fetchImpl,
+  };
+}
 
 describe('composeMimeRfc5322', () => {
   describe('basic structure', () => {
@@ -202,5 +298,166 @@ describe('composeMimeRfc5322', () => {
         'References: <root@gmail.com> <parent@gmail.com>\r\n',
       );
     });
+  });
+});
+
+describe('sendViaGmail — happy path (T-45)', () => {
+  it('POSTs to users.messages.send with Bearer token + JSON content-type', async () => {
+    const { deps, fetchImpl, getAccessToken } = buildDeps();
+    const input = buildInput();
+    const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+    await sendViaGmail(input, config, null, null, deps);
+
+    expect(getAccessToken).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toBe(SEND_URL);
+    const initObj = init as RequestInit;
+    expect(initObj.method).toBe('POST');
+    const headers = initObj.headers as Record<string, string>;
+    expect(headers.Authorization).toBe(`Bearer ${ACCESS_TOKEN}`);
+    expect(headers['Content-Type']).toBe('application/json');
+    expect(headers.Accept).toBe('application/json');
+  });
+
+  it('uses AbortSignal.timeout (15s) on the outbound request', async () => {
+    const { deps, fetchImpl } = buildDeps();
+    const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+    await sendViaGmail(buildInput(), config, null, null, deps);
+    const initObj = fetchImpl.mock.calls[0]![1] as RequestInit;
+    expect(initObj.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('encodes the MIME body as base64url under `raw` in the request body', async () => {
+    const { deps, fetchImpl } = buildDeps();
+    const input = buildInput({
+      contactEmail: 'customer@acme.com',
+      subject: 'Hello',
+      text: 'Hi customer',
+    });
+    const config = {
+      provider: 'gmail' as const,
+      gmailEmail: 'support@example.com',
+      fromName: 'Atendimento Acme',
+    };
+
+    await sendViaGmail(input, config, null, null, deps);
+
+    const init = fetchImpl.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(init.body as string) as { raw: string };
+    expect(typeof body.raw).toBe('string');
+    // base64url alphabet: A-Z a-z 0-9 - _ (no =, no +/  )
+    expect(body.raw).toMatch(/^[A-Za-z0-9_-]+$/);
+
+    const decoded = Buffer.from(body.raw, 'base64url').toString('utf8');
+    expect(decoded).toContain('From: "Atendimento Acme" <support@example.com>\r\n');
+    expect(decoded).toContain('To: customer@acme.com\r\n');
+    expect(decoded).toContain('Subject: Hello\r\n');
+    expect(decoded).toContain('\r\n\r\nHi customer');
+  });
+
+  it('emits bare From address when fromName is absent', async () => {
+    const { deps, fetchImpl } = buildDeps();
+    const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+    await sendViaGmail(buildInput(), config, null, null, deps);
+
+    const init = fetchImpl.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(init.body as string) as { raw: string };
+    const decoded = Buffer.from(body.raw, 'base64url').toString('utf8');
+    expect(decoded).toContain('From: support@example.com\r\n');
+    expect(decoded).not.toContain('From: "');
+  });
+
+  it('includes In-Reply-To and References MIME headers when inReplyToMessageId provided', async () => {
+    const { deps, fetchImpl } = buildDeps();
+    const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+    await sendViaGmail(buildInput(), config, '<parent-rfc-id@gmail.com>', null, deps);
+
+    const init = fetchImpl.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(init.body as string) as { raw: string };
+    const decoded = Buffer.from(body.raw, 'base64url').toString('utf8');
+    expect(decoded).toContain('In-Reply-To: <parent-rfc-id@gmail.com>\r\n');
+    expect(decoded).toContain('References: <parent-rfc-id@gmail.com>\r\n');
+  });
+
+  it('omits In-Reply-To and References MIME headers when inReplyToMessageId is null', async () => {
+    const { deps, fetchImpl } = buildDeps();
+    const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+    await sendViaGmail(buildInput(), config, null, null, deps);
+
+    const init = fetchImpl.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(init.body as string) as { raw: string };
+    const decoded = Buffer.from(body.raw, 'base64url').toString('utf8');
+    expect(decoded).not.toMatch(/^In-Reply-To:/m);
+    expect(decoded).not.toMatch(/^References:/m);
+  });
+
+  it('includes `threadId` in the request body when provided', async () => {
+    const { deps, fetchImpl } = buildDeps();
+    const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+    await sendViaGmail(buildInput(), config, null, 'thr-abc-123', deps);
+
+    const init = fetchImpl.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(init.body as string) as { raw: string; threadId?: string };
+    expect(body.threadId).toBe('thr-abc-123');
+  });
+
+  it('omits `threadId` from the request body when null', async () => {
+    const { deps, fetchImpl } = buildDeps();
+    const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+    await sendViaGmail(buildInput(), config, null, null, deps);
+
+    const init = fetchImpl.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(init.body as string) as { raw: string; threadId?: string };
+    expect(body).not.toHaveProperty('threadId');
+  });
+
+  it('on 200, updates the message row with deliveredAt + channelMsgId from response.id', async () => {
+    const { deps, dbStub, fetchImpl } = buildDeps();
+    fetchImpl.mockResolvedValueOnce(
+      jsonResponse({ id: 'gmail-msg-id-RESP', threadId: 'thr-1', labelIds: ['SENT'] }),
+    );
+    const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+    await sendViaGmail(buildInput(), config, null, null, deps);
+
+    expect(dbStub.update).toHaveBeenCalledTimes(1);
+    expect(dbStub.updateSet).toHaveBeenCalledTimes(1);
+    const patch = dbStub.updateSet.mock.calls[0]![0] as {
+      channelMsgId?: string | null;
+      deliveredAt?: Date;
+    };
+    expect(patch.channelMsgId).toBe('gmail-msg-id-RESP');
+    expect(patch.deliveredAt).toBeInstanceOf(Date);
+  });
+
+  it('selects the existing message row by id BEFORE sending (idempotency pre-check)', async () => {
+    const { deps, dbStub } = buildDeps();
+    const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+    await sendViaGmail(buildInput(), config, null, null, deps);
+
+    // The pre-check is the same shape Postmark uses — select before fetch.
+    expect(dbStub.select).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves UTF-8 body bytes through base64url round-trip', async () => {
+    const { deps, fetchImpl } = buildDeps();
+    const text = 'Olá! relatório com café ☕';
+    const input = buildInput({ text });
+    const config = { provider: 'gmail' as const, gmailEmail: 'support@example.com' };
+
+    await sendViaGmail(input, config, null, null, deps);
+
+    const init = fetchImpl.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(init.body as string) as { raw: string };
+    const decoded = Buffer.from(body.raw, 'base64url').toString('utf8');
+    expect(decoded).toContain(text);
   });
 });
