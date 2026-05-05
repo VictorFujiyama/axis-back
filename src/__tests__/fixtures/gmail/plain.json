@@ -1,0 +1,47 @@
+{
+  "id": "1932abcd0001",
+  "threadId": "1932abcd0001",
+  "labelIds": ["INBOX", "UNREAD"],
+  "snippet": "Hello world from plain text!",
+  "historyId": "9876",
+  "internalDate": "1714900800000",
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/alternative",
+    "filename": "",
+    "headers": [
+      { "name": "From", "value": "Alice <alice@example.com>" },
+      { "name": "To", "value": "support@example.com" },
+      { "name": "Subject", "value": "Hello" },
+      { "name": "Message-ID", "value": "<msg-1@mail.gmail.com>" }
+    ],
+    "body": { "size": 0 },
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "text/plain",
+        "filename": "",
+        "headers": [
+          { "name": "Content-Type", "value": "text/plain; charset=UTF-8" }
+        ],
+        "body": {
+          "size": 28,
+          "data": "SGVsbG8gd29ybGQgZnJvbSBwbGFpbiB0ZXh0IQ"
+        }
+      },
+      {
+        "partId": "1",
+        "mimeType": "text/html",
+        "filename": "",
+        "headers": [
+          { "name": "Content-Type", "value": "text/html; charset=UTF-8" }
+        ],
+        "body": {
+          "size": 39,
+          "data": "PGRpdj48Yj5IZWxsbzwvYj4gd29ybGQgZnJvbSBIVE1MPC9kaXY-"
+        }
+      }
+    ]
+  },
+  "sizeEstimate": 4567
+}
