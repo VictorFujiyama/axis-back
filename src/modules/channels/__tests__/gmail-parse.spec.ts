@@ -110,4 +110,98 @@ describe('parseGmailMessage', () => {
       expect(parseGmailMessage(raw).content).toBe('Olá, açaí ☕');
     });
   });
+
+  describe('headers (subject + threading hints)', () => {
+    it('reads Subject from the top-level payload headers', () => {
+      const parsed = parseGmailMessage(loadFixture('plain.json'));
+      expect(parsed.subject).toBe('Hello');
+    });
+
+    it('reads Message-ID from the top-level payload headers (including angle brackets)', () => {
+      const parsed = parseGmailMessage(loadFixture('plain.json'));
+      expect(parsed.messageId).toBe('<msg-1@mail.gmail.com>');
+    });
+
+    it('returns empty threadHints for a message without In-Reply-To or References', () => {
+      const parsed = parseGmailMessage(loadFixture('plain.json'));
+      expect(parsed.threadHints).toEqual([]);
+    });
+
+    it('extracts subject + messageId + threadHints from with-references.json', () => {
+      const parsed = parseGmailMessage(loadFixture('with-references.json'));
+      expect(parsed.subject).toBe('Re: Hello');
+      expect(parsed.messageId).toBe('<msg-3@mail.gmail.com>');
+      expect(parsed.threadHints).toEqual([
+        '<prev-1@mail.gmail.com>',
+        '<ref-1@mail.gmail.com>',
+        '<ref-2@mail.gmail.com>',
+      ]);
+    });
+
+    it('matches header names case-insensitively', () => {
+      const raw: GmailMessage = {
+        id: 'mixed-case',
+        payload: {
+          mimeType: 'text/plain',
+          headers: [
+            { name: 'subject', value: 'lower-case header' },
+            { name: 'MESSAGE-ID', value: '<upper@example.com>' },
+            { name: 'In-Reply-To', value: '<r@example.com>' },
+          ],
+          body: { size: 4, data: encode('body') },
+        },
+      };
+      const parsed = parseGmailMessage(raw);
+      expect(parsed.subject).toBe('lower-case header');
+      expect(parsed.messageId).toBe('<upper@example.com>');
+      expect(parsed.threadHints).toEqual(['<r@example.com>']);
+    });
+
+    it('returns undefined subject/messageId and empty threadHints when payload has no headers', () => {
+      const raw: GmailMessage = {
+        id: 'no-headers',
+        payload: {
+          mimeType: 'text/plain',
+          body: { size: 4, data: encode('body') },
+        },
+      };
+      const parsed = parseGmailMessage(raw);
+      expect(parsed.subject).toBeUndefined();
+      expect(parsed.messageId).toBeUndefined();
+      expect(parsed.threadHints).toEqual([]);
+    });
+
+    it('builds threadHints from only In-Reply-To when References is absent', () => {
+      const raw: GmailMessage = {
+        id: 'irt-only',
+        payload: {
+          mimeType: 'text/plain',
+          headers: [{ name: 'In-Reply-To', value: '<a@example.com>' }],
+          body: { size: 4, data: encode('body') },
+        },
+      };
+      expect(parseGmailMessage(raw).threadHints).toEqual(['<a@example.com>']);
+    });
+
+    it('builds threadHints from only References (multiple ids) when In-Reply-To is absent', () => {
+      const raw: GmailMessage = {
+        id: 'refs-only',
+        payload: {
+          mimeType: 'text/plain',
+          headers: [
+            {
+              name: 'References',
+              value: '<x@example.com> <y@example.com> <z@example.com>',
+            },
+          ],
+          body: { size: 4, data: encode('body') },
+        },
+      };
+      expect(parseGmailMessage(raw).threadHints).toEqual([
+        '<x@example.com>',
+        '<y@example.com>',
+        '<z@example.com>',
+      ]);
+    });
+  });
 });

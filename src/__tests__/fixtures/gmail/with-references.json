@@ -1,0 +1,37 @@
+{
+  "id": "1932abcd0003",
+  "threadId": "1932abcd0003",
+  "labelIds": ["INBOX", "UNREAD"],
+  "snippet": "Reply body",
+  "historyId": "9878",
+  "internalDate": "1714901000000",
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/alternative",
+    "filename": "",
+    "headers": [
+      { "name": "From", "value": "Carol <carol@example.com>" },
+      { "name": "To", "value": "support@example.com" },
+      { "name": "Subject", "value": "Re: Hello" },
+      { "name": "Message-ID", "value": "<msg-3@mail.gmail.com>" },
+      { "name": "In-Reply-To", "value": "<prev-1@mail.gmail.com>" },
+      { "name": "References", "value": "<ref-1@mail.gmail.com> <ref-2@mail.gmail.com>" }
+    ],
+    "body": { "size": 0 },
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "text/plain",
+        "filename": "",
+        "headers": [
+          { "name": "Content-Type", "value": "text/plain; charset=UTF-8" }
+        ],
+        "body": {
+          "size": 10,
+          "data": "UmVwbHkgYm9keQ"
+        }
+      }
+    ]
+  },
+  "sizeEstimate": 2345
+}
