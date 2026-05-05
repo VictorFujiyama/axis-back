@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { htmlToText } from '../email-utils.js';
+import { htmlToText, parseRfc5322Address } from '../email-utils.js';
 
 describe('htmlToText', () => {
   it('returns plain text input unchanged (modulo trim)', () => {
@@ -37,5 +37,73 @@ describe('htmlToText', () => {
 
   it('trims leading and trailing whitespace', () => {
     expect(htmlToText('  <p>hi</p>  ')).toBe('hi');
+  });
+});
+
+describe('parseRfc5322Address', () => {
+  it('parses quoted display name with embedded comma', () => {
+    expect(parseRfc5322Address('"Doe, John" <john@example.com>')).toEqual({
+      name: 'Doe, John',
+      email: 'john@example.com',
+    });
+  });
+
+  it('parses unquoted display name with angle-bracketed email', () => {
+    expect(parseRfc5322Address('John Doe <john@example.com>')).toEqual({
+      name: 'John Doe',
+      email: 'john@example.com',
+    });
+  });
+
+  it('returns name=undefined when angle form has no display part', () => {
+    expect(parseRfc5322Address('<a@b.com>')).toEqual({
+      name: undefined,
+      email: 'a@b.com',
+    });
+  });
+
+  it('parses bare email (no angle brackets) as { name: undefined, email }', () => {
+    expect(parseRfc5322Address('a@b.com')).toEqual({
+      name: undefined,
+      email: 'a@b.com',
+    });
+  });
+
+  it('lowercases the email portion', () => {
+    expect(parseRfc5322Address('Bob <BOB@EXAMPLE.COM>')).toEqual({
+      name: 'Bob',
+      email: 'bob@example.com',
+    });
+    expect(parseRfc5322Address('JOHN@EXAMPLE.COM')).toEqual({
+      name: undefined,
+      email: 'john@example.com',
+    });
+  });
+
+  it('strips outer whitespace around the whole input', () => {
+    expect(parseRfc5322Address('  John <a@b>  ')).toEqual({
+      name: 'John',
+      email: 'a@b',
+    });
+  });
+
+  it('returns null for non-email strings', () => {
+    expect(parseRfc5322Address('not an email')).toBeNull();
+  });
+
+  it('returns null for empty string and whitespace-only input', () => {
+    expect(parseRfc5322Address('')).toBeNull();
+    expect(parseRfc5322Address('   ')).toBeNull();
+  });
+
+  it('returns null for non-string inputs', () => {
+    expect(parseRfc5322Address(null)).toBeNull();
+    expect(parseRfc5322Address(undefined)).toBeNull();
+    expect(parseRfc5322Address(42)).toBeNull();
+    expect(parseRfc5322Address({ email: 'a@b' })).toBeNull();
+  });
+
+  it('returns null when the angle-bracket form contains a malformed email', () => {
+    expect(parseRfc5322Address('John <not-an-email>')).toBeNull();
   });
 });
