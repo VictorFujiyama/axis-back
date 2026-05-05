@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { constantTimeEqualStr } from '../../crypto';
 import { config as appConfig } from '../../config';
+import { htmlToText } from './email-utils';
 import { ingestWithHooks } from './post-ingest';
 
 const inboxParam = z.object({ inboxId: z.string().uuid() });
@@ -50,24 +51,6 @@ function parseMessageIds(value: string | undefined): string[] {
 function hasAuthFailure(headers: { Name: string; Value: string }[]): boolean {
   const authResults = headerValue(headers, 'Authentication-Results') ?? '';
   return /spf=fail/i.test(authResults) || /dkim=fail/i.test(authResults);
-}
-
-/** Strip HTML tags to produce a crude plaintext fallback — no sanitizer lib yet. */
-function htmlToText(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
 }
 
 export async function emailChannelRoutes(app: FastifyInstance): Promise<void> {
