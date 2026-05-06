@@ -13,6 +13,7 @@ import jwtPlugin from './plugins/jwt';
 import queuePlugin from './plugins/queue';
 import presencePlugin from './plugins/presence';
 import { registerWorkers } from './queue/workers';
+import { startGmailSyncScheduler } from './queue/gmail-sync-scheduler';
 import { registerAutomationEventHook } from './modules/automations/event-hook';
 import { healthRoutes } from './modules/health/routes';
 import { authRoutes } from './modules/auth/routes';
@@ -228,6 +229,10 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   // Spin up BullMQ workers AFTER all plugins/routes loaded.
   registerWorkers(app);
+
+  // In-process gmail-sync scheduler — see module comment for why we don't use
+  // BullMQ repeatable jobs.
+  startGmailSyncScheduler(app);
 
   // Automation rules subscribe to eventBus AFTER workers (so rule actions that
   // emit events land on properly-registered listeners).
