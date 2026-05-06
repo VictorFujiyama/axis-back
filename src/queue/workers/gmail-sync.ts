@@ -103,7 +103,10 @@ async function listBootstrapMessages(
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!res.ok) {
-    throw new Error(`gmail messages.list ${res.status}`);
+    const errBody = await res.text().catch(() => '<unreadable>');
+    throw new Error(
+      `gmail messages.list ${res.status}: ${errBody.slice(0, 500)}`,
+    );
   }
   const body = (await res.json()) as GmailMessageListResponse;
   return body.messages ?? [];
@@ -381,7 +384,16 @@ export async function processGmailSyncJob(
     // Bootstrap branch: no cursor stored yet, list recent unread, then capture
     // a fresh `historyId` from `users.getProfile` to seed the incremental path.
     app.log.info({ inboxId }, 'gmail-sync: bootstrap — listing unread messages');
-    const messages = await listBootstrapMessages(accessToken, fetchImpl);
+    let messages: { id: string; threadId: string }[];
+    try {
+      messages = await listBootstrapMessages(accessToken, fetchImpl);
+    } catch (err) {
+      app.log.error(
+        { err, errMessage: (err as Error).message, inboxId },
+        'gmail-sync: bootstrap — listBootstrapMessages threw',
+      );
+      throw err;
+    }
     messageIds = messages.map((m) => m.id);
     app.log.info(
       { inboxId, messageCount: messageIds.length, messageIds },
