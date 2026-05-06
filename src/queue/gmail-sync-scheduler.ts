@@ -35,7 +35,12 @@ export function startGmailSyncScheduler(
     try {
       const queue = app.queues.getQueue<GmailSyncJob>(QUEUE_NAMES.GMAIL_SYNC);
       const rows = await app.db
-        .select({ id: schema.inboxes.id, config: schema.inboxes.config })
+        .select({
+          id: schema.inboxes.id,
+          config: schema.inboxes.config,
+          enabled: schema.inboxes.enabled,
+          deletedAt: schema.inboxes.deletedAt,
+        })
         .from(schema.inboxes)
         .where(
           and(
@@ -45,11 +50,35 @@ export function startGmailSyncScheduler(
           ),
         );
 
+      const candidates = rows.map((r) => {
+        const cfg = (r.config ?? {}) as Record<string, unknown>;
+        return {
+          id: r.id,
+          provider: cfg.provider,
+          needsReauth: cfg.needsReauth,
+          gmailHistoryId: cfg.gmailHistoryId,
+        };
+      });
+      app.log.info(
+        { count: rows.length, candidates },
+        'gmail-sync scheduler: tick fired',
+      );
+
+      let enqueued = 0;
       for (const row of rows) {
         const cfg = (row.config ?? {}) as Record<string, unknown>;
         if (cfg.provider !== 'gmail' || cfg.needsReauth === true) continue;
         await queue.add('sync', { inboxId: row.id });
+        enqueued++;
+        app.log.info(
+          { inboxId: row.id },
+          'gmail-sync scheduler: job enqueued',
+        );
       }
+      app.log.info(
+        { enqueued, totalRows: rows.length },
+        'gmail-sync scheduler: tick complete',
+      );
     } catch (err) {
       app.log.warn({ err }, 'gmail-sync scheduler: tick failed');
     }

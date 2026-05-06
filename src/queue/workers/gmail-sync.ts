@@ -331,6 +331,16 @@ export async function processGmailSyncJob(
 
   const parsedConfig = parseGmailConfig(rawConfig);
 
+  app.log.info(
+    {
+      inboxId,
+      gmailEmail: parsedConfig.gmailEmail,
+      gmailHistoryId: parsedConfig.gmailHistoryId ?? null,
+      mode: parsedConfig.gmailHistoryId ? 'incremental' : 'bootstrap',
+    },
+    'gmail-sync: starting',
+  );
+
   const fetchImpl = deps.fetchImpl ?? fetch;
   const getAccessToken = deps.getAccessToken ?? getValidAccessToken;
   const ingest = deps.ingest ?? ingestWithHooks;
@@ -345,7 +355,14 @@ export async function processGmailSyncJob(
     deps.uploadAttachment ??
     ((buffer, filename, mimeType, accountId) =>
       uploadGmailAttachment(buffer, filename, mimeType, accountId));
-  const accessToken = await getAccessToken(app, inbox as GmailInboxLike);
+  let accessToken: string;
+  try {
+    accessToken = await getAccessToken(app, inbox as GmailInboxLike);
+    app.log.info({ inboxId }, 'gmail-sync: access token resolved');
+  } catch (err) {
+    app.log.error({ err, inboxId }, 'gmail-sync: getAccessToken failed');
+    throw err;
+  }
 
   // Narrow the inbox for the message-processing helper: `inbox.accountId` was
   // checked above, so we promote it to non-nullable here in one place rather
@@ -363,8 +380,13 @@ export async function processGmailSyncJob(
   if (!parsedConfig.gmailHistoryId) {
     // Bootstrap branch: no cursor stored yet, list recent unread, then capture
     // a fresh `historyId` from `users.getProfile` to seed the incremental path.
+    app.log.info({ inboxId }, 'gmail-sync: bootstrap — listing unread messages');
     const messages = await listBootstrapMessages(accessToken, fetchImpl);
     messageIds = messages.map((m) => m.id);
+    app.log.info(
+      { inboxId, messageCount: messageIds.length, messageIds },
+      'gmail-sync: bootstrap — messages.list returned',
+    );
     await processMessageIds(
       app,
       inboxForMessages,
@@ -376,6 +398,10 @@ export async function processGmailSyncJob(
       uploadAttachment,
     );
     newHistoryId = await fetchGmailHistoryCursor(accessToken, fetchImpl);
+    app.log.info(
+      { inboxId, newHistoryId },
+      'gmail-sync: bootstrap — getProfile returned cursor',
+    );
   } else {
     // Incremental branch: read events since the stored cursor. The response's
     // `historyId` is the new cursor value (Gmail returns the latest snapshot id
@@ -401,6 +427,16 @@ export async function processGmailSyncJob(
       return;
     }
     messageIds = result.messageIds;
+    app.log.info(
+      {
+        inboxId,
+        messageCount: messageIds.length,
+        messageIds,
+        startHistoryId: parsedConfig.gmailHistoryId,
+        endHistoryId: result.historyId,
+      },
+      'gmail-sync: incremental — history.list returned',
+    );
     await processMessageIds(
       app,
       inboxForMessages,
@@ -426,6 +462,11 @@ export async function processGmailSyncJob(
     .update(schema.inboxes)
     .set({ config: patchedConfig, updatedAt: new Date() })
     .where(eq(schema.inboxes.id, inboxId));
+
+  app.log.info(
+    { inboxId, persistedHistoryId: newHistoryId },
+    'gmail-sync: complete',
+  );
 }
 
 /**
@@ -457,6 +498,10 @@ async function processMessageIds(
   uploadAttachment: UploadAttachmentImpl,
 ): Promise<void> {
   for (const id of messageIds) {
+    app.log.info(
+      { inboxId: inbox.id, gmailMessageId: id },
+      'gmail-sync: fetching message',
+    );
     const raw = await fetchFullGmailMessage(id, accessToken, fetchImpl);
     const built = buildIngestPayload(inbox.id, raw);
     if (!built) {
@@ -467,6 +512,16 @@ async function processMessageIds(
       continue;
     }
     const { payload, attachments } = built;
+    app.log.info(
+      {
+        inboxId: inbox.id,
+        gmailMessageId: raw.id,
+        from: payload.from.email,
+        subject: payload.metadata?.subject,
+        attachmentCount: attachments.length,
+      },
+      'gmail-sync: parsed message, calling ingest',
+    );
 
     await attachPrimaryMedia(
       app,
@@ -480,7 +535,22 @@ async function processMessageIds(
     );
 
     try {
-      await ingest(app, payload, inbox.config, inbox.defaultBotId ?? null);
+      const result = await ingest(
+        app,
+        payload,
+        inbox.config,
+        inbox.defaultBotId ?? null,
+      );
+      app.log.info(
+        {
+          inboxId: inbox.id,
+          gmailMessageId: raw.id,
+          deduped: result.deduped,
+          conversationId: result.conversationId,
+          messageId: result.messageId,
+        },
+        'gmail-sync: ingest done',
+      );
     } catch (err) {
       app.log.warn(
         { err, inboxId: inbox.id, gmailMessageId: raw.id },
