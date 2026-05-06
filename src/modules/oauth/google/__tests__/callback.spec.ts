@@ -1036,7 +1036,7 @@ describe('GET /api/v1/oauth/google/callback — schedule gmail-sync (T-41)', () 
       expect(queues.add).toHaveBeenCalledWith(
         'sync',
         { inboxId: insertedRow.id },
-        { repeat: { every: 60_000, key: `gmail-sync:${insertedRow.id}` } },
+        { repeat: { every: 60_000, key: `gmail-sync__${insertedRow.id}` } },
       );
     } finally {
       await app.close();
@@ -1087,7 +1087,7 @@ describe('GET /api/v1/oauth/google/callback — schedule gmail-sync (T-41)', () 
       expect(queues.add).toHaveBeenCalledWith(
         'sync',
         { inboxId: stateInboxId },
-        { repeat: { every: 60_000, key: `gmail-sync:${stateInboxId}` } },
+        { repeat: { every: 60_000, key: `gmail-sync__${stateInboxId}` } },
       );
     } finally {
       await app.close();

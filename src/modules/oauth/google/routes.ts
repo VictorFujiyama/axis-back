@@ -355,11 +355,13 @@ async function scheduleGmailSync(
   // Key Value (jobs never fired for newly-created inboxes). The `key` is the
   // dedup hash — calling this on create + reauth for the same inbox is a
   // no-op the second time. Repeats every 60s per spec § "Sync worker".
+  // BullMQ rejects ":" in repeat.key (treated as a custom id, which uses
+  // ":" as a Redis key separator internally). Use "__" as the separator.
   await app.queues.getQueue<GmailSyncJob>(QUEUE_NAMES.GMAIL_SYNC).add(
     'sync',
     { inboxId },
     {
-      repeat: { every: 60_000, key: `gmail-sync:${inboxId}` },
+      repeat: { every: 60_000, key: `gmail-sync__${inboxId}` },
     },
   );
 }
