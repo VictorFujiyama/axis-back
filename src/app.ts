@@ -13,6 +13,7 @@ import jwtPlugin from './plugins/jwt';
 import queuePlugin from './plugins/queue';
 import presencePlugin from './plugins/presence';
 import { registerWorkers } from './queue/workers';
+import { armGmailSchedulesOnBoot } from './queue/arm-gmail-schedules';
 import { registerAutomationEventHook } from './modules/automations/event-hook';
 import { healthRoutes } from './modules/health/routes';
 import { authRoutes } from './modules/auth/routes';
@@ -228,6 +229,10 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   // Spin up BullMQ workers AFTER all plugins/routes loaded.
   registerWorkers(app);
+
+  // Re-arm gmail-sync repeatable schedules for any existing Gmail inbox.
+  // Idempotent (BullMQ dedups by repeat.key) — safe to run on every boot.
+  await armGmailSchedulesOnBoot(app);
 
   // Automation rules subscribe to eventBus AFTER workers (so rule actions that
   // emit events land on properly-registered listeners).
