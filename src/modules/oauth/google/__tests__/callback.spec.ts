@@ -1032,11 +1032,11 @@ describe('GET /api/v1/oauth/google/callback — schedule gmail-sync (T-41)', () 
       expect(queues.getQueue).toHaveBeenCalledWith('gmail-sync');
 
       // Scheduler keyed per inbox, repeats every 60s, carries inboxId payload.
-      expect(queues.upsertJobScheduler).toHaveBeenCalledTimes(1);
-      expect(queues.upsertJobScheduler).toHaveBeenCalledWith(
-        `gmail-sync:${insertedRow.id}`,
-        { every: 60_000 },
-        { name: 'sync', data: { inboxId: insertedRow.id } },
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      expect(queues.add).toHaveBeenCalledWith(
+        'sync',
+        { inboxId: insertedRow.id },
+        { repeat: { every: 60_000, key: `gmail-sync:${insertedRow.id}` } },
       );
     } finally {
       await app.close();
@@ -1079,15 +1079,15 @@ describe('GET /api/v1/oauth/google/callback — schedule gmail-sync (T-41)', () 
       });
       expect(res.statusCode).toBe(302);
 
-      // upsert is idempotent on the scheduler id — calling it on reauth is
-      // safe and keeps the schedule healthy if BullMQ ever lost the previous
-      // entry (e.g. queue draining for ops).
+      // queue.add with `repeat.key` is dedup'd by hash — calling on reauth
+      // for the same inbox is a no-op the second time. Keeps the schedule
+      // healthy if BullMQ ever lost the previous entry.
       expect(queues.getQueue).toHaveBeenCalledWith('gmail-sync');
-      expect(queues.upsertJobScheduler).toHaveBeenCalledTimes(1);
-      expect(queues.upsertJobScheduler).toHaveBeenCalledWith(
-        `gmail-sync:${stateInboxId}`,
-        { every: 60_000 },
-        { name: 'sync', data: { inboxId: stateInboxId } },
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      expect(queues.add).toHaveBeenCalledWith(
+        'sync',
+        { inboxId: stateInboxId },
+        { repeat: { every: 60_000, key: `gmail-sync:${stateInboxId}` } },
       );
     } finally {
       await app.close();
@@ -1108,7 +1108,7 @@ describe('GET /api/v1/oauth/google/callback — schedule gmail-sync (T-41)', () 
       });
       expect(res.statusCode).toBe(400);
       expect(queues.getQueue).not.toHaveBeenCalled();
-      expect(queues.upsertJobScheduler).not.toHaveBeenCalled();
+      expect(queues.add).not.toHaveBeenCalled();
     } finally {
       await app.close();
     }
@@ -1124,7 +1124,7 @@ describe('GET /api/v1/oauth/google/callback — schedule gmail-sync (T-41)', () 
       });
       expect(res.statusCode).toBe(302);
       expect(queues.getQueue).not.toHaveBeenCalled();
-      expect(queues.upsertJobScheduler).not.toHaveBeenCalled();
+      expect(queues.add).not.toHaveBeenCalled();
     } finally {
       await app.close();
     }
@@ -1148,7 +1148,7 @@ describe('GET /api/v1/oauth/google/callback — schedule gmail-sync (T-41)', () 
         url: `/api/v1/oauth/google/callback?code=AUTH&state=${encodeURIComponent(state)}`,
       });
       expect(res.statusCode).toBe(502);
-      expect(queues.upsertJobScheduler).not.toHaveBeenCalled();
+      expect(queues.add).not.toHaveBeenCalled();
     } finally {
       await app.close();
     }
@@ -1178,7 +1178,7 @@ describe('GET /api/v1/oauth/google/callback — schedule gmail-sync (T-41)', () 
         url: `/api/v1/oauth/google/callback?code=AUTH&state=${encodeURIComponent(state)}`,
       });
       expect(res.statusCode).toBe(404);
-      expect(queues.upsertJobScheduler).not.toHaveBeenCalled();
+      expect(queues.add).not.toHaveBeenCalled();
     } finally {
       await app.close();
     }

@@ -350,14 +350,16 @@ async function scheduleGmailSync(
   app: FastifyInstance,
   inboxId: string,
 ): Promise<void> {
-  // upsertJobScheduler is idempotent on the scheduler id — same call works for
-  // create (first time) and reauth (re-arms an inbox whose schedule may have
-  // been drained). Repeats every 60s per spec § "Sync worker".
-  await app.queues
-    .getQueue<GmailSyncJob>(QUEUE_NAMES.GMAIL_SYNC)
-    .upsertJobScheduler(
-      `gmail-sync:${inboxId}`,
-      { every: 60_000 },
-      { name: 'sync', data: { inboxId } },
-    );
+  // Legacy repeatable-jobs API (queue.add with `repeat`). Switched away from
+  // upsertJobScheduler after observing it silently fail to persist on Render
+  // Key Value (jobs never fired for newly-created inboxes). The `key` is the
+  // dedup hash — calling this on create + reauth for the same inbox is a
+  // no-op the second time. Repeats every 60s per spec § "Sync worker".
+  await app.queues.getQueue<GmailSyncJob>(QUEUE_NAMES.GMAIL_SYNC).add(
+    'sync',
+    { inboxId },
+    {
+      repeat: { every: 60_000, key: `gmail-sync:${inboxId}` },
+    },
+  );
 }
