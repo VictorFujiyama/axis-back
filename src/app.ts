@@ -232,7 +232,9 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   // Re-arm gmail-sync repeatable schedules for any existing Gmail inbox.
   // Idempotent (BullMQ dedups by repeat.key) — safe to run on every boot.
-  await armGmailSchedulesOnBoot(app);
+  // Fire-and-forget so a slow Redis handshake during boot doesn't block the
+  // health check; the function has its own try/catch and logs on failure.
+  void armGmailSchedulesOnBoot(app);
 
   // Automation rules subscribe to eventBus AFTER workers (so rule actions that
   // emit events land on properly-registered listeners).
