@@ -13,11 +13,8 @@ import { registerWebhookWorker } from '../modules/webhooks/worker';
 import { registerCampaignWorkers } from '../modules/campaigns/runner';
 import { deliverBotWebhook } from '../modules/bots/dispatcher-fn';
 import { handleBotFallback } from '../modules/bots/fallback';
-import {
-  parseEmailConfig,
-  parseEmailSecrets,
-  sendViaPostmark,
-} from '../modules/channels/email-sender';
+import { dispatchEmailSend } from '../modules/channels/email-sender';
+import { getValidAccessToken } from '../modules/oauth/google/tokens';
 import {
   parseWhatsAppConfig,
   parseWhatsAppSecrets,
@@ -128,17 +125,16 @@ export function registerWorkers(app: FastifyInstance): void {
         .where(eq(schema.inboxes.id, data.inboxId))
         .limit(1);
       if (!inbox) throw new Error('inbox not found');
-      const cfg = parseEmailConfig(inbox.config);
-      let secrets = parseEmailSecrets({});
+      let rawSecrets: unknown = {};
       if (inbox.secrets) {
         try {
-          secrets = parseEmailSecrets(decryptJSON(inbox.secrets));
+          rawSecrets = decryptJSON(inbox.secrets);
         } catch (err) {
           app.log.error({ err, inboxId: inbox.id }, 'email worker: cannot decrypt secrets');
           throw err;
         }
       }
-      await sendViaPostmark(
+      await dispatchEmailSend(
         {
           messageId: data.messageId,
           conversationId: data.conversationId,
@@ -147,10 +143,14 @@ export function registerWorkers(app: FastifyInstance): void {
           subject: data.subject,
           text: data.text,
         },
-        cfg,
-        secrets,
+        inbox.config,
+        rawSecrets,
         data.inReplyToMessageId,
-        { db: app.db, log: app.log },
+        {
+          db: app.db,
+          log: app.log,
+          getGmailAccessToken: () => getValidAccessToken(app, inbox),
+        },
       );
     },
     5,
