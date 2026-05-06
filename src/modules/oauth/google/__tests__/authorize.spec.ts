@@ -185,7 +185,7 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
     }
   });
 
-  it('redirects 302 to Google consent URL with state on happy path', async () => {
+  it('returns 200 JSON {consentUrl} pointing at Google on happy path', async () => {
     const { app } = await buildTestApp();
     try {
       const token = signJwt(app, {
@@ -198,10 +198,10 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
         headers: { authorization: `Bearer ${token}` },
       });
 
-      expect(res.statusCode).toBe(302);
-      const location = res.headers.location;
-      expect(typeof location).toBe('string');
-      const url = new URL(location as string);
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { consentUrl: string };
+      expect(typeof body.consentUrl).toBe('string');
+      const url = new URL(body.consentUrl);
       expect(`${url.origin}${url.pathname}`).toBe(
         'https://accounts.google.com/o/oauth2/v2/auth',
       );
@@ -240,8 +240,9 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
         headers: { authorization: `Bearer ${token}` },
       });
 
-      expect(res.statusCode).toBe(302);
-      const url = new URL(res.headers.location as string);
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { consentUrl: string };
+      const url = new URL(body.consentUrl);
       const state = url.searchParams.get('state')!;
 
       const { verifyState } = await import('../state.js');
@@ -274,12 +275,12 @@ describe('GET /api/v1/oauth/google/authorize — create branch (T-15)', () => {
         url,
         headers: { authorization: `Bearer ${token}` },
       });
-      const state1 = new URL(res1.headers.location as string).searchParams.get(
-        'state',
-      );
-      const state2 = new URL(res2.headers.location as string).searchParams.get(
-        'state',
-      );
+      const state1 = new URL(
+        (res1.json() as { consentUrl: string }).consentUrl,
+      ).searchParams.get('state');
+      const state2 = new URL(
+        (res2.json() as { consentUrl: string }).consentUrl,
+      ).searchParams.get('state');
       expect(state1).not.toBe(state2);
     } finally {
       await app.close();
@@ -431,7 +432,7 @@ describe('GET /api/v1/oauth/google/authorize — reauth branch (T-16)', () => {
     }
   });
 
-  it('redirects 302 with inboxId encoded into the state when the inbox is owned by the caller', async () => {
+  it('returns 200 JSON with inboxId encoded into the state when the inbox is owned by the caller', async () => {
     const { app } = await buildTestApp({
       selectRows: [
         {
@@ -454,8 +455,9 @@ describe('GET /api/v1/oauth/google/authorize — reauth branch (T-16)', () => {
         url: `/api/v1/oauth/google/authorize?inboxName=Gmail+Teste&inboxId=${VALID_INBOX_ID}`,
         headers: { authorization: `Bearer ${token}` },
       });
-      expect(res.statusCode).toBe(302);
-      const url = new URL(res.headers.location as string);
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { consentUrl: string };
+      const url = new URL(body.consentUrl);
       expect(`${url.origin}${url.pathname}`).toBe(
         'https://accounts.google.com/o/oauth2/v2/auth',
       );
@@ -482,11 +484,12 @@ describe('GET /api/v1/oauth/google/authorize — reauth branch (T-16)', () => {
         url: '/api/v1/oauth/google/authorize?inboxName=Gmail+Teste',
         headers: { authorization: `Bearer ${token}` },
       });
-      expect(res.statusCode).toBe(302);
+      expect(res.statusCode).toBe(200);
       // Create branch must not perform the ownership lookup.
       expect(db.select).not.toHaveBeenCalled();
       // And the resulting state must encode inboxId=null.
-      const url = new URL(res.headers.location as string);
+      const body = res.json() as { consentUrl: string };
+      const url = new URL(body.consentUrl);
       const { verifyState } = await import('../state.js');
       const payload = verifyState(url.searchParams.get('state')!);
       expect(payload.inboxId ?? null).toBeNull();

@@ -181,7 +181,7 @@ describe('POST /api/v1/oauth/google/reauthorize (T-22)', () => {
     }
   });
 
-  it('redirects 302 to /authorize with inboxName + inboxId on the happy path', async () => {
+  it('returns 200 JSON {consentUrl} encoding inboxId + inbox name into the state', async () => {
     const { app } = await buildTestApp({
       selectRows: [
         {
@@ -206,17 +206,21 @@ describe('POST /api/v1/oauth/google/reauthorize (T-22)', () => {
         payload: { inboxId: VALID_INBOX_ID },
       });
 
-      expect(res.statusCode).toBe(302);
-      const location = res.headers.location;
-      expect(typeof location).toBe('string');
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { consentUrl: string };
+      const url = new URL(body.consentUrl);
+      expect(`${url.origin}${url.pathname}`).toBe(
+        'https://accounts.google.com/o/oauth2/v2/auth',
+      );
+      const state = url.searchParams.get('state')!;
+      expect(state).toBeTruthy();
 
-      // Spec § 6: redirect to `/api/v1/oauth/google/authorize?inboxName=<name>
-      // &inboxId=<inboxId>`. We expect a relative URL (same origin); construct
-      // a base for parsing.
-      const url = new URL(location as string, 'http://localhost');
-      expect(url.pathname).toBe('/api/v1/oauth/google/authorize');
-      expect(url.searchParams.get('inboxName')).toBe('Atendimento Gmail');
-      expect(url.searchParams.get('inboxId')).toBe(VALID_INBOX_ID);
+      const { verifyState } = await import('../state.js');
+      const payload = verifyState(state);
+      expect(payload.inboxId).toBe(VALID_INBOX_ID);
+      expect(payload.accountId).toBe('acc-owner');
+      expect(payload.userId).toBe('usr-owner-1');
+      expect(payload.inboxName).toBe('Atendimento Gmail');
     } finally {
       await app.close();
     }
@@ -248,9 +252,12 @@ describe('POST /api/v1/oauth/google/reauthorize (T-22)', () => {
           inboxName: 'Hacker Override Name',
         },
       });
-      expect(res.statusCode).toBe(302);
-      const url = new URL(res.headers.location as string, 'http://localhost');
-      expect(url.searchParams.get('inboxName')).toBe('Real DB Name');
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { consentUrl: string };
+      const url = new URL(body.consentUrl);
+      const { verifyState } = await import('../state.js');
+      const payload = verifyState(url.searchParams.get('state')!);
+      expect(payload.inboxName).toBe('Real DB Name');
     } finally {
       await app.close();
     }

@@ -108,25 +108,13 @@ export async function googleOAuthRoutes(
         }
       }
 
-      const state = signState({
+      const consentUrl = buildConsentUrl({
         accountId: req.user.accountId,
         userId: req.user.sub,
         inboxName,
         inboxId: inboxId ?? null,
-        nonce: randomBytes(16).toString('hex'),
-        ts: Date.now(),
       });
-
-      const params = new URLSearchParams({
-        client_id: config.GOOGLE_OAUTH_CLIENT_ID,
-        redirect_uri: config.GOOGLE_OAUTH_REDIRECT_URI,
-        response_type: 'code',
-        scope: GOOGLE_SCOPES,
-        access_type: 'offline',
-        prompt: 'consent',
-        state,
-      });
-      return reply.redirect(`${GOOGLE_AUTHORIZE_URL}?${params.toString()}`, 302);
+      return reply.send({ consentUrl });
     },
   );
 
@@ -273,6 +261,14 @@ export async function googleOAuthRoutes(
     '/api/v1/oauth/google/reauthorize',
     { preHandler: app.requireAuth },
     async (req, reply) => {
+      if (
+        !config.GOOGLE_OAUTH_CLIENT_ID ||
+        !config.GOOGLE_OAUTH_CLIENT_SECRET ||
+        !config.GOOGLE_OAUTH_REDIRECT_URI
+      ) {
+        return reply.serviceUnavailable('Google OAuth not configured');
+      }
+
       const parsed = reauthorizeBody.safeParse(req.body);
       if (!parsed.success) {
         return reply.badRequest(
@@ -298,16 +294,47 @@ export async function googleOAuthRoutes(
         return reply.forbidden('Inbox not found or not owned by caller');
       }
 
-      const params = new URLSearchParams({
+      // Build consent URL directly here (vs redirecting through /authorize).
+      // Top-level browser navigation drops the Authorization header, so the
+      // front must consume this JSON and set window.location itself.
+      const consentUrl = buildConsentUrl({
+        accountId: req.user.accountId,
+        userId: req.user.sub,
         inboxName: owned.name,
         inboxId,
       });
-      return reply.redirect(
-        `/api/v1/oauth/google/authorize?${params.toString()}`,
-        302,
-      );
+      return reply.send({ consentUrl });
     },
   );
+}
+
+interface ConsentUrlInput {
+  accountId: string;
+  userId: string;
+  inboxName: string;
+  inboxId: string | null;
+}
+
+function buildConsentUrl(input: ConsentUrlInput): string {
+  const state = signState({
+    accountId: input.accountId,
+    userId: input.userId,
+    inboxName: input.inboxName,
+    inboxId: input.inboxId,
+    nonce: randomBytes(16).toString('hex'),
+    ts: Date.now(),
+  });
+
+  const params = new URLSearchParams({
+    client_id: config.GOOGLE_OAUTH_CLIENT_ID!,
+    redirect_uri: config.GOOGLE_OAUTH_REDIRECT_URI!,
+    response_type: 'code',
+    scope: GOOGLE_SCOPES,
+    access_type: 'offline',
+    prompt: 'consent',
+    state,
+  });
+  return `${GOOGLE_AUTHORIZE_URL}?${params.toString()}`;
 }
 
 function buildSuccessRedirect(inboxId: string): string {
