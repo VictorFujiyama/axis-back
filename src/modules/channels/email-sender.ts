@@ -2,6 +2,7 @@ import type { FastifyBaseLogger } from 'fastify';
 import { and, desc, eq, isNotNull } from 'drizzle-orm';
 import { z } from 'zod';
 import { schema, type DB } from '@blossom/db';
+import { eventBus } from '../../realtime/event-bus.js';
 import { parseGmailConfig } from './gmail-config.js';
 import { sendViaGmail } from './gmail-sender.js';
 
@@ -139,13 +140,24 @@ export async function sendViaPostmark(
     Message?: string;
   };
   if (res.ok) {
+    const deliveredAt = new Date();
     await db
       .update(schema.messages)
       .set({
         channelMsgId: data.MessageID ?? null,
-        deliveredAt: new Date(),
+        deliveredAt,
       })
       .where(eq(schema.messages.id, input.messageId));
+    // Notify open clients so the "sending" spinner clears without a refresh.
+    // Twilio-side channels emit on the status callback; for HTTP-only sends
+    // (Postmark, Gmail) the sender owns the broadcast.
+    eventBus.emitEvent({
+      type: 'message.updated',
+      inboxId: input.inboxId,
+      conversationId: input.conversationId,
+      messageId: input.messageId,
+      changes: { deliveredAt },
+    });
     return;
   }
   // 4xx = permanent (auth, validation): mark failed, DO NOT retry.
