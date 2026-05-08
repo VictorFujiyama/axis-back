@@ -57,6 +57,11 @@ const envSchema = z.object({
   // Public base URL of the frontend — used by the OAuth callback to redirect
   // the user back into the app after Google consent. Required for /oauth/google/*.
   FRONT_URL: z.string().url().optional(),
+  // Shared secret presented by Atlas as `X-API-Key` on /api/auth/* endpoints
+  // dedicated to Atlas linking (check-email, verify-credentials,
+  // create-from-atlas). Optional so dev/test envs without the integration boot
+  // fine; the requireAtlasApiKey middleware refuses requests when unset.
+  ATLAS_API_KEY: z.string().optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
