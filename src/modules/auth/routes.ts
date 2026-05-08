@@ -33,6 +33,10 @@ const switchAccountBody = z.object({
   accountId: z.string().uuid(),
 });
 
+const atlasCheckEmailBody = z.object({
+  email: z.string().email(),
+});
+
 export async function authRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/api/v1/auth/login',
@@ -397,6 +401,27 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           auto_offline: m.autoOffline,
         })),
       });
+    },
+  );
+
+  // ---- Atlas integration (Phase 0 — account linking + SSO) ----
+  // Called by atlas-company-os server-side, gated by X-API-Key.
+  // Unversioned `/api/auth/*` keeps these outside the regular `/api/v1/*` surface.
+
+  app.post(
+    '/api/auth/check-email',
+    { preHandler: app.requireAtlasApiKey },
+    async (req, reply) => {
+      const body = atlasCheckEmailBody.parse({
+        email: ((req.body as { email?: string })?.email ?? '').trim().toLowerCase(),
+      });
+      const [user] = await app.db
+        .select({ id: schema.users.id, deletedAt: schema.users.deletedAt })
+        .from(schema.users)
+        .where(eq(schema.users.email, body.email))
+        .limit(1);
+      const exists = Boolean(user && !user.deletedAt);
+      return reply.send({ exists });
     },
   );
 }
