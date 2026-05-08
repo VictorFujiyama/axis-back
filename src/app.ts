@@ -11,6 +11,7 @@ import dbPlugin from './plugins/db';
 import redisPlugin from './plugins/redis';
 import jwtPlugin from './plugins/jwt';
 import atlasAuthPlugin from './plugins/atlas-auth';
+import atlasIframeAuthPlugin from './plugins/atlas-iframe-auth';
 import queuePlugin from './plugins/queue';
 import presencePlugin from './plugins/presence';
 import { registerWorkers } from './queue/workers';
@@ -164,6 +165,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(redisPlugin);
   await app.register(jwtPlugin);
   await app.register(atlasAuthPlugin);
+  await app.register(atlasIframeAuthPlugin);
   await app.register(queuePlugin);
   await app.register(presencePlugin);
 
