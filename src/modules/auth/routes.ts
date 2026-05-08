@@ -37,6 +37,11 @@ const atlasCheckEmailBody = z.object({
   email: z.string().email(),
 });
 
+const atlasVerifyCredentialsBody = z.object({
+  email: z.string().email(),
+  password: z.string().min(1),
+});
+
 export async function authRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/api/v1/auth/login',
@@ -422,6 +427,37 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         .limit(1);
       const exists = Boolean(user && !user.deletedAt);
       return reply.send({ exists });
+    },
+  );
+
+  app.post(
+    '/api/auth/verify-credentials',
+    { preHandler: app.requireAtlasApiKey },
+    async (req, reply) => {
+      const body = atlasVerifyCredentialsBody.parse({
+        ...(typeof req.body === 'object' && req.body ? req.body : {}),
+        email: ((req.body as { email?: string })?.email ?? '').trim().toLowerCase(),
+      });
+      const [user] = await app.db
+        .select({
+          id: schema.users.id,
+          email: schema.users.email,
+          passwordHash: schema.users.passwordHash,
+          deletedAt: schema.users.deletedAt,
+        })
+        .from(schema.users)
+        .where(eq(schema.users.email, body.email))
+        .limit(1);
+
+      if (!user || user.deletedAt) {
+        await equalizeTiming(body.password);
+        return reply.unauthorized('Invalid credentials');
+      }
+      const ok = await verifyPassword(user.passwordHash, body.password);
+      if (!ok) {
+        return reply.unauthorized('Invalid credentials');
+      }
+      return reply.send({ axis_user_id: user.id, axis_email: user.email });
     },
   );
 }
