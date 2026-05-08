@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
@@ -40,6 +41,10 @@ const atlasCheckEmailBody = z.object({
 const atlasVerifyCredentialsBody = z.object({
   email: z.string().email(),
   password: z.string().min(1),
+});
+
+const atlasCreateFromAtlasBody = z.object({
+  email: z.string().email(),
 });
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
@@ -458,6 +463,44 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         return reply.unauthorized('Invalid credentials');
       }
       return reply.send({ axis_user_id: user.id, axis_email: user.email });
+    },
+  );
+
+  app.post(
+    '/api/auth/create-from-atlas',
+    { preHandler: app.requireAtlasApiKey },
+    async (req, reply) => {
+      const body = atlasCreateFromAtlasBody.parse({
+        email: ((req.body as { email?: string })?.email ?? '').trim().toLowerCase(),
+      });
+      // Reject any pre-existing record (active or soft-deleted) — Atlas-side falls
+      // back to verify-credentials on 409 (see Phase 0 spec). Re-checking after
+      // insert via 23505 covers the parallel-request race.
+      const [existing] = await app.db
+        .select({ id: schema.users.id })
+        .from(schema.users)
+        .where(eq(schema.users.email, body.email))
+        .limit(1);
+      if (existing) {
+        return reply.code(409).send({ code: 'email_exists' });
+      }
+      const passwordHash = await hashPassword(randomBytes(32).toString('hex'));
+      try {
+        const [user] = await app.db
+          .insert(schema.users)
+          .values({
+            email: body.email,
+            name: body.email,
+            passwordHash,
+          })
+          .returning({ id: schema.users.id, email: schema.users.email });
+        return reply.send({ axis_user_id: user!.id, axis_email: user!.email });
+      } catch (err: any) {
+        if (err?.code === '23505') {
+          return reply.code(409).send({ code: 'email_exists' });
+        }
+        throw err;
+      }
     },
   );
 }
