@@ -503,6 +503,78 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       }
     },
   );
+
+  // Trades a short-lived `atlas_token` (HS256, signed by Atlas with
+  // AXIS_JWT_SECRET) for a regular Axis session. axis-front calls this on iframe
+  // mount so the user lands logged in without ever seeing the Axis login screen.
+  // Auth is the JWT in the body — `requireAtlasIframeAuth` (T-020) verifies the
+  // signature, asserts kind/exp, and resolves the user via axis_user_id; no
+  // X-API-Key gate (per Phase 0 spec line 68).
+  app.post(
+    '/api/auth/exchange-iframe-token',
+    { preHandler: app.requireAtlasIframeAuth },
+    async (req, reply) => {
+      const userId = req.atlasIframeUser!.id;
+
+      const [user] = await app.db
+        .select()
+        .from(schema.users)
+        .where(eq(schema.users.id, userId))
+        .limit(1);
+      if (!user || user.deletedAt) {
+        return reply.unauthorized('User no longer exists');
+      }
+
+      const accountMemberships = await app.db
+        .select({
+          accountId: schema.accountUsers.accountId,
+          role: schema.accountUsers.role,
+          accountName: schema.accounts.name,
+          availability: schema.accountUsers.availability,
+          autoOffline: schema.accountUsers.autoOffline,
+        })
+        .from(schema.accountUsers)
+        .innerJoin(schema.accounts, eq(schema.accountUsers.accountId, schema.accounts.id))
+        .where(eq(schema.accountUsers.userId, user.id));
+
+      if (accountMemberships.length === 0) {
+        return reply.forbidden('User has no account memberships');
+      }
+
+      // The atlas_token identifies a single user; iframe SSO can't surface a
+      // multi-account picker, so always pick the first membership. Multi-account
+      // selection inside the Atlas iframe is a V2 concern.
+      const membership = accountMemberships[0]!;
+      const accessToken = signAccessToken(app, {
+        sub: user.id,
+        email: user.email,
+        role: membership.role,
+        accountId: membership.accountId,
+      });
+      const refreshToken = await issueRefreshTokenWithUser(app, user.id, membership.accountId);
+
+      return reply.send({
+        accessToken,
+        refreshToken,
+        user: {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          role: membership.role,
+          avatarUrl: user.avatarUrl,
+          accountId: membership.accountId,
+          accountName: membership.accountName,
+          accounts: accountMemberships.map((m) => ({
+            id: m.accountId,
+            name: m.accountName,
+            role: m.role,
+            availability: m.availability,
+            auto_offline: m.autoOffline,
+          })),
+        },
+      });
+    },
+  );
 }
 
 // Expose for seed script
