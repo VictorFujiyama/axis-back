@@ -62,6 +62,12 @@ const envSchema = z.object({
   // create-from-atlas). Optional so dev/test envs without the integration boot
   // fine; the requireAtlasApiKey middleware refuses requests when unset.
   ATLAS_API_KEY: z.string().optional(),
+  // HS256 secret shared with Atlas to verify the short-lived `atlas_token`
+  // JWTs Atlas signs for the messaging iframe (kind: "atlas-iframe"). Atlas
+  // calls it `AXIS_JWT_SECRET` on its side. Optional so envs without the
+  // integration boot fine; the requireAtlasIframeAuth middleware refuses
+  // requests when unset.
+  AXIS_JWT_SECRET: z.string().optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
