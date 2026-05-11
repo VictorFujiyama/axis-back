@@ -67,6 +67,11 @@ const envSchema = z.object({
   // null without making any network call, so bots silently fall back to
   // `cfg.systemPrompt`. Pairs with ATLAS_API_KEY for `X-API-Key` auth.
   ATLAS_BASE_URL: z.string().url().optional(),
+  // Shared HMAC secret used to sign outbound messaging events posted to
+  // Atlas at `${ATLAS_BASE_URL}/api/messaging/events`. When unset, the
+  // atlas-events enqueuer subscribes no listeners and the worker is a
+  // no-op — the integration is "off" without touching Atlas.
+  ATLAS_EVENTS_HMAC_SECRET: z.string().min(16).optional(),
   // HS256 secret shared with Atlas to verify the short-lived `atlas_token`
   // JWTs Atlas signs for the messaging iframe (kind: "atlas-iframe"). Atlas
   // calls it `AXIS_JWT_SECRET` on its side. Optional so envs without the
