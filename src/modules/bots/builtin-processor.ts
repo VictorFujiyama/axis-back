@@ -19,6 +19,7 @@ import { decryptJSON } from '../../crypto';
 import { eventBus } from '../../realtime/event-bus';
 import { parseBuiltinConfig, type BuiltinBotConfig } from './builtin-config';
 import { callLLM, resolveApiKey, type LLMMessage } from './llm-client';
+import { fetchPlaybook, type PlaybookSource } from './playbook-fetcher';
 
 const HISTORY_LIMIT = 20;
 
@@ -45,10 +46,6 @@ export async function processBuiltinBot(
     fetchImpl?: typeof fetch;
   },
 ): Promise<void> {
-  // `redis` and `fetchImpl` are wired here for T-016a to consume; ref'd as
-  // `void` so a strict-unused-locals run wouldn't flag them in the meantime.
-  void redis;
-  void fetchImpl;
   // ── 1. Load entities ──────────────────────────────────────────────
   const [conv] = await db
     .select()
@@ -85,6 +82,41 @@ export async function processBuiltinBot(
   if (!apiKey) {
     log.error({ botId: bot.id, provider: cfg.provider }, 'builtin-bot: no API key available');
     return;
+  }
+
+  // ── 2.5. Resolve effective system prompt (Atlas playbook or inline) ──
+  const playbookStart = Date.now();
+  let effectiveSystemPrompt = cfg.systemPrompt;
+  let playbookFetchResult: { source: PlaybookSource; etag: string } | null = null;
+  let playbookFetchError: string | undefined;
+  if (cfg.playbookSource === 'atlas') {
+    try {
+      const playbook = await fetchPlaybook(
+        input.inboxId,
+        { redis, log },
+        { fetchImpl },
+      );
+      if (playbook) {
+        effectiveSystemPrompt = playbook.markdown;
+        playbookFetchResult = { source: playbook.source, etag: playbook.etag };
+      } else {
+        log.warn(
+          { botId: bot.id, inboxId: input.inboxId },
+          'builtin-bot: playbook fetch returned null; falling back to inline systemPrompt',
+        );
+      }
+    } catch (err) {
+      playbookFetchError = err instanceof Error ? err.message.slice(0, 200) : 'unknown';
+      log.warn(
+        { err, botId: bot.id, inboxId: input.inboxId },
+        'builtin-bot: playbook fetch threw',
+      );
+    }
+    // T-016b will insert the bot_events row here; pin the bookkeeping vars
+    // so the compiler doesn't flag them as unused in the meantime.
+    void playbookFetchResult;
+    void playbookFetchError;
+    void playbookStart;
   }
 
   // ── 3. Load message history ───────────────────────────────────────
@@ -153,7 +185,7 @@ export async function processBuiltinBot(
       provider: cfg.provider,
       model: cfg.model,
       apiKey,
-      systemPrompt: cfg.systemPrompt,
+      systemPrompt: effectiveSystemPrompt,
       messages: llmMessages,
       temperature: cfg.temperature,
       maxTokens: cfg.maxTokens,
