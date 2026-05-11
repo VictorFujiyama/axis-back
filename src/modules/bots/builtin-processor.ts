@@ -112,11 +112,31 @@ export async function processBuiltinBot(
         'builtin-bot: playbook fetch threw',
       );
     }
-    // T-016b will insert the bot_events row here; pin the bookkeeping vars
-    // so the compiler doesn't flag them as unused in the meantime.
-    void playbookFetchResult;
-    void playbookFetchError;
-    void playbookStart;
+    await db
+      .insert(schema.botEvents)
+      .values({
+        botId: bot.id,
+        accountId: input.accountId,
+        conversationId: input.conversationId,
+        messageId: input.newMessageId,
+        event: 'playbook_fetch',
+        direction: 'outbound',
+        status: playbookFetchResult ? 'success' : 'failed',
+        latencyMs: Date.now() - playbookStart,
+        payload: playbookFetchResult
+          ? {
+              source: playbookFetchResult.source,
+              etag: playbookFetchResult.etag.slice(0, 8),
+              fallback: false,
+            }
+          : {
+              fallback: true,
+              ...(playbookFetchError
+                ? { reason: 'threw', errorPreview: playbookFetchError }
+                : { reason: 'returned-null' }),
+            },
+      })
+      .catch((err) => log.warn({ err }, 'bot_events insert failed (playbook_fetch)'));
   }
 
   // ── 3. Load message history ───────────────────────────────────────
