@@ -88,7 +88,7 @@ export function registerWorkers(app: FastifyInstance): void {
   const botWorker = app.queues.registerWorker<BotDispatchJob>(
     QUEUE_NAMES.BOT_DISPATCH,
     async (job) => {
-      await deliverBotWebhook(job.data, { db: app.db, log: app.log });
+      await deliverBotWebhook(job.data, { db: app.db, log: app.log, redis: app.redis });
     },
     10,
   );
