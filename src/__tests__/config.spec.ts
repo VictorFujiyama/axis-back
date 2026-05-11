@@ -64,3 +64,38 @@ describe('config — GOOGLE_OAUTH_*', () => {
     await expect(loadFreshConfig()).rejects.toThrow();
   });
 });
+
+describe('config — ATLAS_EVENTS_HMAC_SECRET', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('defaults to undefined when ATLAS_EVENTS_HMAC_SECRET is unset', async () => {
+    vi.stubEnv('ATLAS_EVENTS_HMAC_SECRET', '');
+    delete process.env.ATLAS_EVENTS_HMAC_SECRET;
+
+    const config = await loadFreshConfig();
+
+    expect(config.ATLAS_EVENTS_HMAC_SECRET).toBeUndefined();
+  });
+
+  it('parses a 32-byte hex secret', async () => {
+    const hex64 = 'a'.repeat(64);
+    vi.stubEnv('ATLAS_EVENTS_HMAC_SECRET', hex64);
+
+    const config = await loadFreshConfig();
+
+    expect(config.ATLAS_EVENTS_HMAC_SECRET).toBe(hex64);
+  });
+
+  it('rejects a secret shorter than 16 characters', async () => {
+    vi.stubEnv('ATLAS_EVENTS_HMAC_SECRET', 'too-short');
+
+    await expect(loadFreshConfig()).rejects.toThrow();
+  });
+});
