@@ -41,7 +41,24 @@ export function registerAtlasEventsWorker(
         return;
       }
 
-      const body = JSON.stringify(job.data);
+      // Map internal camelCase + `type` to Atlas snake_case + `event_type`.
+      // Extra fields (assignedUserId/Team) go into `payload` per Atlas schema.
+      const j = job.data;
+      const atlasPayload: Record<string, unknown> = {
+        event_type: j.type,
+        occurred_at: j.occurredAt,
+        conversation_id: j.conversationId,
+        summary: j.summary,
+      };
+      if (j.type === 'message_sent') {
+        atlasPayload['message_id'] = j.messageId;
+      } else if (j.type === 'handoff_to_human') {
+        atlasPayload['payload'] = {
+          assigned_user_id: j.assignedUserId,
+          assigned_team_id: j.assignedTeamId,
+        };
+      }
+      const body = JSON.stringify(atlasPayload);
       const signature = signOutboundPayload(body, secret);
       const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
       const url = `${baseUrl.replace(/\/$/, '')}/api/messaging/events`;
