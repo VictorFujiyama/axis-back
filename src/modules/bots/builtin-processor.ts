@@ -13,11 +13,13 @@
  */
 import { and, desc, eq, sql } from 'drizzle-orm';
 import type { FastifyBaseLogger } from 'fastify';
+import type Redis from 'ioredis';
 import { schema, type DB } from '@blossom/db';
 import { decryptJSON } from '../../crypto';
 import { eventBus } from '../../realtime/event-bus';
 import { parseBuiltinConfig, type BuiltinBotConfig } from './builtin-config';
 import { callLLM, resolveApiKey, type LLMMessage } from './llm-client';
+import { fetchPlaybook, type PlaybookSource } from './playbook-fetcher';
 
 const HISTORY_LIMIT = 20;
 
@@ -32,7 +34,17 @@ export interface ProcessInput {
 
 export async function processBuiltinBot(
   input: ProcessInput,
-  { db, log }: { db: DB; log: FastifyBaseLogger },
+  {
+    db,
+    log,
+    redis,
+    fetchImpl,
+  }: {
+    db: DB;
+    log: FastifyBaseLogger;
+    redis: Redis;
+    fetchImpl?: typeof fetch;
+  },
 ): Promise<void> {
   // ── 1. Load entities ──────────────────────────────────────────────
   const [conv] = await db
@@ -70,6 +82,61 @@ export async function processBuiltinBot(
   if (!apiKey) {
     log.error({ botId: bot.id, provider: cfg.provider }, 'builtin-bot: no API key available');
     return;
+  }
+
+  // ── 2.5. Resolve effective system prompt (Atlas playbook or inline) ──
+  const playbookStart = Date.now();
+  let effectiveSystemPrompt = cfg.systemPrompt;
+  let playbookFetchResult: { source: PlaybookSource; etag: string } | null = null;
+  let playbookFetchError: string | undefined;
+  if (cfg.playbookSource === 'atlas') {
+    try {
+      const playbook = await fetchPlaybook(
+        input.inboxId,
+        { redis, log },
+        { fetchImpl },
+      );
+      if (playbook) {
+        effectiveSystemPrompt = playbook.markdown;
+        playbookFetchResult = { source: playbook.source, etag: playbook.etag };
+      } else {
+        log.warn(
+          { botId: bot.id, inboxId: input.inboxId },
+          'builtin-bot: playbook fetch returned null; falling back to inline systemPrompt',
+        );
+      }
+    } catch (err) {
+      playbookFetchError = err instanceof Error ? err.message.slice(0, 200) : 'unknown';
+      log.warn(
+        { err, botId: bot.id, inboxId: input.inboxId },
+        'builtin-bot: playbook fetch threw',
+      );
+    }
+    await db
+      .insert(schema.botEvents)
+      .values({
+        botId: bot.id,
+        accountId: input.accountId,
+        conversationId: input.conversationId,
+        messageId: input.newMessageId,
+        event: 'playbook_fetch',
+        direction: 'outbound',
+        status: playbookFetchResult ? 'success' : 'failed',
+        latencyMs: Date.now() - playbookStart,
+        payload: playbookFetchResult
+          ? {
+              source: playbookFetchResult.source,
+              etag: playbookFetchResult.etag.slice(0, 8),
+              fallback: false,
+            }
+          : {
+              fallback: true,
+              ...(playbookFetchError
+                ? { reason: 'threw', errorPreview: playbookFetchError }
+                : { reason: 'returned-null' }),
+            },
+      })
+      .catch((err) => log.warn({ err }, 'bot_events insert failed (playbook_fetch)'));
   }
 
   // ── 3. Load message history ───────────────────────────────────────
@@ -138,7 +205,7 @@ export async function processBuiltinBot(
       provider: cfg.provider,
       model: cfg.model,
       apiKey,
-      systemPrompt: cfg.systemPrompt,
+      systemPrompt: effectiveSystemPrompt,
       messages: llmMessages,
       temperature: cfg.temperature,
       maxTokens: cfg.maxTokens,
