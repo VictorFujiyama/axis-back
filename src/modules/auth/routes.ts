@@ -486,15 +486,31 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       }
       const passwordHash = await hashPassword(randomBytes(32).toString('hex'));
       try {
-        const [user] = await app.db
-          .insert(schema.users)
-          .values({
-            email: body.email,
-            name: body.email,
-            passwordHash,
-          })
-          .returning({ id: schema.users.id, email: schema.users.email });
-        return reply.send({ axis_user_id: user!.id, axis_email: user!.email });
+        // The user is auto-created from the Atlas modal, so they own their
+        // own Axis tenant. Spin up an account + admin membership in the same
+        // transaction — otherwise exchange-iframe-token can't pick a membership
+        // and returns 403. See Phase 0 retrospective (atlas-into-atlas).
+        const created = await app.db.transaction(async (tx) => {
+          const [user] = await tx
+            .insert(schema.users)
+            .values({
+              email: body.email,
+              name: body.email,
+              passwordHash,
+            })
+            .returning({ id: schema.users.id, email: schema.users.email });
+          const [account] = await tx
+            .insert(schema.accounts)
+            .values({ name: body.email })
+            .returning({ id: schema.accounts.id });
+          await tx.insert(schema.accountUsers).values({
+            accountId: account!.id,
+            userId: user!.id,
+            role: 'admin',
+          });
+          return user!;
+        });
+        return reply.send({ axis_user_id: created.id, axis_email: created.email });
       } catch (err: any) {
         if (err?.code === '23505') {
           return reply.code(409).send({ code: 'email_exists' });
