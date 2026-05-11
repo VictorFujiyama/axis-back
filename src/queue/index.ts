@@ -35,6 +35,7 @@ export const QUEUE_NAMES = {
   CAMPAIGN_SEND: 'campaign-send',
   MEDIA_MIRROR: 'media-mirror',
   GMAIL_SYNC: 'gmail-sync',
+  ATLAS_EVENTS: 'atlas-events',
 } as const;
 
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];

@@ -29,9 +29,20 @@ describe('QUEUE_NAMES — gmail-sync registration', () => {
       'campaign-send',
       'media-mirror',
       'gmail-sync',
+      'atlas-events',
     ];
     for (const name of expected) {
       expect(Object.values(QUEUE_NAMES)).toContain(name);
     }
+  });
+});
+
+describe('QUEUE_NAMES — atlas-events registration', () => {
+  it('exposes ATLAS_EVENTS as the wire name "atlas-events"', () => {
+    expect(QUEUE_NAMES.ATLAS_EVENTS).toBe('atlas-events');
+  });
+
+  it('includes atlas-events in the iteration set used by the registry constructor', () => {
+    expect(Object.values(QUEUE_NAMES)).toContain('atlas-events');
   });
 });
