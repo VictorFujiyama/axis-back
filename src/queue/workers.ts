@@ -33,6 +33,7 @@ import {
 import { registerGmailSyncWorker } from './workers/gmail-sync';
 import { subscribeAtlasEvents } from '../modules/atlas-events/enqueue';
 import { registerAtlasEventsWorker } from '../modules/atlas-events/worker';
+import { registerBotOutboundHook } from '../modules/bots/outbound-hook';
 import { config as appConfig } from '../config';
 
 /**
@@ -392,6 +393,7 @@ export function registerWorkers(app: FastifyInstance): void {
   registerGmailSyncWorker(app);
   subscribeAtlasEvents(app);
   registerAtlasEventsWorker(app);
+  registerBotOutboundHook(app);
 
   app.log.info('queue workers registered');
 }

@@ -524,7 +524,9 @@ export async function dispatchOutbound(
     .from(schema.messages)
     .where(eq(schema.messages.id, messageId))
     .limit(1);
-  if (!msg || msg.senderType !== 'user') return;
+  // Outbound dispatch is meant for agent-sent ('user') and bot-sent ('bot')
+  // messages. Contact/system messages never go outbound from here.
+  if (!msg || (msg.senderType !== 'user' && msg.senderType !== 'bot')) return;
 
   const [conv] = await app.db
     .select({ contactId: schema.conversations.contactId, inboxId: schema.conversations.inboxId })
