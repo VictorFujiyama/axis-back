@@ -31,6 +31,8 @@ import {
   sendOutboundTwilio,
 } from '../modules/channels/twilio-shared';
 import { registerGmailSyncWorker } from './workers/gmail-sync';
+import { subscribeAtlasEvents } from '../modules/atlas-events/enqueue';
+import { registerAtlasEventsWorker } from '../modules/atlas-events/worker';
 import { config as appConfig } from '../config';
 
 /**
@@ -388,6 +390,8 @@ export function registerWorkers(app: FastifyInstance): void {
   registerWebhookWorker(app);
   registerCampaignWorkers(app);
   registerGmailSyncWorker(app);
+  subscribeAtlasEvents(app);
+  registerAtlasEventsWorker(app);
 
   app.log.info('queue workers registered');
 }
