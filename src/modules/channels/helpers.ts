@@ -372,7 +372,7 @@ export async function ingestIncomingMessage(
           botId: convForBot.assignedBotId,
           accountId: convForBot.accountId,
         },
-        { db, log, queue: deps.botQueue },
+        { db, log, queue: deps.botQueue, redis: deps.redis },
       );
     }
   }

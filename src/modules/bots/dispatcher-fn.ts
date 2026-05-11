@@ -7,6 +7,7 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { desc, eq } from 'drizzle-orm';
 import type { FastifyBaseLogger } from 'fastify';
+import type Redis from 'ioredis';
 import { schema, type DB } from '@blossom/db';
 import { decryptJSON } from '../../crypto';
 import { safeFetch } from './safe-fetch';
@@ -26,6 +27,8 @@ export interface DispatchInput {
 interface Deps {
   db: DB;
   log: FastifyBaseLogger;
+  redis: Redis;
+  fetchImpl?: typeof fetch;
 }
 
 export function signPayload(body: string, secret: string): string {
@@ -73,7 +76,7 @@ async function logBotEvent(
 
 export async function deliverBotWebhook(
   input: DispatchInput,
-  { db, log }: Deps,
+  { db, log, redis, fetchImpl }: Deps,
 ): Promise<void> {
   const [conv] = await db
     .select()
@@ -92,7 +95,7 @@ export async function deliverBotWebhook(
   // Built-in bots use the internal LLM processor instead of webhook delivery.
   if (bot.botType === 'builtin') {
     const { processBuiltinBot } = await import('./builtin-processor');
-    await processBuiltinBot(input, { db, log });
+    await processBuiltinBot(input, { db, log, redis, fetchImpl });
     return;
   }
 

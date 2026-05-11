@@ -13,6 +13,7 @@
  */
 import { and, desc, eq, sql } from 'drizzle-orm';
 import type { FastifyBaseLogger } from 'fastify';
+import type Redis from 'ioredis';
 import { schema, type DB } from '@blossom/db';
 import { decryptJSON } from '../../crypto';
 import { eventBus } from '../../realtime/event-bus';
@@ -32,8 +33,22 @@ export interface ProcessInput {
 
 export async function processBuiltinBot(
   input: ProcessInput,
-  { db, log }: { db: DB; log: FastifyBaseLogger },
+  {
+    db,
+    log,
+    redis,
+    fetchImpl,
+  }: {
+    db: DB;
+    log: FastifyBaseLogger;
+    redis: Redis;
+    fetchImpl?: typeof fetch;
+  },
 ): Promise<void> {
+  // `redis` and `fetchImpl` are wired here for T-016a to consume; ref'd as
+  // `void` so a strict-unused-locals run wouldn't flag them in the meantime.
+  void redis;
+  void fetchImpl;
   // ── 1. Load entities ──────────────────────────────────────────────
   const [conv] = await db
     .select()
