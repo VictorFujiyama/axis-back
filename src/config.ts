@@ -68,10 +68,14 @@ const envSchema = z.object({
   // `cfg.systemPrompt`. Pairs with ATLAS_API_KEY for `X-API-Key` auth.
   ATLAS_BASE_URL: z.string().url().optional(),
   // Shared HMAC secret used to sign outbound messaging events posted to
-  // Atlas at `${ATLAS_BASE_URL}/api/messaging/events`. When unset, the
+  // Atlas at `${ATLAS_BASE_URL}${ATLAS_EVENTS_ENDPOINT}`. When unset, the
   // atlas-events enqueuer subscribes no listeners and the worker is a
   // no-op — the integration is "off" without touching Atlas.
   ATLAS_EVENTS_HMAC_SECRET: z.string().min(16).optional(),
+  // Path on Atlas where the atlas-events worker POSTs envelopes. Default is
+  // the Phase 12 connector route. Override to `/api/messaging/events` to
+  // roll back to the Phase B endpoint without redeploying axis-back.
+  ATLAS_EVENTS_ENDPOINT: z.string().default('/api/connectors/messaging/events'),
   // HS256 secret shared with Atlas to verify the short-lived `atlas_token`
   // JWTs Atlas signs for the messaging iframe (kind: "atlas-iframe"). Atlas
   // calls it `AXIS_JWT_SECRET` on its side. Optional so envs without the
