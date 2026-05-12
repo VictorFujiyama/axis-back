@@ -1,12 +1,18 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { FastifyInstance } from 'fastify';
 import type { DB } from '@blossom/db';
 
 import {
   MessagingToolError,
+  assignHandler,
   getThreadHandler,
   listThreadsHandler,
+  resolveHandler,
   searchHandler,
+  sendMessageHandler,
 } from '../tools';
+import { buildAtlasBotEmail } from '../atlas-bot';
+import { eventBus } from '../../../realtime/event-bus';
 
 /**
  * Mock the drizzle chain used by tools.ts handlers:
@@ -141,5 +147,287 @@ describe('searchHandler', () => {
     const result = await searchHandler(db, { query: 'nothingmatches', limit: 20 });
 
     expect(result.hits).toEqual([]);
+  });
+});
+
+// ─── Write tools (T-022) ──────────────────────────────────────────────────────
+
+const ACCOUNT_ID = '33333333-3333-3333-3333-333333333333';
+const CONV_ID = '44444444-4444-4444-4444-444444444444';
+const INBOX_ID = '55555555-5555-5555-5555-555555555555';
+const TARGET_USER_ID = '66666666-6666-6666-6666-666666666666';
+const BOT_USER_ID = '77777777-7777-7777-7777-777777777777';
+const ATLAS_APP_USER_ID = 'clerk_user_atlas_xyz';
+const ATLAS_ORG_ID = 'atlas_org_abc';
+
+const CTX = { atlasAppUserId: ATLAS_APP_USER_ID, atlasOrgId: ATLAS_ORG_ID };
+
+const BOT_USER_ROW = {
+  id: BOT_USER_ID,
+  email: buildAtlasBotEmail(ACCOUNT_ID),
+  name: 'Atlas Assistant',
+};
+
+const CONV_SCOPE_ROW = {
+  id: CONV_ID,
+  inboxId: INBOX_ID,
+  contactId: '88888888-8888-8888-8888-888888888888',
+  assignedUserId: null as string | null,
+  assignedTeamId: null as string | null,
+  assignedBotId: null as string | null,
+  status: 'open' as const,
+  deletedAt: null as Date | null,
+  accountId: ACCOUNT_ID,
+};
+
+/**
+ * Drizzle mock for write-tool tests. Each write handler issues a mix of:
+ *   - select(...).from(...).[innerJoin(...).]where(...).limit(1)   (scope/link/member lookups)
+ *   - insert(...).values(...).returning()                          (sendMessage)
+ *   - update(...).set(...).where(...) [.returning(...)]            (sendMessage/assign/resolve)
+ *
+ * `selectLimits`, `insertReturnings` and `updateReturnings` are sequential
+ * queues consumed in call order. The update path is dual-shape: awaiting
+ * `where()` directly resolves to `undefined` (sendMessage timestamp bump),
+ * while `.returning(...)` resolves to the next entry in `updateReturnings`
+ * (assign/resolve).
+ */
+function makeWriteDb(opts: {
+  selectLimits?: Array<unknown[]>;
+  insertReturnings?: Array<unknown[]>;
+  updateReturnings?: Array<unknown[]>;
+}): { db: DB; updateReturning: ReturnType<typeof vi.fn> } {
+  const selectLimit = vi.fn();
+  for (const rs of opts.selectLimits ?? []) selectLimit.mockResolvedValueOnce(rs);
+  const orderBy = vi.fn().mockReturnValue({ limit: selectLimit });
+  const selectWhere = vi.fn().mockReturnValue({ limit: selectLimit, orderBy });
+  const innerJoin = vi.fn().mockReturnValue({ where: selectWhere });
+  const selectFrom = vi
+    .fn()
+    .mockReturnValue({ where: selectWhere, innerJoin });
+  const select = vi.fn().mockReturnValue({ from: selectFrom });
+
+  const insertReturning = vi.fn();
+  for (const rs of opts.insertReturnings ?? []) insertReturning.mockResolvedValueOnce(rs);
+  const insertValues = vi.fn().mockReturnValue({ returning: insertReturning });
+  const insertFn = vi.fn().mockReturnValue({ values: insertValues });
+
+  const updateReturning = vi.fn();
+  for (const rs of opts.updateReturnings ?? []) updateReturning.mockResolvedValueOnce(rs);
+  // `where()` is both awaitable (for the no-returning sendMessage timestamp
+  // bump) AND chains into `.returning(...)` (assign/resolve). We hand back a
+  // resolved Promise decorated with a `returning` method.
+  const updateWhere = vi.fn().mockImplementation(() => {
+    const thenable: Promise<undefined> & { returning?: typeof updateReturning } =
+      Promise.resolve(undefined);
+    thenable.returning = updateReturning;
+    return thenable;
+  });
+  const updateSet = vi.fn().mockReturnValue({ where: updateWhere });
+  const updateFn = vi.fn().mockReturnValue({ set: updateSet });
+
+  return {
+    db: { select, insert: insertFn, update: updateFn } as unknown as DB,
+    updateReturning,
+  };
+}
+
+const appStub = {
+  log: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
+} as unknown as FastifyInstance;
+
+describe('sendMessageHandler', () => {
+  let emitSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    emitSpy = vi.spyOn(eventBus, 'emitEvent').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    emitSpy.mockRestore();
+  });
+
+  it('inserts a bot message, bumps the conversation, and emits message.created with Atlas meta', async () => {
+    const insertedMsg = {
+      id: 'msg-new',
+      conversationId: CONV_ID,
+      inboxId: INBOX_ID,
+      senderType: 'bot' as const,
+      senderId: BOT_USER_ID,
+      content: 'hi from atlas',
+      contentType: 'text',
+      mediaUrl: null,
+      mediaMimeType: null,
+      isPrivateNote: false,
+      createdAt: new Date('2026-05-12T14:00:00Z'),
+    };
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [CONV_SCOPE_ROW],          // loadConversationScope
+        [{ id: 'link-1' }],        // requireAtlasUserLink
+        [BOT_USER_ROW],            // getOrCreateAtlasBotUser (idempotent lookup hit)
+      ],
+      insertReturnings: [[insertedMsg]],
+    });
+
+    const result = await sendMessageHandler(
+      db,
+      appStub,
+      {
+        conversationId: CONV_ID,
+        content: 'hi from atlas',
+        contentType: 'text',
+        isPrivateNote: false,
+      },
+      CTX,
+    );
+
+    expect(result).toEqual({ messageId: 'msg-new' });
+    expect(emitSpy).toHaveBeenCalledTimes(1);
+    expect(emitSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'message.created',
+        conversationId: CONV_ID,
+        inboxId: INBOX_ID,
+        meta: { atlasAppUserId: ATLAS_APP_USER_ID, atlasOrgId: ATLAS_ORG_ID },
+      }),
+    );
+  });
+
+  it('throws MessagingToolError("forbidden") when atlas_user_link is missing for this Atlas user', async () => {
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [CONV_SCOPE_ROW],          // loadConversationScope
+        [],                        // requireAtlasUserLink → empty
+      ],
+    });
+
+    const promise = sendMessageHandler(
+      db,
+      appStub,
+      {
+        conversationId: CONV_ID,
+        content: 'hi',
+        contentType: 'text',
+        isPrivateNote: false,
+      },
+      CTX,
+    );
+
+    await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
+    await expect(promise).rejects.toMatchObject({ code: 'forbidden' });
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('assignHandler', () => {
+  let emitSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    emitSpy = vi.spyOn(eventBus, 'emitEvent').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    emitSpy.mockRestore();
+  });
+
+  it('updates assignment and emits conversation.assigned when target user is an inbox member', async () => {
+    const updatedConv = {
+      id: CONV_ID,
+      inboxId: INBOX_ID,
+      assignedUserId: TARGET_USER_ID,
+      assignedTeamId: null,
+      assignedBotId: null,
+    };
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [CONV_SCOPE_ROW],                  // loadConversationScope
+        [{ id: 'link-1' }],                // requireAtlasUserLink
+        [{ userId: TARGET_USER_ID }],      // inboxMembers lookup
+      ],
+      updateReturnings: [[updatedConv]],
+    });
+
+    const result = await assignHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID, userId: TARGET_USER_ID },
+      CTX,
+    );
+
+    expect(result).toEqual({
+      conversationId: CONV_ID,
+      assignedUserId: TARGET_USER_ID,
+      assignedTeamId: null,
+    });
+    expect(emitSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'conversation.assigned',
+        conversationId: CONV_ID,
+        assignedUserId: TARGET_USER_ID,
+        assignedBotId: null,
+        meta: { atlasAppUserId: ATLAS_APP_USER_ID, atlasOrgId: ATLAS_ORG_ID },
+      }),
+    );
+  });
+
+  it('throws MessagingToolError("bad_request") when the target user is not a member of the inbox', async () => {
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [CONV_SCOPE_ROW],          // loadConversationScope
+        [{ id: 'link-1' }],        // requireAtlasUserLink
+        [],                        // inboxMembers lookup → empty
+      ],
+    });
+
+    const promise = assignHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID, userId: TARGET_USER_ID },
+      CTX,
+    );
+
+    await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
+    await expect(promise).rejects.toMatchObject({ code: 'bad_request' });
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('resolveHandler', () => {
+  let emitSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    emitSpy = vi.spyOn(eventBus, 'emitEvent').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    emitSpy.mockRestore();
+  });
+
+  it('marks the conversation resolved, stamps resolvedBy=atlas-bot, and emits conversation.resolved with Atlas meta', async () => {
+    const updatedConv = {
+      id: CONV_ID,
+      inboxId: INBOX_ID,
+      resolvedBy: BOT_USER_ID,
+    };
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [CONV_SCOPE_ROW],          // loadConversationScope (status='open')
+        [{ id: 'link-1' }],        // requireAtlasUserLink
+        [BOT_USER_ROW],            // getOrCreateAtlasBotUser lookup hit
+        [{ config: null }],        // inbox config — CSAT disabled, no enqueue
+      ],
+      updateReturnings: [[updatedConv]],
+    });
+
+    const result = await resolveHandler(db, appStub, { conversationId: CONV_ID }, CTX);
+
+    expect(result).toEqual({
+      conversationId: CONV_ID,
+      status: 'resolved',
+      resolvedBy: BOT_USER_ID,
+    });
+    expect(emitSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'conversation.resolved',
+        conversationId: CONV_ID,
+        resolvedBy: BOT_USER_ID,
+        meta: { atlasAppUserId: ATLAS_APP_USER_ID, atlasOrgId: ATLAS_ORG_ID },
+      }),
+    );
   });
 });
