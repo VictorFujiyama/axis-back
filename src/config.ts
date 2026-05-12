@@ -82,11 +82,34 @@ const envSchema = z.object({
   // integration boot fine; the requireAtlasIframeAuth middleware refuses
   // requests when unset.
   AXIS_JWT_SECRET: z.string().optional(),
+  // Master switch for the Phase D MCP server route (/mcp). Default false so
+  // dormant envs without the integration boot fine. Flip to true in Render
+  // once Atlas Phase 11+12 are merged and the `mcp_servers` row is provisioned.
+  // Mirrors the ALLOW_UNSIGNED_WEBHOOKS enum-string pattern instead of
+  // `z.coerce.boolean()` because the latter coerces `'false'` → `true`.
+  MCP_SERVER_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  // Shared HMAC secret Atlas signs MCP requests with (header `X-Atlas-Signature`).
+  // Kept separate from ATLAS_EVENTS_HMAC_SECRET for separation of concerns
+  // (rotating one channel must not invalidate the other). Required only when
+  // MCP_SERVER_ENABLED=true (enforced by the boot check below).
+  ATLAS_MCP_HMAC_SECRET: z.string().min(16).optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
 
 export const config: Config = envSchema.parse(process.env);
+
+// MCP server requires a signing secret to be present, regardless of NODE_ENV.
+// Caught at boot rather than the first request so a misconfigured deploy
+// crash-loops loudly instead of silently 401-ing every Atlas MCP call.
+if (config.MCP_SERVER_ENABLED && !config.ATLAS_MCP_HMAC_SECRET) {
+  throw new Error(
+    'MCP_SERVER_ENABLED=true requires ATLAS_MCP_HMAC_SECRET (min 16 chars).',
+  );
+}
 
 // Safety net: refuse to boot in production with weak or dev-default secrets.
 if (config.NODE_ENV === 'production') {
