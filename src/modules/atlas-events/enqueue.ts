@@ -96,10 +96,13 @@ async function buildEnvelopeForEvent(
   event: RealtimeEvent,
 ): Promise<AtlasEventEnvelope | null> {
   if (event.type === 'message.created') {
+    // Forward MCP-write `meta` so `mapActors()` can stamp `actors[].app_user_id`
+    // on the outbound envelope (T-021 actor binding propagation, L-403).
     return buildConversationTurnEnvelope(db, {
       conversationId: event.conversationId,
       messageId: event.message.id,
       action: 'create',
+      atlasMeta: event.meta,
     });
   }
 
