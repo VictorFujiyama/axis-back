@@ -99,3 +99,60 @@ describe('config — ATLAS_EVENTS_HMAC_SECRET', () => {
     await expect(loadFreshConfig()).rejects.toThrow();
   });
 });
+
+describe('config — MCP_SERVER_ENABLED + ATLAS_MCP_HMAC_SECRET', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('defaults MCP_SERVER_ENABLED to false when unset', async () => {
+    vi.stubEnv('MCP_SERVER_ENABLED', '');
+    delete process.env.MCP_SERVER_ENABLED;
+
+    const config = await loadFreshConfig();
+
+    expect(config.MCP_SERVER_ENABLED).toBe(false);
+    expect(config.ATLAS_MCP_HMAC_SECRET).toBeUndefined();
+  });
+
+  it('parses MCP_SERVER_ENABLED=true with a 32-byte hex secret', async () => {
+    const hex64 = 'b'.repeat(64);
+    vi.stubEnv('MCP_SERVER_ENABLED', 'true');
+    vi.stubEnv('ATLAS_MCP_HMAC_SECRET', hex64);
+
+    const config = await loadFreshConfig();
+
+    expect(config.MCP_SERVER_ENABLED).toBe(true);
+    expect(config.ATLAS_MCP_HMAC_SECRET).toBe(hex64);
+  });
+
+  it('treats MCP_SERVER_ENABLED="false" as false (not coerced to true)', async () => {
+    vi.stubEnv('MCP_SERVER_ENABLED', 'false');
+
+    const config = await loadFreshConfig();
+
+    expect(config.MCP_SERVER_ENABLED).toBe(false);
+  });
+
+  it('rejects MCP_SERVER_ENABLED=true without ATLAS_MCP_HMAC_SECRET', async () => {
+    vi.stubEnv('MCP_SERVER_ENABLED', 'true');
+    vi.stubEnv('ATLAS_MCP_HMAC_SECRET', '');
+    delete process.env.ATLAS_MCP_HMAC_SECRET;
+
+    await expect(loadFreshConfig()).rejects.toThrow(
+      /MCP_SERVER_ENABLED=true requires ATLAS_MCP_HMAC_SECRET/,
+    );
+  });
+
+  it('rejects ATLAS_MCP_HMAC_SECRET shorter than 16 characters', async () => {
+    vi.stubEnv('MCP_SERVER_ENABLED', 'true');
+    vi.stubEnv('ATLAS_MCP_HMAC_SECRET', 'too-short');
+
+    await expect(loadFreshConfig()).rejects.toThrow();
+  });
+});
