@@ -1,13 +1,20 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { config } from '../config';
 import { verifyMcpRequest } from '../modules/atlas-mcp/auth';
+import { buildMcpServer } from '../modules/atlas-mcp/server';
 
 /**
- * Phase D.2 — MCP server route (`/mcp`) spike (T-015a).
+ * Phase D.2 — MCP server route (`/mcp`).
  *
- * Skeleton only: route + body capture + HMAC preHandler + stub handler. T-015b
- * swaps the stub for an `McpServer` + `StreamableHTTPServerTransport` and
- * registers the three read tools (T-013) via `server.tool()`.
+ * Spike (T-015a) wired the route, body-capture parser, and HMAC preHandler.
+ * T-015b swapped the stub handler for a real `McpServer` over the SDK's
+ * `StreamableHTTPServerTransport`. Tool registrations live in
+ * `src/modules/atlas-mcp/server.ts` (3 read tools: get_thread / list_threads /
+ * search). Per-request we spin up a fresh server + transport — stateless mode
+ * (`sessionIdGenerator: undefined`) so concurrent calls never share mutable
+ * transport state, and the response stream is closed cleanly when the request
+ * ends.
  *
  * Plugin-scoped, NOT `fp`-wrapped: Fastify encapsulation contains the JSON
  * content-type-parser override and `rawBody` decorator to this plugin's
@@ -80,10 +87,39 @@ export async function mcpServerPlugin(app: FastifyInstance): Promise<void> {
         }
       },
     },
-    async () => {
-      // Stub: T-015b replaces this with `transport.handleRequest(...)` after
-      // wiring `McpServer.connect(transport)` + tool registrations.
-      return { ok: true };
+    async (req, reply) => {
+      const server = buildMcpServer(app.db);
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+      });
+
+      // Hand the response stream to the transport; Fastify must not try to
+      // reply on its own. The transport writes the JSON-RPC reply (and any
+      // SSE frames) directly to `reply.raw`.
+      reply.hijack();
+
+      // Release transport + server resources when the client disconnects or
+      // the transport finishes writing. Idempotent — `close()` on an already
+      // closed transport is a no-op.
+      reply.raw.on('close', () => {
+        void transport.close().catch(() => {});
+        void server.close().catch(() => {});
+      });
+
+      try {
+        await server.connect(transport);
+        await transport.handleRequest(req.raw, reply.raw, req.body);
+      } catch (err) {
+        app.log.error({ err }, 'mcp-server: handleRequest failed');
+        if (!reply.raw.headersSent) {
+          reply.raw.statusCode = 500;
+          reply.raw.end(JSON.stringify({ error: 'internal_error' }));
+        } else {
+          reply.raw.end();
+        }
+        void transport.close().catch(() => {});
+        void server.close().catch(() => {});
+      }
     },
   );
 }
