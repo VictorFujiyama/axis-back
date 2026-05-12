@@ -20,3 +20,4 @@ export * from './api-keys';
 export * from './webhook-subscriptions';
 export * from './campaigns';
 export * from './catalog-products';
+export * from './atlas-user-links';
