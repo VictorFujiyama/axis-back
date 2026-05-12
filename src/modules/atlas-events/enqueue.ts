@@ -2,6 +2,13 @@ import type { FastifyInstance } from 'fastify';
 import { config } from '../../config';
 import { eventBus, type RealtimeEvent } from '../../realtime/event-bus';
 import { QUEUE_NAMES } from '../../queue';
+import type { DB } from '@blossom/db';
+import {
+  buildConversationTurnEnvelope,
+  buildHandoffEnvelope,
+  buildResolvedEnvelope,
+  type AtlasEventEnvelope,
+} from './build-envelope';
 
 export interface AtlasEventActor {
   kind: 'contact' | 'user' | 'bot' | 'system';
@@ -55,24 +62,15 @@ export type AtlasEventJob =
     };
 
 /**
- * Subset of {@link AtlasEventJob} for the Phase B `type`-discriminator variants.
- * T-004b will migrate the listeners below to emit the new `kind`-discriminator
- * envelope; until then `mapEvent` only returns this subtype, which lets the
- * call sites in this file access `.type` / `.conversationId` without narrowing.
- */
-type LegacyAtlasEventJob = Extract<AtlasEventJob, { type: string }>;
-
-interface MappedJob {
-  payload: LegacyAtlasEventJob;
-  jobId: string;
-}
-
-/**
  * Subscribe to eventBus and enqueue outbound Atlas events.
  *
  * Pre-check: ATLAS_EVENTS_HMAC_SECRET unset → feature off, no subscription.
  * Three hooks: message.created, conversation.assigned (filtered to
  * assignedBotId === null), conversation.resolved.
+ *
+ * Phase D T-004b: emits Phase 12 §12.1 `kind`-discriminator envelopes via
+ * `build-envelope` helpers. Phase B `type`-variants remain in {@link AtlasEventJob}
+ * so worker can drain in-flight jobs during deploy window.
  */
 export function subscribeAtlasEvents(app: FastifyInstance): void {
   if (!config.ATLAS_EVENTS_HMAC_SECRET) {
@@ -84,62 +82,34 @@ export function subscribeAtlasEvents(app: FastifyInstance): void {
 
   eventBus.onEvent(async (event: RealtimeEvent) => {
     try {
-      const mapped = mapEvent(event);
-      if (!mapped) return;
-      await queue.add(mapped.payload.type, mapped.payload, { jobId: mapped.jobId });
+      const envelope = await buildEnvelopeForEvent(app.db, event);
+      if (!envelope) return;
+      await queue.add(envelope.kind, envelope, { jobId: envelope.sourceRef });
     } catch (err) {
       app.log.warn({ err, eventType: event.type }, 'atlas-events: enqueue failed');
     }
   });
 }
 
-function mapEvent(event: RealtimeEvent): MappedJob | null {
-  const occurredAt = new Date().toISOString();
-
+async function buildEnvelopeForEvent(
+  db: DB,
+  event: RealtimeEvent,
+): Promise<AtlasEventEnvelope | null> {
   if (event.type === 'message.created') {
-    const content = (event.message.content ?? '').slice(0, 200);
-    return {
-      payload: {
-        type: 'message_sent',
-        conversationId: event.conversationId,
-        messageId: event.message.id,
-        occurredAt,
-        summary: `${event.message.senderType}: ${content}`,
-      },
-      jobId: `${event.conversationId}:message_sent:${event.message.id}`,
-    };
+    return buildConversationTurnEnvelope(db, {
+      conversationId: event.conversationId,
+      messageId: event.message.id,
+      action: 'create',
+    });
   }
 
   if (event.type === 'conversation.assigned') {
     if (event.assignedBotId !== null) return null;
-    const who = event.assignedUserId
-      ? 'user'
-      : event.assignedTeamId
-        ? 'team'
-        : 'unassigned';
-    return {
-      payload: {
-        type: 'handoff_to_human',
-        conversationId: event.conversationId,
-        assignedUserId: event.assignedUserId,
-        assignedTeamId: event.assignedTeamId,
-        occurredAt,
-        summary: `Handoff: bot → ${who}`,
-      },
-      jobId: `${event.conversationId}:handoff:${Date.parse(occurredAt)}`,
-    };
+    return buildHandoffEnvelope(db, event);
   }
 
   if (event.type === 'conversation.resolved') {
-    return {
-      payload: {
-        type: 'conversation_resolved',
-        conversationId: event.conversationId,
-        occurredAt,
-        summary: 'Resolved',
-      },
-      jobId: `${event.conversationId}:resolved`,
-    };
+    return buildResolvedEnvelope(db, event);
   }
 
   return null;
