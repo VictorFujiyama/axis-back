@@ -44,6 +44,20 @@ export function registerAtlasEventsWorker(
       // Map internal camelCase + `type` to Atlas snake_case + `event_type`.
       // Extra fields (assignedUserId/Team) go into `payload` per Atlas schema.
       const j = job.data;
+
+      // T-003: AtlasEventJob now also accepts the Phase 12 `kind`-discriminator
+      // envelope. T-006 will wire the dual-shape serializer + endpoint switch;
+      // until then the producers (`mapEvent` in enqueue.ts) only emit legacy
+      // variants, so any `kind`-shaped job here means a future producer landed
+      // before T-006. Mark complete with a warn so the queue doesn't churn.
+      if ('kind' in j) {
+        app.log.warn(
+          { jobId: job.id, envelopeKind: j.kind, action: j.action },
+          'atlas-events worker: kind-envelope variant — T-006 not yet wired, skipping',
+        );
+        return;
+      }
+
       const atlasPayload: Record<string, unknown> = {
         event_type: j.type,
         occurred_at: j.occurredAt,
@@ -80,8 +94,8 @@ export function registerAtlasEventsWorker(
           {
             err,
             jobId: job.id,
-            jobType: job.data.type,
-            conversationId: job.data.conversationId,
+            jobType: j.type,
+            conversationId: j.conversationId,
           },
           'atlas-events worker: network/timeout — will retry',
         );
@@ -94,8 +108,8 @@ export function registerAtlasEventsWorker(
         app.log.info(
           {
             jobId: job.id,
-            jobType: job.data.type,
-            conversationId: job.data.conversationId,
+            jobType: j.type,
+            conversationId: j.conversationId,
             status: res.status,
             latencyMs,
           },
@@ -108,8 +122,8 @@ export function registerAtlasEventsWorker(
         app.log.warn(
           {
             jobId: job.id,
-            jobType: job.data.type,
-            conversationId: job.data.conversationId,
+            jobType: j.type,
+            conversationId: j.conversationId,
             status: res.status,
             latencyMs,
           },

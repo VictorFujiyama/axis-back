@@ -3,7 +3,35 @@ import { config } from '../../config';
 import { eventBus, type RealtimeEvent } from '../../realtime/event-bus';
 import { QUEUE_NAMES } from '../../queue';
 
+export interface AtlasEventActor {
+  kind: 'contact' | 'user' | 'bot' | 'system';
+  id: string;
+  appUserId?: string;
+}
+
+export interface AtlasEventParticipant {
+  kind: 'contact' | 'user' | 'team' | 'bot';
+  id: string;
+}
+
+export interface AtlasEventViewableBy {
+  scope: 'org' | 'users';
+  users?: string[];
+}
+
 export type AtlasEventJob =
+  | {
+      kind: 'conversation_turn' | 'conversation_summary' | 'contact';
+      action: 'create' | 'update' | 'delete';
+      sourceRef: string;
+      occurredAt: string;
+      summary: string;
+      accountId: string;
+      actors: AtlasEventActor[];
+      participants: AtlasEventParticipant[];
+      viewableBy: AtlasEventViewableBy;
+      payload?: Record<string, unknown>;
+    }
   | {
       type: 'message_sent';
       conversationId: string;
@@ -26,8 +54,16 @@ export type AtlasEventJob =
       summary: string;
     };
 
+/**
+ * Subset of {@link AtlasEventJob} for the Phase B `type`-discriminator variants.
+ * T-004b will migrate the listeners below to emit the new `kind`-discriminator
+ * envelope; until then `mapEvent` only returns this subtype, which lets the
+ * call sites in this file access `.type` / `.conversationId` without narrowing.
+ */
+type LegacyAtlasEventJob = Extract<AtlasEventJob, { type: string }>;
+
 interface MappedJob {
-  payload: AtlasEventJob;
+  payload: LegacyAtlasEventJob;
   jobId: string;
 }
 
