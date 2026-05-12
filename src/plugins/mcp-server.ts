@@ -3,6 +3,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { config } from '../config';
 import { verifyMcpRequest } from '../modules/atlas-mcp/auth';
 import { buildMcpServer } from '../modules/atlas-mcp/server';
+import type { AtlasRequestContext } from '../modules/atlas-mcp/tools';
 
 /**
  * Phase D.2 — MCP server route (`/mcp`).
@@ -25,6 +26,13 @@ import { buildMcpServer } from '../modules/atlas-mcp/server';
  * Phase B primitive (`verifyOutboundSignature`) so the on-wire format stays
  * Stripe-style (`t=<unix>,v1=<hex>`).
  *
+ * Identity (T-023): the write tools (`messaging.send_message`, `.assign`,
+ * `.resolve`) need to know which Atlas user fired the call so the handler can
+ * gate on `atlas_user_links` and stamp the `actors[].app_user_id` on the
+ * emitted envelope. We read `X-Atlas-App-User-Id` + `X-Atlas-Org-Id` headers
+ * here and pass them as `ctx` into `buildMcpServer`. If either is missing the
+ * write tools surface a `forbidden` tool error; read tools work either way.
+ *
  * Off by default: when `MCP_SERVER_ENABLED=false` the plugin registers no
  * route, so `/mcp` falls through to Fastify's default 404. The boot check in
  * `config.ts` already refuses to start with the flag on and no secret.
@@ -34,6 +42,19 @@ declare module 'fastify' {
   interface FastifyRequest {
     rawBody?: Buffer;
   }
+}
+
+function readSingleHeader(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) return value[0]?.trim() || undefined;
+  if (typeof value === 'string') return value.trim() || undefined;
+  return undefined;
+}
+
+function buildAtlasContext(req: FastifyRequest): AtlasRequestContext | undefined {
+  const atlasAppUserId = readSingleHeader(req.headers['x-atlas-app-user-id']);
+  const atlasOrgId = readSingleHeader(req.headers['x-atlas-org-id']);
+  if (!atlasAppUserId || !atlasOrgId) return undefined;
+  return { atlasAppUserId, atlasOrgId };
 }
 
 export async function mcpServerPlugin(app: FastifyInstance): Promise<void> {
@@ -88,7 +109,8 @@ export async function mcpServerPlugin(app: FastifyInstance): Promise<void> {
       },
     },
     async (req, reply) => {
-      const server = buildMcpServer(app.db);
+      const ctx = buildAtlasContext(req);
+      const server = buildMcpServer(app.db, app, ctx);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });

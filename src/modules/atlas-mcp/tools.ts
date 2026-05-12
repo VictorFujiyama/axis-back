@@ -404,15 +404,19 @@ export async function sendMessageHandler(
 // messaging.assign
 // ──────────────────────────────────────────────────────────────────────────────
 
-export const assignInputSchema = z
-  .object({
-    conversationId: uuid,
-    userId: uuid.nullable().optional(),
-    teamId: uuid.nullable().optional(),
-  })
-  .refine((v) => v.userId !== undefined || v.teamId !== undefined, {
-    message: 'assign: at least one of userId or teamId must be provided',
-  });
+// Split into a raw ZodObject + a refined ZodEffects so the MCP SDK can
+// register the raw shape (`assignInputObjectSchema.shape`) while runtime
+// validation still enforces the "at least one of userId/teamId" rule via
+// `assignInputSchema.parse()` at the server.ts wrapper.
+export const assignInputObjectSchema = z.object({
+  conversationId: uuid,
+  userId: uuid.nullable().optional(),
+  teamId: uuid.nullable().optional(),
+});
+export const assignInputSchema = assignInputObjectSchema.refine(
+  (v) => v.userId !== undefined || v.teamId !== undefined,
+  { message: 'assign: at least one of userId or teamId must be provided' },
+);
 export type AssignInput = z.infer<typeof assignInputSchema>;
 
 export interface AssignResult {
