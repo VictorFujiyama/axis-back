@@ -66,6 +66,10 @@ async function loadFreshModules(secret: string | undefined) {
   } else {
     vi.stubEnv('ATLAS_EVENTS_HMAC_SECRET', secret);
   }
+  // T-006 flipped USE_PHASE_12_ENVELOPE default to false; legacy cases below
+  // assert Phase 12 envelope shape, so stub the flag on. T-007 will reorganize
+  // the suite into nested describes per mode and add Phase B mirror cases.
+  vi.stubEnv('USE_PHASE_12_ENVELOPE', 'true');
   const eventBusModule = await import('../../../realtime/event-bus');
   const enqueueModule = await import('../enqueue');
   return {
