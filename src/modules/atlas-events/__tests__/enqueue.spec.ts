@@ -23,7 +23,8 @@ interface AppStub {
  * Mock `app.db.select().from(...).where(...).limit(...)` chain. Each call to
  * `.limit()` resolves to the next row-set in `rowSets`. The build-envelope
  * helpers issue: 1) conversation, 2) inbox, 3) message (for message.created),
- * or 1) conversation, 2) inbox (for handoff / resolved).
+ * or 1) conversation, 2) inbox (for handoff / resolved). Phase B legacy mapping
+ * does no DB lookup so rowSets is unused when envelopeMode='false'.
  */
 function makeDb(rowSets: Array<unknown[]>): DB {
   const limit = vi.fn();
@@ -53,10 +54,14 @@ function buildAppStub(rowSets: Array<unknown[]> = []): AppStub {
   return { app, queues: { getQueue, add }, log };
 }
 
-// Re-import config + enqueue module per-test so that `config.ATLAS_EVENTS_HMAC_SECRET`
-// reflects the current vi.stubEnv state (config.ts parses process.env at module
-// load time). Mirrors the loadFreshConfig pattern in src/__tests__/config.spec.ts.
-async function loadFreshModules(secret: string | undefined) {
+// Re-import config + enqueue per-test so config.ts (parsed at module load)
+// reflects the current vi.stubEnv state. `envelopeMode` toggles the Phase 12
+// envelope feature flag — describes pin it to 'true' (Phase 12 shape) or
+// 'false' (Phase B literal). Mode-agnostic cases inherit the default 'true'.
+async function loadFreshModules(
+  secret: string | undefined,
+  envelopeMode: 'true' | 'false' = 'true',
+) {
   vi.resetModules();
   if (secret === undefined) {
     vi.stubEnv('ATLAS_EVENTS_HMAC_SECRET', '');
@@ -66,10 +71,7 @@ async function loadFreshModules(secret: string | undefined) {
   } else {
     vi.stubEnv('ATLAS_EVENTS_HMAC_SECRET', secret);
   }
-  // T-006 flipped USE_PHASE_12_ENVELOPE default to false; legacy cases below
-  // assert Phase 12 envelope shape, so stub the flag on. T-007 will reorganize
-  // the suite into nested describes per mode and add Phase B mirror cases.
-  vi.stubEnv('USE_PHASE_12_ENVELOPE', 'true');
+  vi.stubEnv('USE_PHASE_12_ENVELOPE', envelopeMode);
   const eventBusModule = await import('../../../realtime/event-bus');
   const enqueueModule = await import('../enqueue');
   return {
@@ -123,6 +125,8 @@ describe('subscribeAtlasEvents', () => {
     vi.resetModules();
   });
 
+  // --- mode-agnostic cases: behavior identical across USE_PHASE_12_ENVELOPE ---
+
   it('does not subscribe when ATLAS_EVENTS_HMAC_SECRET is unset', async () => {
     const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined);
     const onEventSpy = vi.spyOn(eventBus, 'onEvent');
@@ -145,84 +149,6 @@ describe('subscribeAtlasEvents', () => {
     expect(queues.add).not.toHaveBeenCalled();
   });
 
-  it('enqueues conversation_turn envelope on message.created', async () => {
-    const { eventBus, subscribeAtlasEvents } = await loadFreshModules(VALID_SECRET);
-    const msgRow = {
-      id: 'msg-xyz',
-      conversationId: 'conv-abc',
-      senderType: 'contact',
-      senderId: 'contact-1',
-      content: 'hello world',
-      createdAt: new Date('2026-05-11T12:00:00Z'),
-    };
-    const { app, queues } = buildAppStub([[convRow], [inboxRow], [msgRow]]);
-
-    subscribeAtlasEvents(app);
-
-    expect(queues.getQueue).toHaveBeenCalledWith('atlas-events');
-
-    const event: RealtimeEvent = {
-      type: 'message.created',
-      inboxId: 'inbox-1',
-      conversationId: 'conv-abc',
-      message: makeMessage({
-        id: 'msg-xyz',
-        senderType: 'contact',
-        content: 'hello world',
-      }),
-    };
-    eventBus.emitEvent(event);
-    await flushMicrotasks();
-
-    expect(queues.add).toHaveBeenCalledTimes(1);
-    const [name, payload, opts] = queues.add.mock.calls[0]!;
-    expect(name).toBe('conversation_turn');
-    expect(payload).toMatchObject({
-      kind: 'conversation_turn',
-      action: 'create',
-      sourceRef: 'conv-abc:message_sent:msg-xyz',
-      accountId: 'account-1',
-      summary: 'contact: hello world',
-      actors: [{ kind: 'contact', id: 'contact-1' }],
-      viewableBy: { scope: 'org' },
-    });
-    expect(opts).toEqual({ jobId: 'conv-abc:message_sent:msg-xyz' });
-  });
-
-  it('enqueues handoff conversation_turn envelope when conversation.assigned has assignedBotId === null', async () => {
-    const { eventBus, subscribeAtlasEvents } = await loadFreshModules(VALID_SECRET);
-    const handoffConv = { ...convRow, id: 'conv-handoff' };
-    const { app, queues } = buildAppStub([[handoffConv], [inboxRow]]);
-
-    subscribeAtlasEvents(app);
-
-    const event: RealtimeEvent = {
-      type: 'conversation.assigned',
-      inboxId: 'inbox-1',
-      conversationId: 'conv-handoff',
-      assignedUserId: 'user-99',
-      assignedTeamId: null,
-      assignedBotId: null,
-    };
-    eventBus.emitEvent(event);
-    await flushMicrotasks();
-
-    expect(queues.add).toHaveBeenCalledTimes(1);
-    const [name, payload, opts] = queues.add.mock.calls[0]!;
-    expect(name).toBe('conversation_turn');
-    expect(payload).toMatchObject({
-      kind: 'conversation_turn',
-      action: 'update',
-      accountId: 'account-1',
-      summary: 'Handoff: bot → user',
-      actors: [],
-      viewableBy: { scope: 'org' },
-    });
-    const jobOpts = opts as { jobId: string };
-    expect(jobOpts.jobId).toMatch(/^conv-handoff:handoff:\d+$/);
-    expect((payload as { sourceRef: string }).sourceRef).toBe(jobOpts.jobId);
-  });
-
   it('does NOT enqueue when conversation.assigned has a non-null assignedBotId', async () => {
     const { eventBus, subscribeAtlasEvents } = await loadFreshModules(VALID_SECRET);
     const { app, queues } = buildAppStub();
@@ -243,33 +169,232 @@ describe('subscribeAtlasEvents', () => {
     expect(queues.add).not.toHaveBeenCalled();
   });
 
-  it('enqueues resolved conversation_turn envelope on conversation.resolved', async () => {
-    const { eventBus, subscribeAtlasEvents } = await loadFreshModules(VALID_SECRET);
-    const resolvedConv = { ...convRow, id: 'conv-res' };
-    const { app, queues } = buildAppStub([[resolvedConv], [inboxRow]]);
+  // --- envelope-shape cases ---
 
-    subscribeAtlasEvents(app);
+  describe('USE_PHASE_12_ENVELOPE=true', () => {
+    it('enqueues conversation_turn envelope on message.created', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(
+        VALID_SECRET,
+        'true',
+      );
+      const msgRow = {
+        id: 'msg-xyz',
+        conversationId: 'conv-abc',
+        senderType: 'contact',
+        senderId: 'contact-1',
+        content: 'hello world',
+        createdAt: new Date('2026-05-11T12:00:00Z'),
+      };
+      const { app, queues } = buildAppStub([[convRow], [inboxRow], [msgRow]]);
 
-    const event: RealtimeEvent = {
-      type: 'conversation.resolved',
-      inboxId: 'inbox-1',
-      conversationId: 'conv-res',
-      resolvedBy: 'user-1',
-    };
-    eventBus.emitEvent(event);
-    await flushMicrotasks();
+      subscribeAtlasEvents(app);
 
-    expect(queues.add).toHaveBeenCalledTimes(1);
-    const [name, payload, opts] = queues.add.mock.calls[0]!;
-    expect(name).toBe('conversation_turn');
-    expect(payload).toMatchObject({
-      kind: 'conversation_turn',
-      action: 'update',
-      sourceRef: 'conv-res:resolved',
-      accountId: 'account-1',
-      summary: 'Resolved',
-      actors: [],
+      expect(queues.getQueue).toHaveBeenCalledWith('atlas-events');
+
+      const event: RealtimeEvent = {
+        type: 'message.created',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-abc',
+        message: makeMessage({
+          id: 'msg-xyz',
+          senderType: 'contact',
+          content: 'hello world',
+        }),
+      };
+      eventBus.emitEvent(event);
+      await flushMicrotasks();
+
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [name, payload, opts] = queues.add.mock.calls[0]!;
+      expect(name).toBe('conversation_turn');
+      expect(payload).toMatchObject({
+        kind: 'conversation_turn',
+        action: 'create',
+        sourceRef: 'conv-abc:message_sent:msg-xyz',
+        accountId: 'account-1',
+        summary: 'contact: hello world',
+        actors: [{ kind: 'contact', id: 'contact-1' }],
+        viewableBy: { scope: 'org' },
+      });
+      expect(opts).toEqual({ jobId: 'conv-abc:message_sent:msg-xyz' });
     });
-    expect(opts).toEqual({ jobId: 'conv-res:resolved' });
+
+    it('enqueues handoff conversation_turn envelope when conversation.assigned has assignedBotId === null', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(
+        VALID_SECRET,
+        'true',
+      );
+      const handoffConv = { ...convRow, id: 'conv-handoff' };
+      const { app, queues } = buildAppStub([[handoffConv], [inboxRow]]);
+
+      subscribeAtlasEvents(app);
+
+      const event: RealtimeEvent = {
+        type: 'conversation.assigned',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-handoff',
+        assignedUserId: 'user-99',
+        assignedTeamId: null,
+        assignedBotId: null,
+      };
+      eventBus.emitEvent(event);
+      await flushMicrotasks();
+
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [name, payload, opts] = queues.add.mock.calls[0]!;
+      expect(name).toBe('conversation_turn');
+      expect(payload).toMatchObject({
+        kind: 'conversation_turn',
+        action: 'update',
+        accountId: 'account-1',
+        summary: 'Handoff: bot → user',
+        actors: [],
+        viewableBy: { scope: 'org' },
+      });
+      const jobOpts = opts as { jobId: string };
+      expect(jobOpts.jobId).toMatch(/^conv-handoff:handoff:\d+$/);
+      expect((payload as { sourceRef: string }).sourceRef).toBe(jobOpts.jobId);
+    });
+
+    it('enqueues resolved conversation_turn envelope on conversation.resolved', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(
+        VALID_SECRET,
+        'true',
+      );
+      const resolvedConv = { ...convRow, id: 'conv-res' };
+      const { app, queues } = buildAppStub([[resolvedConv], [inboxRow]]);
+
+      subscribeAtlasEvents(app);
+
+      const event: RealtimeEvent = {
+        type: 'conversation.resolved',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-res',
+        resolvedBy: 'user-1',
+      };
+      eventBus.emitEvent(event);
+      await flushMicrotasks();
+
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [name, payload, opts] = queues.add.mock.calls[0]!;
+      expect(name).toBe('conversation_turn');
+      expect(payload).toMatchObject({
+        kind: 'conversation_turn',
+        action: 'update',
+        sourceRef: 'conv-res:resolved',
+        accountId: 'account-1',
+        summary: 'Resolved',
+        actors: [],
+      });
+      expect(opts).toEqual({ jobId: 'conv-res:resolved' });
+    });
+  });
+
+  describe('USE_PHASE_12_ENVELOPE=false', () => {
+    it('enqueues Phase B message_sent legacy job on message.created', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(
+        VALID_SECRET,
+        'false',
+      );
+      const { app, queues } = buildAppStub();
+
+      subscribeAtlasEvents(app);
+
+      expect(queues.getQueue).toHaveBeenCalledWith('atlas-events');
+
+      const event: RealtimeEvent = {
+        type: 'message.created',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-abc',
+        message: makeMessage({
+          id: 'msg-xyz',
+          senderType: 'contact',
+          content: 'hello world',
+        }),
+      };
+      eventBus.emitEvent(event);
+      await flushMicrotasks();
+
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [name, payload, opts] = queues.add.mock.calls[0]!;
+      expect(name).toBe('message_sent');
+      expect(payload).toMatchObject({
+        type: 'message_sent',
+        conversationId: 'conv-abc',
+        messageId: 'msg-xyz',
+        summary: 'contact: hello world',
+      });
+      expect((payload as { occurredAt: string }).occurredAt).toMatch(
+        /^\d{4}-\d{2}-\d{2}T/,
+      );
+      expect(payload).not.toHaveProperty('kind');
+      expect(opts).toEqual({ jobId: 'conv-abc:message_sent:msg-xyz' });
+    });
+
+    it('enqueues Phase B handoff_to_human legacy job when conversation.assigned has assignedBotId === null', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(
+        VALID_SECRET,
+        'false',
+      );
+      const { app, queues } = buildAppStub();
+
+      subscribeAtlasEvents(app);
+
+      const event: RealtimeEvent = {
+        type: 'conversation.assigned',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-handoff',
+        assignedUserId: 'user-99',
+        assignedTeamId: null,
+        assignedBotId: null,
+      };
+      eventBus.emitEvent(event);
+      await flushMicrotasks();
+
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [name, payload, opts] = queues.add.mock.calls[0]!;
+      expect(name).toBe('handoff_to_human');
+      expect(payload).toMatchObject({
+        type: 'handoff_to_human',
+        conversationId: 'conv-handoff',
+        assignedUserId: 'user-99',
+        assignedTeamId: null,
+        summary: 'Handoff: bot → user',
+      });
+      expect(payload).not.toHaveProperty('kind');
+      const jobOpts = opts as { jobId: string };
+      expect(jobOpts.jobId).toMatch(/^conv-handoff:handoff:\d+$/);
+    });
+
+    it('enqueues Phase B conversation_resolved legacy job on conversation.resolved', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(
+        VALID_SECRET,
+        'false',
+      );
+      const { app, queues } = buildAppStub();
+
+      subscribeAtlasEvents(app);
+
+      const event: RealtimeEvent = {
+        type: 'conversation.resolved',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-res',
+        resolvedBy: 'user-1',
+      };
+      eventBus.emitEvent(event);
+      await flushMicrotasks();
+
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [name, payload, opts] = queues.add.mock.calls[0]!;
+      expect(name).toBe('conversation_resolved');
+      expect(payload).toMatchObject({
+        type: 'conversation_resolved',
+        conversationId: 'conv-res',
+        summary: 'Resolved',
+      });
+      expect(payload).not.toHaveProperty('messageId');
+      expect(payload).not.toHaveProperty('kind');
+      expect(opts).toEqual({ jobId: 'conv-res:resolved' });
+    });
   });
 });
