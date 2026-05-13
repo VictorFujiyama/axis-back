@@ -21,10 +21,12 @@ import type { AtlasRequestContext } from '../modules/atlas-mcp/tools';
  * content-type-parser override and `rawBody` decorator to this plugin's
  * subtree. Other routes (Twilio urlencoded, normal JSON APIs) are unaffected.
  *
- * Auth: shared HMAC (`X-Atlas-Signature`), verified against the raw request
- * bytes — Atlas-side signs the same string (L-408). The verifier reuses the
- * Phase B primitive (`verifyOutboundSignature`) so the on-wire format stays
- * Stripe-style (`t=<unix>,v1=<hex>`).
+ * Auth (Phase D Activation T-005): mode-aware. `verifyMcpRequest(req, config)`
+ * dispatches on `config.MCP_AUTH_MODE` — Bearer (`Authorization: Bearer <key>`),
+ * Phase B HMAC (`X-Atlas-Signature`, `verifyOutboundSignature` Stripe-style),
+ * or `both` (Bearer primary, HMAC fall-through only when the Authorization
+ * header is absent). See `modules/atlas-mcp/auth.ts` for the dispatch logic
+ * and L-507 for the constant-time Bearer compare.
  *
  * Identity (T-023): the write tools (`messaging.send_message`, `.assign`,
  * `.resolve`) need to know which Atlas user fired the call so the handler can
@@ -34,8 +36,9 @@ import type { AtlasRequestContext } from '../modules/atlas-mcp/tools';
  * write tools surface a `forbidden` tool error; read tools work either way.
  *
  * Off by default: when `MCP_SERVER_ENABLED=false` the plugin registers no
- * route, so `/mcp` falls through to Fastify's default 404. The boot check in
- * `config.ts` already refuses to start with the flag on and no secret.
+ * route, so `/mcp` falls through to Fastify's default 404. The boot precheck
+ * in `config.ts` (T-003) throws on misconfigured auth (e.g. mode='hmac' with
+ * no HMAC secret, or mode ∈ {bearer,both} with no API key).
  */
 
 declare module 'fastify' {
@@ -62,14 +65,8 @@ export async function mcpServerPlugin(app: FastifyInstance): Promise<void> {
     return;
   }
 
-  const secret = config.ATLAS_MCP_HMAC_SECRET;
-  if (!secret) {
-    // The boot check in `config.ts` should have caught this, but guard
-    // defensively: registering the route without a secret would 401 every
-    // request anyway.
-    app.log.warn('mcp-server: MCP_SERVER_ENABLED=true but no secret; skipping route');
-    return;
-  }
+  // Mode-aware auth gating now happens at boot via T-003 precheck (throws on
+  // misconfig). Plugin always registers when MCP_SERVER_ENABLED=true.
 
   // Body parsing fix (T-015a step 2): capture raw bytes for HMAC verification
   // while still exposing `request.body` as a parsed object for handler
@@ -97,12 +94,7 @@ export async function mcpServerPlugin(app: FastifyInstance): Promise<void> {
     '/mcp',
     {
       preHandler: async (req, reply) => {
-        const raw = req.rawBody?.toString('utf8') ?? '';
-        const result = verifyMcpRequest(
-          req.headers['x-atlas-signature'],
-          raw,
-          secret,
-        );
+        const result = verifyMcpRequest(req, config);
         if (!result.ok) {
           return reply.code(401).send({ error: result.error ?? 'unauthorized' });
         }
