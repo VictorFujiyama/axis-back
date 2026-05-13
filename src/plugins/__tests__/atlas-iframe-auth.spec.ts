@@ -21,6 +21,8 @@ interface SignOptions {
   iat?: number;
   exp?: number;
   secret?: string;
+  atlasAppUserId?: string;
+  atlasOrgId?: string;
 }
 
 // Minimal mirror of Atlas's signAxisIframeToken (apps/web/src/server/lib/
@@ -28,13 +30,19 @@ interface SignOptions {
 // here keeps the test honest about what bytes it accepts.
 function signTestToken(options: SignOptions = {}): string {
   const now = Math.floor(Date.now() / 1000);
-  const payload = {
+  const payload: Record<string, unknown> = {
     kind: options.kind ?? 'atlas-iframe',
     axis_user_id: options.axisUserId ?? TEST_USER_ID,
     axis_email: options.axisEmail ?? TEST_EMAIL,
     iat: options.iat ?? now,
     exp: options.exp ?? now + 5 * 60,
   };
+  if (options.atlasAppUserId !== undefined) {
+    payload.atlas_app_user_id = options.atlasAppUserId;
+  }
+  if (options.atlasOrgId !== undefined) {
+    payload.atlas_org_id = options.atlasOrgId;
+  }
   const secret = options.secret ?? TEST_SECRET;
   const headerB64 = toBase64Url(
     Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' }), 'utf8').toString('base64'),
@@ -339,5 +347,50 @@ describe('verifyAtlasIframeTokenWithSecret — pure verifier', () => {
     expect(
       verifyAtlasIframeTokenWithSecret('a.b.c.d', TEST_SECRET),
     ).toBeNull();
+  });
+});
+
+describe('verifyAtlasIframeTokenWithSecret — Phase D-Builtin atlas_app_user_id + atlas_org_id', () => {
+  // T-011: Atlas-side may attach `atlas_app_user_id` + `atlas_org_id` to the
+  // payload when the Clerk session carries an organization. Verifier must
+  // preserve both fields on the returned payload, treat the partial case as
+  // "neither" (backward compat for Phase 0 tokens), and never error on absence.
+  const ATLAS_APP_USER_ID = 'user_2abc123def456ghi';
+  const ATLAS_ORG_ID = 'aaaaaaaa-0000-4000-8000-000000000001';
+
+  it('returns both fields when the JWT carries them', async () => {
+    const { verifyAtlasIframeTokenWithSecret } = await import(
+      '../atlas-iframe-auth.js'
+    );
+    const token = signTestToken({
+      atlasAppUserId: ATLAS_APP_USER_ID,
+      atlasOrgId: ATLAS_ORG_ID,
+    });
+    const payload = verifyAtlasIframeTokenWithSecret(token, TEST_SECRET);
+    expect(payload).not.toBeNull();
+    expect(payload?.atlas_app_user_id).toBe(ATLAS_APP_USER_ID);
+    expect(payload?.atlas_org_id).toBe(ATLAS_ORG_ID);
+  });
+
+  it('omits both fields entirely when the JWT does not carry them', async () => {
+    const { verifyAtlasIframeTokenWithSecret } = await import(
+      '../atlas-iframe-auth.js'
+    );
+    const token = signTestToken();
+    const payload = verifyAtlasIframeTokenWithSecret(token, TEST_SECRET);
+    expect(payload).not.toBeNull();
+    expect(Object.prototype.hasOwnProperty.call(payload, 'atlas_app_user_id')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(payload, 'atlas_org_id')).toBe(false);
+  });
+
+  it('ignores both fields when only one of the pair is present (partial = invalid)', async () => {
+    const { verifyAtlasIframeTokenWithSecret } = await import(
+      '../atlas-iframe-auth.js'
+    );
+    const token = signTestToken({ atlasAppUserId: ATLAS_APP_USER_ID });
+    const payload = verifyAtlasIframeTokenWithSecret(token, TEST_SECRET);
+    expect(payload).not.toBeNull();
+    expect(Object.prototype.hasOwnProperty.call(payload, 'atlas_app_user_id')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(payload, 'atlas_org_id')).toBe(false);
   });
 });
