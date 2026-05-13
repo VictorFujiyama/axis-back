@@ -40,6 +40,7 @@ declare module 'fastify' {
   }
   interface FastifyRequest {
     atlasIframeUser?: AtlasIframeUser;
+    atlasIframePayload?: AtlasIframePayload;
   }
 }
 
@@ -161,6 +162,7 @@ async function plugin(app: FastifyInstance): Promise<void> {
       return reply.unauthorized('Invalid or missing token');
     }
     req.atlasIframeUser = { id: user.id, email: user.email };
+    req.atlasIframePayload = payload;
   });
 }
 
