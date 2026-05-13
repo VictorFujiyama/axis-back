@@ -6,12 +6,26 @@ import { EventEmitter } from 'node:events';
  * (see plan §12.2 — deferred to a future task).
  */
 
+/**
+ * Optional Atlas binding attached to events that originate from the MCP write
+ * path (Phase D T-021). Carries the Atlas requester identity through the in-
+ * process bus so the atlas-events listener can stamp `actors[].app_user_id`
+ * on the outbound envelope (Phase 12 §12.1 + L-403). Non-MCP emitters (Phase
+ * A/B/C handlers) leave this undefined — that is correct because those events
+ * originate from humans or non-Atlas bots.
+ */
+export interface RealtimeEventAtlasMeta {
+  atlasAppUserId?: string;
+  atlasOrgId?: string;
+}
+
 export type RealtimeEvent =
   | {
       type: 'message.created';
       inboxId: string;
       conversationId: string;
       message: RealtimeMessage;
+      meta?: RealtimeEventAtlasMeta;
     }
   | {
       type: 'conversation.created';
@@ -31,12 +45,14 @@ export type RealtimeEvent =
       assignedUserId: string | null;
       assignedTeamId: string | null;
       assignedBotId: string | null;
+      meta?: RealtimeEventAtlasMeta;
     }
   | {
       type: 'conversation.resolved';
       inboxId: string;
       conversationId: string;
       resolvedBy: string | null;
+      meta?: RealtimeEventAtlasMeta;
     }
   | {
       type: 'conversation.reopened';

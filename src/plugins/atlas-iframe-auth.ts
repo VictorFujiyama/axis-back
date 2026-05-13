@@ -24,6 +24,8 @@ export interface AtlasIframePayload {
   axis_email: string;
   iat: number;
   exp: number;
+  atlas_app_user_id?: string;
+  atlas_org_id?: string;
 }
 
 export interface AtlasIframeUser {
@@ -38,6 +40,7 @@ declare module 'fastify' {
   }
   interface FastifyRequest {
     atlasIframeUser?: AtlasIframeUser;
+    atlasIframePayload?: AtlasIframePayload;
   }
 }
 
@@ -98,13 +101,29 @@ export function verifyAtlasIframeTokenWithSecret(
   const now = Math.floor(Date.now() / 1000);
   if (p.exp < now) return null;
 
-  return {
+  // Phase D-Builtin: Atlas-side may attach `atlas_app_user_id` + `atlas_org_id`
+  // when the Clerk session carries an organization. We validate "both or neither"
+  // — a partial pair is treated as if neither were present (preserves Phase 0
+  // backward compat: tokens minted without extras continue to verify cleanly).
+  const result: AtlasIframePayload = {
     kind: 'atlas-iframe',
     axis_user_id: p.axis_user_id,
     axis_email: p.axis_email,
     iat: p.iat,
     exp: p.exp,
   };
+  const appUserId = p.atlas_app_user_id;
+  const orgId = p.atlas_org_id;
+  if (
+    typeof appUserId === 'string' &&
+    appUserId.length > 0 &&
+    typeof orgId === 'string' &&
+    orgId.length > 0
+  ) {
+    result.atlas_app_user_id = appUserId;
+    result.atlas_org_id = orgId;
+  }
+  return result;
 }
 
 async function plugin(app: FastifyInstance): Promise<void> {
@@ -143,6 +162,7 @@ async function plugin(app: FastifyInstance): Promise<void> {
       return reply.unauthorized('Invalid or missing token');
     }
     req.atlasIframeUser = { id: user.id, email: user.email };
+    req.atlasIframePayload = payload;
   });
 }
 

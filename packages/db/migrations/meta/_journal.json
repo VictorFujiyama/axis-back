@@ -190,6 +190,20 @@
       "when": 1777430361513,
       "tag": "0026_aromatic_stone_men",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1778608607526,
+      "tag": "0027_wealthy_legion",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1778610602861,
+      "tag": "0028_broad_umar",
+      "breakpoints": true
     }
   ]
 }

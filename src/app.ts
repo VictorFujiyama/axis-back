@@ -13,6 +13,7 @@ import jwtPlugin from './plugins/jwt';
 import atlasAuthPlugin from './plugins/atlas-auth';
 import atlasIframeAuthPlugin from './plugins/atlas-iframe-auth';
 import queuePlugin from './plugins/queue';
+import { mcpServerPlugin } from './plugins/mcp-server';
 import presencePlugin from './plugins/presence';
 import { registerWorkers } from './queue/workers';
 import { armGmailSchedulesOnBoot } from './queue/arm-gmail-schedules';
@@ -168,6 +169,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(atlasIframeAuthPlugin);
   await app.register(queuePlugin);
   await app.register(presencePlugin);
+
+  await app.register(mcpServerPlugin);
 
   // Register WebSocket plugin at root so multiple route plugins can declare WS endpoints.
   await app.register(websocket, {
