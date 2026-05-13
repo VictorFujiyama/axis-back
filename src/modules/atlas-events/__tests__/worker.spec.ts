@@ -116,7 +116,7 @@ describe('registerAtlasEventsWorker', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('signs the body and POSTs to the default Phase 12 connector endpoint on 2xx', async () => {
+  it('signs the body and POSTs to the default Phase B endpoint on 2xx (Phase D Activation default)', async () => {
     const { registerAtlasEventsWorker } = await loadFreshWorker(
       VALID_SECRET,
       VALID_BASE_URL,
@@ -133,7 +133,7 @@ describe('registerAtlasEventsWorker', () => {
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     const [url, init] = fetchImpl.mock.calls[0]!;
-    expect(url).toBe(`${VALID_BASE_URL}/api/connectors/messaging/events`);
+    expect(url).toBe(`${VALID_BASE_URL}/api/messaging/events`);
     expect((init as RequestInit).method).toBe('POST');
     const headers = (init as RequestInit).headers as Record<string, string>;
     expect(headers['Content-Type']).toBe('application/json');
@@ -257,7 +257,7 @@ describe('registerAtlasEventsWorker', () => {
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     const [url, init] = fetchImpl.mock.calls[0]!;
-    expect(url).toBe(`${VALID_BASE_URL}/api/connectors/messaging/events`);
+    expect(url).toBe(`${VALID_BASE_URL}/api/messaging/events`);
 
     const body = JSON.parse((init as RequestInit).body as string);
     expect(body).toEqual({
