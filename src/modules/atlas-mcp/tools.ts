@@ -307,7 +307,7 @@ async function requireAtlasUserLink(
   if (!row) {
     throw new MessagingToolError(
       'forbidden',
-      'no atlas_user_link for this Atlas user in this account',
+      'Atlas user not linked — open /messaging in Atlas web first to activate the link, then retry.',
     );
   }
 }
