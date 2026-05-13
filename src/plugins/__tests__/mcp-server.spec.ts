@@ -159,3 +159,81 @@ describe('mcp-server plugin — valid HMAC handshake (T-016)', () => {
     }
   });
 });
+
+describe('mcp-server plugin — Bearer auth (T-005)', () => {
+  const initBody = JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'initialize',
+    id: 1,
+    params: {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'mcp-server-spec', version: '0.0.0' },
+    },
+  });
+
+  describe('mode=both (default) — Bearer primary, HMAC fallback available', () => {
+    beforeEach(() => {
+      vi.stubEnv('MCP_SERVER_ENABLED', 'true');
+      vi.stubEnv('ATLAS_MCP_HMAC_SECRET', TEST_SECRET);
+      vi.stubEnv('MCP_AXIS_API_KEY', TEST_BEARER_KEY);
+      // MCP_AUTH_MODE defaults to 'both' per T-003.
+    });
+
+    it('lets a valid Bearer-authenticated initialize request through the transport (200)', async () => {
+      const app = await buildTestApp();
+      try {
+        const res = await app.inject({
+          method: 'POST',
+          url: '/mcp',
+          headers: {
+            'content-type': 'application/json',
+            accept: 'application/json, text/event-stream',
+            authorization: `Bearer ${TEST_BEARER_KEY}`,
+          },
+          payload: initBody,
+        });
+        // 200 proves the Bearer code path: preHandler took the Bearer branch
+        // (Authorization present), constant-time-matched the key, and let the
+        // transport handle the handshake. No X-Atlas-Signature header on this
+        // request — HMAC was never consulted.
+        expect(res.statusCode).toBe(200);
+      } finally {
+        await app.close();
+      }
+    });
+  });
+
+  describe('mode=bearer pure — no HMAC secret required', () => {
+    beforeEach(() => {
+      vi.stubEnv('MCP_SERVER_ENABLED', 'true');
+      vi.stubEnv('MCP_AUTH_MODE', 'bearer');
+      vi.stubEnv('MCP_AXIS_API_KEY', TEST_BEARER_KEY);
+      // ATLAS_MCP_HMAC_SECRET deliberately unset — T-003 precheck allows this
+      // for mode='bearer' (HMAC explicitly not used).
+    });
+
+    it('boots the plugin without ATLAS_MCP_HMAC_SECRET and accepts a valid Bearer (200)', async () => {
+      const app = await buildTestApp();
+      try {
+        const res = await app.inject({
+          method: 'POST',
+          url: '/mcp',
+          headers: {
+            'content-type': 'application/json',
+            accept: 'application/json, text/event-stream',
+            authorization: `Bearer ${TEST_BEARER_KEY}`,
+          },
+          payload: initBody,
+        });
+        // 200 here is the activation-story guarantee: with the HMAC secret
+        // unset, the old gate at the top of `mcpServerPlugin` would have
+        // early-returned and given a 404. T-005 removed that gate; boot
+        // misconfig handling now lives entirely in `config.ts` T-003 precheck.
+        expect(res.statusCode).toBe(200);
+      } finally {
+        await app.close();
+      }
+    });
+  });
+});

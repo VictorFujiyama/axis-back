@@ -21,7 +21,7 @@ export interface McpAuthConfig {
 }
 
 /**
- * Inbound MCP auth (Phase D Activation T-004).
+ * Inbound MCP auth (Phase D Activation T-004 / T-005).
  *
  * Mode-aware dispatch via `config.MCP_AUTH_MODE`:
  *   - 'bearer': `Authorization: Bearer <key>` only.
@@ -34,49 +34,11 @@ export interface McpAuthConfig {
  * Bearer comparison is constant-time (`crypto.timingSafeEqual`, see L-507).
  * HMAC delegates to the Phase B primitive (`verifyOutboundSignature`,
  * L-104 / L-408).
- *
- * The legacy 3-arg signature is retained as an overload so the still-pending
- * plugin call-site (T-005) compiles. Both the overload and the
- * `verifyHmacOnly` helper below are removed in T-005 once the plugin has
- * migrated.
  */
 export function verifyMcpRequest(
   req: FastifyRequest,
   config: McpAuthConfig,
-): VerifyMcpResult;
-export function verifyMcpRequest(
-  signatureHeader: string | string[] | undefined,
-  rawBody: string,
-  secret: string,
-): VerifyMcpResult;
-export function verifyMcpRequest(
-  a: FastifyRequest | string | string[] | undefined,
-  b: McpAuthConfig | string,
-  c?: string,
 ): VerifyMcpResult {
-  if (c !== undefined || typeof b === 'string') {
-    return verifyHmacOnly(a as string | string[] | undefined, b as string, c as string);
-  }
-  return verifyWithMode(a as FastifyRequest, b as McpAuthConfig);
-}
-
-// Legacy HMAC-only shim — retired by T-005.
-function verifyHmacOnly(
-  signatureHeader: string | string[] | undefined,
-  rawBody: string,
-  secret: string,
-): VerifyMcpResult {
-  const headerValue = Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader;
-  if (!headerValue) {
-    return { ok: false, error: 'missing X-Atlas-Signature header' };
-  }
-  if (!verifyOutboundSignature(headerValue, rawBody, secret)) {
-    return { ok: false, error: 'invalid signature' };
-  }
-  return { ok: true };
-}
-
-function verifyWithMode(req: FastifyRequest, config: McpAuthConfig): VerifyMcpResult {
   const mode = config.MCP_AUTH_MODE;
 
   if (mode === 'bearer') {
