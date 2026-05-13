@@ -55,14 +55,20 @@ export function verifyMcpRequest(
 }
 
 /**
- * Returns `null` when no `Authorization: Bearer <…>` header is present —
- * the signal in mode='both' to fall through to HMAC. Returns a non-null
- * result when the header IS present (ok=true for valid, ok=false otherwise).
+ * Returns `null` when no `Authorization` header is present — the signal
+ * in mode='both' to fall through to HMAC. Returns a non-null result when
+ * the header IS present (ok=true for valid, ok=false otherwise).
+ *
+ * Phase 11 compat (L-510): Phase 11 `@atlas/mcp` `resolveHeaders` substitui
+ * `{ref:"env://VAR"}` por VALOR LITERAL do env, sem concatenar prefix.
+ * Resultado: Atlas envia `Authorization: <key>` (sem `Bearer ` prefix).
+ * Aceitamos AMBOS — `Authorization: Bearer <key>` (RFC 6750) E `Authorization: <key>`
+ * (Phase 11 raw value) — pra compat sem patch Atlas-side.
  */
 function tryBearerAuth(req: FastifyRequest, config: McpAuthConfig): VerifyMcpResult | null {
   const raw = req.headers['authorization'];
   const value = Array.isArray(raw) ? raw[0] : raw;
-  if (!value || !value.startsWith('Bearer ')) return null;
+  if (!value) return null;
 
   const expected = config.MCP_AXIS_API_KEY;
   if (!expected) {
@@ -71,7 +77,8 @@ function tryBearerAuth(req: FastifyRequest, config: McpAuthConfig): VerifyMcpRes
     return { ok: false, error: 'bearer auth not configured' };
   }
 
-  const received = value.slice('Bearer '.length);
+  // Strip 'Bearer ' prefix if present; otherwise treat full value as token.
+  const received = value.startsWith('Bearer ') ? value.slice('Bearer '.length) : value;
   const aBuf = Buffer.from(received, 'utf8');
   const bBuf = Buffer.from(expected, 'utf8');
   if (aBuf.length !== bBuf.length) {
