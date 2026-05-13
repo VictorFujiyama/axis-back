@@ -48,7 +48,8 @@ afterEach(() => {
 
 describe('mcp-server plugin — disabled by default (T-015a)', () => {
   it('returns 404 when MCP_SERVER_ENABLED=false', async () => {
-    // Default config: MCP_SERVER_ENABLED unset → false. No secret needed.
+    // Stub explicit pra evitar dependência de .env local que pode ter MCP_SERVER_ENABLED=true (smoke setup).
+    vi.stubEnv('MCP_SERVER_ENABLED', 'false');
     const app = await buildTestApp();
     try {
       const res = await app.inject({
