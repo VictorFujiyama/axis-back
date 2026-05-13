@@ -26,6 +26,8 @@ interface SignOptions {
   iat?: number;
   exp?: number;
   secret?: string;
+  atlasAppUserId?: string;
+  atlasOrgId?: string;
 }
 
 function toBase64Url(b64: string): string {
@@ -36,13 +38,19 @@ function toBase64Url(b64: string): string {
 // atlas-company-os) — keeps the test honest about what bytes axis-back accepts.
 function signTestToken(options: SignOptions = {}): string {
   const now = Math.floor(Date.now() / 1000);
-  const payload = {
+  const payload: Record<string, unknown> = {
     kind: options.kind ?? 'atlas-iframe',
     axis_user_id: options.axisUserId ?? TEST_USER_ID,
     axis_email: options.axisEmail ?? TEST_EMAIL,
     iat: options.iat ?? now,
     exp: options.exp ?? now + 5 * 60,
   };
+  if (options.atlasAppUserId !== undefined) {
+    payload.atlas_app_user_id = options.atlasAppUserId;
+  }
+  if (options.atlasOrgId !== undefined) {
+    payload.atlas_org_id = options.atlasOrgId;
+  }
   const secret = options.secret ?? TEST_SECRET;
   const headerB64 = toBase64Url(
     Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' }), 'utf8').toString('base64'),
@@ -61,11 +69,17 @@ interface AppBuildOptions {
   // selects: (1) preHandler resolves the user, (2) the route refetches the
   // user record for response fields, (3) account memberships for the response.
   selectRows?: unknown[][];
+  // When set, the atlas_user_links onConflictDoNothing() will reject with this
+  // error. Used to verify the upsert is non-blocking.
+  insertReject?: unknown;
 }
 
 interface AppBuildResult {
   app: FastifyInstance;
   redisSet: ReturnType<typeof vi.fn>;
+  insertSpy: ReturnType<typeof vi.fn>;
+  valuesSpy: ReturnType<typeof vi.fn>;
+  onConflictSpy: ReturnType<typeof vi.fn>;
 }
 
 async function buildTestApp(options: AppBuildOptions = {}): Promise<AppBuildResult> {
@@ -103,7 +117,16 @@ async function buildTestApp(options: AppBuildOptions = {}): Promise<AppBuildResu
       Promise.resolve(rows).then(resolve, reject);
     return chain;
   });
-  app.decorate('db', { select } as unknown as FastifyInstance['db']);
+  // Mock the atlas_user_links upsert chain: insert(table).values(row).onConflictDoNothing().
+  const onConflictSpy = options.insertReject
+    ? vi.fn().mockRejectedValue(options.insertReject)
+    : vi.fn().mockResolvedValue(undefined);
+  const valuesSpy = vi.fn().mockReturnValue({ onConflictDoNothing: onConflictSpy });
+  const insertSpy = vi.fn().mockReturnValue({ values: valuesSpy });
+  app.decorate(
+    'db',
+    { select, insert: insertSpy } as unknown as FastifyInstance['db'],
+  );
 
   // issueRefreshTokenWithUser writes one key via app.redis.set.
   const redisSet = vi.fn().mockResolvedValue('OK');
@@ -111,7 +134,7 @@ async function buildTestApp(options: AppBuildOptions = {}): Promise<AppBuildResu
 
   await app.register(authRoutes);
   await app.ready();
-  return { app, redisSet };
+  return { app, redisSet, insertSpy, valuesSpy, onConflictSpy };
 }
 
 beforeAll(() => {
@@ -421,6 +444,108 @@ describe('POST /api/auth/exchange-iframe-token — does NOT use X-API-Key', () =
         // Note: no `x-api-key` header.
         payload: { atlas_token: token },
       });
+      expect(res.statusCode).toBe(200);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+// T-012: Phase D-Builtin — when the JWT carries atlas_app_user_id +
+// atlas_org_id, the handler UPSERTs an atlas_user_links row so subsequent
+// MCP write tools can resolve Atlas user → Axis user. The plugin's verifier
+// enforces "both or neither" (see atlas-iframe-auth.ts), so the upsert
+// branch only fires when both fields are non-empty strings.
+describe('POST /api/auth/exchange-iframe-token — atlas_user_links upsert (T-012)', () => {
+  const TEST_CLERK_USER_ID = 'user_2abcDEF1234567890';
+  const TEST_ATLAS_ORG_ID = 'org-uuid-' + 'a'.repeat(24);
+
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+    vi.stubEnv('AXIS_JWT_SECRET', TEST_SECRET);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('UPSERTs atlas_user_links when the JWT carries both Atlas ids', async () => {
+    const { app, insertSpy, valuesSpy, onConflictSpy } = await buildTestApp({
+      selectRows: [
+        [{ id: TEST_USER_ID, email: TEST_EMAIL, deletedAt: null }],
+        [DEFAULT_USER_ROW],
+        [DEFAULT_MEMBERSHIP_ROW],
+      ],
+    });
+    try {
+      const token = signTestToken({
+        atlasAppUserId: TEST_CLERK_USER_ID,
+        atlasOrgId: TEST_ATLAS_ORG_ID,
+      });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/auth/exchange-iframe-token',
+        payload: { atlas_token: token },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(insertSpy).toHaveBeenCalledTimes(1);
+      expect(valuesSpy).toHaveBeenCalledWith({
+        accountId: TEST_ACCOUNT_ID,
+        axisUserId: TEST_USER_ID,
+        atlasAppUserId: TEST_CLERK_USER_ID,
+        atlasOrgId: TEST_ATLAS_ORG_ID,
+      });
+      expect(onConflictSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('skips the UPSERT when the JWT has no Atlas ids (Phase 0 backward compat)', async () => {
+    const { app, insertSpy, onConflictSpy } = await buildTestApp({
+      selectRows: [
+        [{ id: TEST_USER_ID, email: TEST_EMAIL, deletedAt: null }],
+        [DEFAULT_USER_ROW],
+        [DEFAULT_MEMBERSHIP_ROW],
+      ],
+    });
+    try {
+      const token = signTestToken();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/auth/exchange-iframe-token',
+        payload: { atlas_token: token },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(insertSpy).not.toHaveBeenCalled();
+      expect(onConflictSpy).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('returns 200 when atlas_user_links upsert fails (non-blocking)', async () => {
+    const { app, onConflictSpy } = await buildTestApp({
+      selectRows: [
+        [{ id: TEST_USER_ID, email: TEST_EMAIL, deletedAt: null }],
+        [DEFAULT_USER_ROW],
+        [DEFAULT_MEMBERSHIP_ROW],
+      ],
+      insertReject: new Error('simulated db failure'),
+    });
+    try {
+      const token = signTestToken({
+        atlasAppUserId: TEST_CLERK_USER_ID,
+        atlasOrgId: TEST_ATLAS_ORG_ID,
+      });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/auth/exchange-iframe-token',
+        payload: { atlas_token: token },
+      });
+      // Upsert was attempted, but failure must not block the SSO exchange.
+      expect(onConflictSpy).toHaveBeenCalledTimes(1);
       expect(res.statusCode).toBe(200);
     } finally {
       await app.close();

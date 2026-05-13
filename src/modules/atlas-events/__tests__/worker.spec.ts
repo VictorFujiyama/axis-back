@@ -34,12 +34,14 @@ function buildAppStub(): AppStub {
 }
 
 // `src/config.ts` parses process.env at module-load time, and worker.ts reads
-// `config.ATLAS_BASE_URL`/`config.ATLAS_EVENTS_HMAC_SECRET` at handler
-// invocation. Reset modules + restub env per test so each case sees a freshly
-// parsed config. Mirrors loadFreshModules in enqueue.spec.ts.
+// `config.ATLAS_BASE_URL`/`config.ATLAS_EVENTS_HMAC_SECRET`/
+// `config.ATLAS_EVENTS_ENDPOINT` at handler invocation. Reset modules + restub
+// env per test so each case sees a freshly parsed config. Mirrors
+// loadFreshModules in enqueue.spec.ts.
 async function loadFreshWorker(
   secret: string | undefined,
   baseUrl: string | undefined,
+  endpoint?: string,
 ) {
   vi.resetModules();
   if (secret === undefined) {
@@ -53,6 +55,11 @@ async function loadFreshWorker(
     delete process.env.ATLAS_BASE_URL;
   } else {
     vi.stubEnv('ATLAS_BASE_URL', baseUrl);
+  }
+  if (endpoint !== undefined) {
+    vi.stubEnv('ATLAS_EVENTS_ENDPOINT', endpoint);
+  } else {
+    delete process.env.ATLAS_EVENTS_ENDPOINT;
   }
   const mod = await import('../worker');
   return { registerAtlasEventsWorker: mod.registerAtlasEventsWorker };
@@ -109,7 +116,7 @@ describe('registerAtlasEventsWorker', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('signs the body and POSTs to /api/messaging/events on 2xx', async () => {
+  it('signs the body and POSTs to the default Phase B endpoint on 2xx (Phase D Activation default)', async () => {
     const { registerAtlasEventsWorker } = await loadFreshWorker(
       VALID_SECRET,
       VALID_BASE_URL,
@@ -210,6 +217,101 @@ describe('registerAtlasEventsWorker', () => {
     await expect(handler(makeJob())).rejects.toBe(abortErr);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(log.warn).toHaveBeenCalled();
+  });
+
+  it('serializes Phase 12 kind-envelope to snake_case wire shape and POSTs to default endpoint', async () => {
+    const { registerAtlasEventsWorker } = await loadFreshWorker(
+      VALID_SECRET,
+      VALID_BASE_URL,
+    );
+    const { app, queues, log } = buildAppStub();
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(new Response('', { status: 202 }));
+
+    registerAtlasEventsWorker(app, { fetchImpl });
+    const handler = captureHandler(queues.registerWorker);
+
+    const envelopeJob: { id: string; data: AtlasEventJob } = {
+      id: 'job-env-1',
+      data: {
+        kind: 'conversation_turn',
+        action: 'create',
+        sourceRef: 'conv-abc:message_sent:msg-xyz',
+        occurredAt: '2026-05-12T08:00:00.000Z',
+        summary: 'contact: hello there',
+        accountId: 'acct-1',
+        actors: [
+          { kind: 'bot', id: 'bot-1', appUserId: 'clerk_user_42' },
+        ],
+        participants: [
+          { kind: 'contact', id: 'cont-1' },
+          { kind: 'user', id: 'user-1' },
+        ],
+        viewableBy: { scope: 'org' },
+        payload: { conversationId: 'conv-abc', messageId: 'msg-xyz' },
+      },
+    };
+
+    await handler(envelopeJob);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toBe(`${VALID_BASE_URL}/api/messaging/events`);
+
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body).toEqual({
+      kind: 'conversation_turn',
+      action: 'create',
+      source_ref: 'conv-abc:message_sent:msg-xyz',
+      occurred_at: '2026-05-12T08:00:00.000Z',
+      summary: 'contact: hello there',
+      account_id: 'acct-1',
+      actors: [
+        { kind: 'bot', id: 'bot-1', app_user_id: 'clerk_user_42' },
+      ],
+      participants: [
+        { kind: 'contact', id: 'cont-1' },
+        { kind: 'user', id: 'user-1' },
+      ],
+      viewable_by: { scope: 'org' },
+      payload: { conversationId: 'conv-abc', messageId: 'msg-xyz' },
+    });
+
+    const headers = (init as RequestInit).headers as Record<string, string>;
+    expect(headers['X-Atlas-Signature']).toMatch(/^t=\d+,v1=[a-f0-9]{64}$/);
+
+    expect(log.info).toHaveBeenCalled();
+    const lastInfo = log.info.mock.calls.at(-1)![0];
+    expect(lastInfo).toMatchObject({
+      jobId: 'job-env-1',
+      jobKind: 'conversation_turn',
+      jobAction: 'create',
+      sourceRef: 'conv-abc:message_sent:msg-xyz',
+      accountId: 'acct-1',
+      status: 202,
+    });
+  });
+
+  it('honors ATLAS_EVENTS_ENDPOINT override to roll back to the Phase B endpoint', async () => {
+    const { registerAtlasEventsWorker } = await loadFreshWorker(
+      VALID_SECRET,
+      VALID_BASE_URL,
+      '/api/messaging/events',
+    );
+    const { app, queues } = buildAppStub();
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(new Response('', { status: 202 }));
+
+    registerAtlasEventsWorker(app, { fetchImpl });
+    const handler = captureHandler(queues.registerWorker);
+
+    await handler(makeJob());
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url] = fetchImpl.mock.calls[0]!;
+    expect(url).toBe(`${VALID_BASE_URL}/api/messaging/events`);
   });
 
   it('logs warn and returns (no throw, no fetch) when ATLAS_BASE_URL is unset mid-job', async () => {

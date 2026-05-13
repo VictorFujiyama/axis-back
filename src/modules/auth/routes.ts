@@ -561,6 +561,33 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       // multi-account picker, so always pick the first membership. Multi-account
       // selection inside the Atlas iframe is a V2 concern.
       const membership = accountMemberships[0]!;
+
+      // Phase D-Builtin: when the Atlas-minted JWT carries Clerk session ids,
+      // record the mapping in atlas_user_links so subsequent MCP write tools
+      // can resolve Atlas user → Axis user. "both or neither" invariant is
+      // enforced by the verifier (see atlas-iframe-auth.ts), so checking one
+      // field is enough. Non-blocking: a DB hiccup must not break the SSO
+      // exchange — the link can re-upsert on the next iframe load.
+      const atlasPayload = req.atlasIframePayload;
+      if (atlasPayload?.atlas_app_user_id && atlasPayload.atlas_org_id) {
+        try {
+          await app.db
+            .insert(schema.atlasUserLinks)
+            .values({
+              accountId: membership.accountId,
+              axisUserId: user.id,
+              atlasAppUserId: atlasPayload.atlas_app_user_id,
+              atlasOrgId: atlasPayload.atlas_org_id,
+            })
+            .onConflictDoNothing();
+        } catch (err) {
+          app.log.warn(
+            { err },
+            '[exchange-iframe-token] atlas_user_links upsert failed (non-blocking)',
+          );
+        }
+      }
+
       const accessToken = signAccessToken(app, {
         sub: user.id,
         email: user.email,
