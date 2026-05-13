@@ -20,6 +20,7 @@ import { signOutboundPayload } from '../../modules/webhooks/sign';
 // `process.env` at module load time).
 
 const TEST_SECRET = 'test-mcp-hmac-secret-' + 'a'.repeat(32);
+const TEST_BEARER_KEY = 'test-mcp-bearer-key-' + 'b'.repeat(32);
 
 async function buildTestApp(): Promise<FastifyInstance> {
   vi.resetModules();
@@ -67,6 +68,10 @@ describe('mcp-server plugin — invalid HMAC (T-015a)', () => {
   beforeEach(() => {
     vi.stubEnv('MCP_SERVER_ENABLED', 'true');
     vi.stubEnv('ATLAS_MCP_HMAC_SECRET', TEST_SECRET);
+    // T-003: default MCP_AUTH_MODE='both' requires MCP_AXIS_API_KEY at boot.
+    // These cases still exercise the HMAC fallback (no Authorization header
+    // in the request → Bearer check returns null → falls through to HMAC).
+    vi.stubEnv('MCP_AXIS_API_KEY', TEST_BEARER_KEY);
   });
 
   it('returns 401 when X-Atlas-Signature is missing', async () => {
@@ -113,6 +118,7 @@ describe('mcp-server plugin — valid HMAC handshake (T-016)', () => {
   beforeEach(() => {
     vi.stubEnv('MCP_SERVER_ENABLED', 'true');
     vi.stubEnv('ATLAS_MCP_HMAC_SECRET', TEST_SECRET);
+    vi.stubEnv('MCP_AXIS_API_KEY', TEST_BEARER_KEY);
   });
 
   it('lets a valid HMAC-signed initialize request through the transport (200)', async () => {
