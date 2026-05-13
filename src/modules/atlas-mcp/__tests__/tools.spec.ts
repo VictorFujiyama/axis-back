@@ -313,7 +313,11 @@ describe('sendMessageHandler', () => {
     );
 
     await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
-    await expect(promise).rejects.toMatchObject({ code: 'forbidden' });
+    await expect(promise).rejects.toMatchObject({
+      code: 'forbidden',
+      message:
+        'Atlas user not linked — open /messaging in Atlas web first to activate the link, then retry.',
+    });
     expect(emitSpy).not.toHaveBeenCalled();
   });
 });
