@@ -1,5 +1,13 @@
 # Changelog
 
+## Phase D Builtin — Auto-provision atlas_user_links via Phase 0 SSO — 2026-05-13
+
+- `atlas_user_links` is now auto-populated for every Atlas user that loads `/messaging` — no SQL INSERT, no admin UI, no support ticket. The Atlas-side `signAxisIframeToken` (Phase 0 SSO mint path) now embeds `atlas_app_user_id` (Clerk user id) + `atlas_org_id` (Atlas org UUID resolved via `getOrCreateUserOrg`) when both are present, and the axis-back `verifyAtlasIframeTokenWithSecret` round-trips them through the JWT verify step. The `/api/auth/exchange-iframe-token` handler then `INSERT ... ON CONFLICT DO NOTHING` on `(accountId, atlasOrgId, atlasAppUserId)` so the link row exists before the user's next MCP tool call. The very first iframe load is the implicit provisioning event.
+- "Both or neither" invariant on the JWT (`src/plugins/atlas-iframe-auth.ts` verifier): if only one of `atlas_app_user_id` / `atlas_org_id` is present (or either is empty), both are dropped from the returned shape. Phase 0 SSO tokens without either field continue to verify cleanly (backward compat — see L-518). Validation is `typeof === 'string' && length > 0` only; `atlas_user_links.atlasOrgId` is `text` not `uuid`, so no UUID shape check.
+- UPSERT is non-blocking: a DB error during `exchange-iframe-token` is logged via `app.log.warn` and the response still returns 200. The link is idempotent on the unique constraint, so the next iframe load retries naturally.
+- `requireAtlasUserLink` error string in `src/modules/atlas-mcp/tools.ts` rewritten from the internal-sounding "no atlas_user_link for this Atlas user in this account" to the actionable "Atlas user not linked — open /messaging in Atlas web first to activate the link, then retry." The string bubbles through `MessagingToolError → MCP transport JSON → Atlas chat`, so end users see the fix path verbatim. The pre-existing `tools.spec.ts` case was strengthened to pin the exact wording.
+- `FastifyRequest` interface gained `atlasIframePayload?: AtlasIframePayload`; the `requireAtlasIframeAuth` decorator now sets `req.atlasIframePayload = payload` alongside the existing `atlasIframeUser` decoration so downstream handlers can read both ids without re-decoding. Existing callers that only read `atlasIframeUser` are unaffected.
+
 ## Phase D Activation — Bearer auth + envelope feature flag — 2026-05-12
 
 - Bearer token auth via `MCP_AXIS_API_KEY` env (Phase 11 Atlas-side `mcp_servers.headers` compat — `{"Authorization":{"ref":"env://MCP_AXIS_API_KEY"}}`). `verifyMcpRequest` validates `Authorization: Bearer <hex>` with `crypto.timingSafeEqual` after a length-equal early-return (see L-507) — constant-time compare prevents byte-by-byte timing attacks on the static token.
