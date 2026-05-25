@@ -74,6 +74,10 @@ function eventRoom(e: RealtimeEvent): string[] {
       return [`conversation:${e.conversationId}`, `inbox:${e.inboxId}`];
     case 'presence.update':
       return [`account:${e.accountId}`];
+    case 'contact.created':
+      // Consumed only by the atlas-events listener; the agent socket drops it
+      // before this is reached. [] keeps the switch exhaustive (noImplicitReturns).
+      return [];
   }
 }
 
@@ -197,6 +201,9 @@ export async function realtimeRoutes(app: FastifyInstance): Promise<void> {
         setImmediate(() => send(event));
         return;
       }
+      // contact.created is account-scoped (no inboxId) and consumed only by the
+      // atlas-events listener — drop here, before the inbox ACL check.
+      if (event.type === 'contact.created') return;
       if (!canAccessInbox(ctx, event.inboxId)) return;
       const rooms = eventRoom(event);
       const matches = rooms.some((r) => ctx.rooms.has(r));

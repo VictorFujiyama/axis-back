@@ -204,6 +204,13 @@
       "when": 1778610602861,
       "tag": "0028_broad_umar",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1779719730291,
+      "tag": "0029_slow_fenris",
+      "breakpoints": true
     }
   ]
 }

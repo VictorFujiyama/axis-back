@@ -97,6 +97,20 @@ export type RealtimeEvent =
       accountId: string;
       users: Record<string, 'online' | 'busy' | 'offline'>;
       contacts: Record<string, 'online'>;
+    }
+  | {
+      /**
+       * A CRM contact was created or updated. Account-scoped (carries
+       * `accountId`, no `inboxId`) so the atlas-events listener can drop events
+       * from accounts other than the connector's source account (anti-leak P0,
+       * spec §10b). `contact` carries the record the `buildContactEvent` builder
+       * keys off (T-006). Realtime sockets drop it — the front has no
+       * `contact.created` handler and CRM rows must never leak to widget
+       * visitors.
+       */
+      type: 'contact.created';
+      accountId: string;
+      contact: RealtimeContact;
     };
 
 export interface RealtimeMessage {
@@ -131,6 +145,14 @@ export interface RealtimeConversation {
   assignedBotId: string | null;
   lastMessageAt: Date | null;
   updatedAt: Date;
+}
+
+export interface RealtimeContact {
+  id: string;
+  name: string | null;
+  email: string | null;
+  phone: string | null;
+  createdAt: Date;
 }
 
 class TypedEmitter extends EventEmitter {

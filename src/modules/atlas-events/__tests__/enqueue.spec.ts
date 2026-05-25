@@ -1,11 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { DB } from '@blossom/db';
+import type { ConnectorEvent } from '@atlas/connectors';
 
 import type {
   RealtimeEvent,
   RealtimeMessage,
 } from '../../../realtime/event-bus';
+
+// Mock the T-004a builders: the connector-path tests verify listener WIRING
+// (routing, account filter, dual-emit), not envelope shape — that is covered by
+// build-connector-event.spec.ts (T-004b). The mocks let us drive a known
+// `ConnectorEvent` (and its `metadata.accountId`) without DB fixtures.
+const builderMocks = vi.hoisted(() => ({
+  buildConversationTurnEvent: vi.fn(),
+  buildConversationSummaryEvent: vi.fn(),
+  buildHandoffEvent: vi.fn(),
+  buildContactEvent: vi.fn(),
+}));
+vi.mock('../build-connector-event', () => builderMocks);
 
 interface AppStub {
   app: FastifyInstance;
@@ -58,9 +71,15 @@ function buildAppStub(rowSets: Array<unknown[]> = []): AppStub {
 // reflects the current vi.stubEnv state. `envelopeMode` toggles the Phase 12
 // envelope feature flag — describes pin it to 'true' (Phase 12 shape) or
 // 'false' (Phase B literal). Mode-agnostic cases inherit the default 'true'.
+interface ConnectorEnv {
+  enabled: boolean;
+  dualEmit?: boolean;
+}
+
 async function loadFreshModules(
   secret: string | undefined,
   envelopeMode: 'true' | 'false' = 'true',
+  connector?: ConnectorEnv,
 ) {
   vi.resetModules();
   if (secret === undefined) {
@@ -72,6 +91,20 @@ async function loadFreshModules(
     vi.stubEnv('ATLAS_EVENTS_HMAC_SECRET', secret);
   }
   vi.stubEnv('USE_PHASE_12_ENVELOPE', envelopeMode);
+  if (connector?.enabled) {
+    // All four are required by config.ts's boot precheck when the connector is
+    // on — stub them or importing config throws.
+    vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'true');
+    vi.stubEnv('ATLAS_URL', CONNECTOR_URL);
+    vi.stubEnv('ATLAS_ORG_ID', ORG_ID);
+    vi.stubEnv('ATLAS_HMAC_SECRET', HMAC_SECRET);
+    vi.stubEnv('ATLAS_SOURCE_ACCOUNT_ID', SOURCE_ACCOUNT_ID);
+    if (connector.dualEmit) {
+      // ATLAS_DUAL_EMIT precheck also requires the Phase B leg (secret + base url).
+      vi.stubEnv('ATLAS_DUAL_EMIT', 'true');
+      vi.stubEnv('ATLAS_BASE_URL', PHASE_B_BASE_URL);
+    }
+  }
   const eventBusModule = await import('../../../realtime/event-bus');
   const enqueueModule = await import('../enqueue');
   return {
@@ -105,6 +138,26 @@ async function flushMicrotasks() {
 }
 
 const VALID_SECRET = 'a'.repeat(64);
+
+// Phase 12.2 connector env fixtures (must be schema-valid: uuid / url / min-len).
+const SOURCE_ACCOUNT_ID = '11111111-1111-1111-1111-111111111111';
+const OTHER_ACCOUNT_ID = '22222222-2222-2222-2222-222222222222';
+const ORG_ID = '220ef5e0-47df-4493-ae4d-ec0dfe83cabd';
+const HMAC_SECRET = 'b'.repeat(48);
+const CONNECTOR_URL = 'https://atlas-company-os.vercel.app';
+const PHASE_B_BASE_URL = 'https://atlas.example.com';
+
+/** A stand-in `ConnectorEvent` for the builder mocks. The emit path reads only
+ * `event_id`; the listener's anti-leak filter reads `metadata.accountId` (which
+ * defaults to the source account so it passes — override it to force a drop). */
+function fakeConnectorEvent(overrides: Partial<ConnectorEvent> = {}): ConnectorEvent {
+  return {
+    event_id: 'msg_msg-xyz',
+    kind: 'conversation_turn',
+    metadata: { accountId: SOURCE_ACCOUNT_ID },
+    ...overrides,
+  } as ConnectorEvent;
+}
 
 const convRow = {
   id: 'conv-abc',
@@ -395,6 +448,165 @@ describe('subscribeAtlasEvents', () => {
       expect(payload).not.toHaveProperty('messageId');
       expect(payload).not.toHaveProperty('kind');
       expect(opts).toEqual({ jobId: 'conv-res:resolved' });
+    });
+  });
+
+  describe('connector path (ATLAS_CONNECTOR_ENABLED)', () => {
+    beforeEach(() => {
+      builderMocks.buildConversationTurnEvent.mockReset();
+      builderMocks.buildConversationSummaryEvent.mockReset();
+      builderMocks.buildHandoffEvent.mockReset();
+      builderMocks.buildContactEvent.mockReset();
+    });
+
+    // No Phase B secret here → proves the C1 gate decouple (Phase 10 shape).
+    it('emits a ConnectorEvent on message.created with jobId=event_id, no Phase B secret', async () => {
+      builderMocks.buildConversationTurnEvent.mockResolvedValue(fakeConnectorEvent());
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
+        enabled: true,
+      });
+      const { app, queues } = buildAppStub();
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'message.created',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-abc',
+        message: makeMessage({ id: 'msg-xyz' }),
+      });
+      await flushMicrotasks();
+
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [name, payload, opts] = queues.add.mock.calls[0]!;
+      expect(name).toBe('atlas-events');
+      expect((payload as ConnectorEvent).event_id).toBe('msg_msg-xyz');
+      expect(opts).toEqual({ jobId: 'msg_msg-xyz' });
+    });
+
+    it('routes contact.created to buildContactEvent and emits when account matches', async () => {
+      builderMocks.buildContactEvent.mockResolvedValue(
+        fakeConnectorEvent({ kind: 'contact', event_id: 'contact_c-1' }),
+      );
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
+        enabled: true,
+      });
+      const { app, queues } = buildAppStub();
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'contact.created',
+        accountId: SOURCE_ACCOUNT_ID,
+        contact: { id: 'c-1', name: 'Jo', email: 'jo@x.com', phone: null, createdAt: new Date() },
+      });
+      await flushMicrotasks();
+
+      expect(builderMocks.buildContactEvent).toHaveBeenCalledWith(app.db, { contactId: 'c-1' });
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [name, , opts] = queues.add.mock.calls[0]!;
+      expect(name).toBe('atlas-events');
+      expect(opts).toEqual({ jobId: 'contact_c-1' });
+    });
+
+    // Anti-leak P0 (spec §10b, L-615): another account's event is built, not emitted.
+    it('drops the event when the resolved account ≠ ATLAS_SOURCE_ACCOUNT_ID', async () => {
+      builderMocks.buildContactEvent.mockResolvedValue(
+        fakeConnectorEvent({
+          kind: 'contact',
+          event_id: 'contact_c-9',
+          metadata: { accountId: OTHER_ACCOUNT_ID },
+        }),
+      );
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
+        enabled: true,
+      });
+      const { app, queues } = buildAppStub();
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'contact.created',
+        accountId: OTHER_ACCOUNT_ID,
+        contact: { id: 'c-9', name: 'X', email: null, phone: null, createdAt: new Date() },
+      });
+      await flushMicrotasks();
+
+      expect(builderMocks.buildContactEvent).toHaveBeenCalledWith(app.db, { contactId: 'c-9' });
+      expect(queues.add).not.toHaveBeenCalled();
+    });
+
+    // Listeners #2 resolved→summary, #3 assigned→handoff (+ bot-assigned skip).
+    it('routes conversation.resolved→summary and conversation.assigned(bot→human)→handoff', async () => {
+      builderMocks.buildConversationSummaryEvent.mockResolvedValue(
+        fakeConnectorEvent({ kind: 'conversation_summary', event_id: 'conv_conv-res:resolved' }),
+      );
+      builderMocks.buildHandoffEvent.mockResolvedValue(
+        fakeConnectorEvent({ kind: 'handoff_to_human', event_id: 'conv_conv-h:handoff:1' }),
+      );
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
+        enabled: true,
+      });
+      const { app, queues } = buildAppStub();
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'conversation.resolved',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-res',
+        resolvedBy: 'user-1',
+      });
+      // bot-assigned → no handoff (assignedBotId !== null)
+      eventBus.emitEvent({
+        type: 'conversation.assigned',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-bot',
+        assignedUserId: null,
+        assignedTeamId: null,
+        assignedBotId: 'bot-1',
+      });
+      eventBus.emitEvent({
+        type: 'conversation.assigned',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-h',
+        assignedUserId: 'user-9',
+        assignedTeamId: null,
+        assignedBotId: null,
+      });
+      await flushMicrotasks();
+
+      expect(builderMocks.buildConversationSummaryEvent).toHaveBeenCalledWith(app.db, {
+        conversationId: 'conv-res',
+      });
+      expect(builderMocks.buildHandoffEvent).toHaveBeenCalledTimes(1);
+      expect(builderMocks.buildHandoffEvent).toHaveBeenCalledWith(app.db, {
+        conversationId: 'conv-h',
+      });
+      expect(queues.add).toHaveBeenCalledTimes(2); // summary + handoff (bot-assigned dropped)
+    });
+
+    // Dual-emit soak (Phase 9): one event → 2 jobs, distinct keyspaces (L-609).
+    it('dual-emits both the connector event and the Phase B legacy job', async () => {
+      builderMocks.buildConversationTurnEvent.mockResolvedValue(fakeConnectorEvent());
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(VALID_SECRET, 'false', {
+        enabled: true,
+        dualEmit: true,
+      });
+      const { app, queues } = buildAppStub();
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'message.created',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-abc',
+        message: makeMessage({ id: 'msg-xyz', senderType: 'contact', content: 'hello world' }),
+      });
+      await flushMicrotasks();
+
+      expect(queues.add).toHaveBeenCalledTimes(2);
+      const names = queues.add.mock.calls.map((c) => c[0]);
+      expect(names).toContain('atlas-events'); // connector
+      expect(names).toContain('message_sent'); // Phase B legacy
+      const jobIds = queues.add.mock.calls.map((c) => (c[2] as { jobId: string }).jobId);
+      expect(jobIds).toContain('msg_msg-xyz'); // connector event_id keyspace
+      expect(jobIds).toContain('conv-abc:message_sent:msg-xyz'); // Phase B keyspace
     });
   });
 });

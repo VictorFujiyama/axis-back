@@ -1,0 +1,197 @@
+import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { type AnyColumn, type SQL, and, asc, eq, gt, isNull, or } from 'drizzle-orm';
+import { verifyRequest, type ConnectorEvent } from '@atlas/connectors';
+import { schema, type DB } from '@blossom/db';
+import { config } from '../../config';
+import {
+  buildContactEvent,
+  buildConversationTurnEvent,
+} from '../atlas-events/build-connector-event';
+
+/**
+ * Phase 12.2 — history backfill route (`GET /atlas-connector/backfill`, Berg
+ * doc Phase 4e). Atlas's `backfill-app` worker walks pages until `nextCursor`
+ * is null, re-entering each event into the standard pipeline (idempotent,
+ * L-603). Auth: a GET signs the empty body (L-607); `verifyRequest` never
+ * throws (L-612) — map `.reason` to 401, and 401 if the verified org isn't ours
+ * (L-611). Contacts-first (spec §12.10.06, L-605): `?phase=contacts` (default)
+ * before `?phase=messages` so turns resolve to a real entity, not a phantom
+ * (L-604). Anti-leak P0 (L-615): both walks hard-filter `accountId =
+ * ATLAS_SOURCE_ACCOUNT_ID` (both tables carry it directly — no JOIN). Cursor:
+ * opaque `base64url(JSON({afterCreatedAt, afterId}))` keyset on `(created_at,
+ * id)`; Drizzle has no row-tuple compare, so `> a OR (= a AND id > b)`, fetching
+ * `limit + 1` to detect more. Envelopes reuse the T-004a builders (pre-validated).
+ */
+
+export interface DecodedCursor {
+  afterCreatedAt: string;
+  afterId: string;
+}
+
+type BackfillPhase = 'contacts' | 'messages';
+
+const DEFAULT_LIMIT = 500;
+const MAX_LIMIT = 500;
+
+export function encodeCursor(c: DecodedCursor): string {
+  return Buffer.from(JSON.stringify(c), 'utf8').toString('base64url');
+}
+
+/** Decode an opaque cursor; returns null on any malformed input (→ 400). */
+export function decodeCursor(s: string): DecodedCursor | null {
+  try {
+    const parsed = JSON.parse(Buffer.from(s, 'base64url').toString('utf8')) as unknown;
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as DecodedCursor).afterCreatedAt === 'string' &&
+      typeof (parsed as DecodedCursor).afterId === 'string'
+    ) {
+      return parsed as DecodedCursor;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+interface KeysetRow {
+  id: string;
+  createdAt: Date;
+}
+
+/** Split the `limit + 1` fetch into the page + the next cursor. */
+function paginate<T extends KeysetRow>(
+  rows: T[],
+  limit: number,
+): { page: T[]; nextCursor: string | null } {
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+  const last = page[page.length - 1];
+  const nextCursor =
+    hasMore && last
+      ? encodeCursor({ afterCreatedAt: last.createdAt.toISOString(), afterId: last.id })
+      : null;
+  return { page, nextCursor };
+}
+
+function keysetCond(
+  createdAtCol: AnyColumn,
+  idCol: AnyColumn,
+  cursor: DecodedCursor | null,
+): SQL | undefined {
+  if (!cursor) return undefined;
+  const after = new Date(cursor.afterCreatedAt);
+  return or(
+    gt(createdAtCol, after),
+    and(eq(createdAtCol, after), gt(idCol, cursor.afterId)),
+  );
+}
+
+export interface BackfillPageInput {
+  db: DB;
+  phase: BackfillPhase;
+  cursor: DecodedCursor | null;
+  limit: number;
+  accountId: string;
+  buildContact: (id: string) => Promise<ConnectorEvent>;
+  buildTurn: (input: { conversationId: string; messageId: string }) => Promise<ConnectorEvent>;
+}
+
+/** Fetch + build one page of the backfill walk for the requested phase. */
+export async function backfillPage(
+  input: BackfillPageInput,
+): Promise<{ events: ConnectorEvent[]; nextCursor: string | null }> {
+  const { db, phase, cursor, limit, accountId } = input;
+  const events: ConnectorEvent[] = [];
+
+  if (phase === 'contacts') {
+    const c = schema.contacts;
+    const rows: KeysetRow[] = await db
+      .select({ id: c.id, createdAt: c.createdAt })
+      .from(c)
+      .where(and(eq(c.accountId, accountId), isNull(c.deletedAt), keysetCond(c.createdAt, c.id, cursor)))
+      .orderBy(asc(c.createdAt), asc(c.id))
+      .limit(limit + 1);
+    const { page, nextCursor } = paginate(rows, limit);
+    for (const r of page) events.push(await input.buildContact(r.id));
+    return { events, nextCursor };
+  }
+
+  const m = schema.messages;
+  const rows: Array<KeysetRow & { conversationId: string }> = await db
+    .select({ id: m.id, createdAt: m.createdAt, conversationId: m.conversationId })
+    .from(m)
+    .where(and(eq(m.accountId, accountId), keysetCond(m.createdAt, m.id, cursor)))
+    .orderBy(asc(m.createdAt), asc(m.id))
+    .limit(limit + 1);
+  const { page, nextCursor } = paginate(rows, limit);
+  for (const r of page) {
+    events.push(await input.buildTurn({ conversationId: r.conversationId, messageId: r.id }));
+  }
+  return { events, nextCursor };
+}
+
+function headerValue(req: FastifyRequest, name: string): string | null {
+  const v = req.headers[name];
+  if (Array.isArray(v)) return v[0] ?? null;
+  return v ?? null;
+}
+
+export interface BackfillRouteOpts {
+  /** Injectable builders for tests; default to the real T-004a helpers. */
+  buildContact?: (id: string) => Promise<ConnectorEvent>;
+  buildTurn?: (input: { conversationId: string; messageId: string }) => Promise<ConnectorEvent>;
+}
+
+export async function atlasBackfillRoutes(
+  app: FastifyInstance,
+  opts: BackfillRouteOpts = {},
+): Promise<void> {
+  // Gated like T-012: the boot precheck (T-003) guarantees ATLAS_ORG_ID +
+  // ATLAS_SOURCE_ACCOUNT_ID whenever the connector is enabled.
+  if (
+    !config.ATLAS_CONNECTOR_ENABLED ||
+    !config.ATLAS_HMAC_SECRET ||
+    !config.ATLAS_ORG_ID ||
+    !config.ATLAS_SOURCE_ACCOUNT_ID
+  ) {
+    return;
+  }
+  const secret = config.ATLAS_HMAC_SECRET;
+  const orgId = config.ATLAS_ORG_ID;
+  const accountId = config.ATLAS_SOURCE_ACCOUNT_ID;
+  const buildContact = opts.buildContact ?? ((id) => buildContactEvent(app.db, { contactId: id }));
+  const buildTurn = opts.buildTurn ?? ((i) => buildConversationTurnEvent(app.db, i));
+
+  app.get('/atlas-connector/backfill', async (req, reply) => {
+    // GET signs the empty body (L-607): the bytes we verify must equal what
+    // Atlas signed, which is ''.
+    const verify = verifyRequest(
+      '',
+      headerValue(req, 'x-atlas-signature'),
+      headerValue(req, 'x-atlas-org-id'),
+      secret,
+    );
+    if (!verify.ok) return reply.code(401).send({ ok: false, error: verify.reason });
+    if (verify.orgId !== orgId) return reply.code(401).send({ ok: false, error: 'org-mismatch' });
+
+    const q = req.query as Record<string, string | undefined>;
+    const phase: BackfillPhase = q.phase === 'messages' ? 'messages' : 'contacts';
+    const parsedLimit = Number.parseInt(q.limit ?? '', 10);
+    const limit = Math.min(Math.max(Number.isFinite(parsedLimit) ? parsedLimit : DEFAULT_LIMIT, 1), MAX_LIMIT);
+    const cursor = q.cursor ? decodeCursor(q.cursor) : null;
+    if (q.cursor && !cursor) return reply.code(400).send({ ok: false, error: 'malformed-cursor' });
+
+    const { events, nextCursor } = await backfillPage({
+      db: app.db,
+      phase,
+      cursor,
+      limit,
+      accountId,
+      buildContact,
+      buildTurn,
+    });
+    return reply.send({ events, nextCursor });
+  });
+}

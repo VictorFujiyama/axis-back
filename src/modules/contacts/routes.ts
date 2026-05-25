@@ -4,6 +4,7 @@ import multipart from '@fastify/multipart';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { writeAudit } from '../../lib/audit';
+import { eventBus } from '../../realtime/event-bus';
 
 const channelTypes = [
   'whatsapp',
@@ -311,6 +312,21 @@ export async function contactRoutes(app: FastifyInstance): Promise<void> {
         return contact;
       });
 
+      // Feed the Atlas connector contact-emit path (T-006 listener keys off
+      // this). Account-scoped so the listener can drop non-source accounts
+      // before signing/POSTing to Atlas (anti-leak P0, spec §10b).
+      eventBus.emitEvent({
+        type: 'contact.created',
+        accountId: req.user.accountId,
+        contact: {
+          id: result.id,
+          name: result.name,
+          email: result.email,
+          phone: result.phone,
+          createdAt: result.createdAt,
+        },
+      });
+
       return reply.code(201).send(publicContact(result));
     },
   );
@@ -334,6 +350,22 @@ export async function contactRoutes(app: FastifyInstance): Promise<void> {
         .where(and(eq(schema.contacts.id, id), eq(schema.contacts.accountId, req.user.accountId), isNull(schema.contacts.deletedAt)))
         .returning();
       if (!contact) return reply.notFound();
+
+      // Re-emit on update so Atlas re-resolves identity hints (idempotent
+      // upsert keyed on contact_<id>, L-603). Same account-scoped shape as the
+      // create path above.
+      eventBus.emitEvent({
+        type: 'contact.created',
+        accountId: req.user.accountId,
+        contact: {
+          id: contact.id,
+          name: contact.name,
+          email: contact.email,
+          phone: contact.phone,
+          createdAt: contact.createdAt,
+        },
+      });
+
       return publicContact(contact);
     },
   );
