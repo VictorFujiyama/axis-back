@@ -21,6 +21,19 @@ function basicAuth(accountSid: string, authToken: string): string {
   return 'Basic ' + Buffer.from(`${accountSid}:${authToken}`).toString('base64');
 }
 
+/**
+ * Normalize a phone number to strict `+E164` (strip spaces, dashes, parens and
+ * any `whatsapp:` prefix). Twilio stores sender_id / IncomingPhoneNumber in
+ * strict +E164, and we match against them by exact string — so a number a user
+ * typed as "+1 218 217 4957" must be normalized to "+12182174957" first, or the
+ * lookup never matches and webhook auto-config silently fails ("sender not
+ * found"). Mirrors `toWhatsAppAddress` in whatsapp-sender.ts.
+ */
+export function toE164(raw: string): string {
+  const cleaned = raw.replace(/[^\d+]/g, '');
+  return cleaned.startsWith('+') ? cleaned : `+${cleaned}`;
+}
+
 /** Twilio error responses include PII (accountSid, phone_number, uri). Extract
  * only the fields safe to log: numeric code and short message. */
 function redactTwilioError(body: string): { code?: number; message?: string } {
@@ -184,7 +197,7 @@ export async function setTwilioWebhook(
       return { ok: false, description: 'no fromNumber or messagingServiceSid' };
     }
 
-    const cleanNumber = fromNumber.replace(/^whatsapp:/i, '');
+    const cleanNumber = toE164(fromNumber);
 
     // WhatsApp senders live in the Messaging Channels API, not IncomingPhoneNumbers.
     // Pricing webhook field is on the sender itself — setting SmsUrl on a backing
