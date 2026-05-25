@@ -10,6 +10,9 @@ COPY packages/db/package.json ./packages/db/
 COPY packages/sdk/package.json ./packages/sdk/
 COPY packages/shared-types/package.json ./packages/shared-types/
 COPY modules/catalog/package.json ./modules/catalog/
+# Vendored @atlas/connectors tarball — lockfile references file:vendor/*.tgz,
+# so it must be present before install or pnpm fails with ENOENT.
+COPY vendor ./vendor/
 
 RUN pnpm install --frozen-lockfile
 
