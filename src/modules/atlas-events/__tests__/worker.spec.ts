@@ -1,8 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { createHmac } from 'node:crypto';
+import { ConnectorEmitFailedError, type ConnectorEvent } from '@atlas/connectors';
 
 import type { AtlasEventJob } from '../enqueue';
+
+// Mock the connector singleton: T-007 worker tests verify the worker's DISPATCH
+// + error contract (4xx terminal vs 5xx rethrow vs disabled), NOT the SDK's
+// retry internals (covered by the SDK's own suite). The mock drives emitDirect's
+// outcome without real backoff sleeps or a live Atlas endpoint. Legacy/§12.1
+// jobs never hit it (isConnectorEvent === false), so the existing cases are
+// untouched. Mirrors enqueue.spec's vi.hoisted+vi.mock pattern (T-006).
+const connectorMock = vi.hoisted(() => ({
+  getAtlasConnector: vi.fn(),
+}));
+vi.mock('../connector', () => connectorMock);
 
 interface AppStub {
   app: FastifyInstance;
@@ -42,6 +54,7 @@ async function loadFreshWorker(
   secret: string | undefined,
   baseUrl: string | undefined,
   endpoint?: string,
+  connectorEnabled = false,
 ) {
   vi.resetModules();
   if (secret === undefined) {
@@ -61,12 +74,51 @@ async function loadFreshWorker(
   } else {
     delete process.env.ATLAS_EVENTS_ENDPOINT;
   }
+  if (connectorEnabled) {
+    // config.ts's boot precheck requires all four when the connector is on —
+    // stub them or importing config throws (mirrors enqueue.spec).
+    vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'true');
+    vi.stubEnv('ATLAS_URL', CONNECTOR_URL);
+    vi.stubEnv('ATLAS_ORG_ID', CONNECTOR_ORG_ID);
+    vi.stubEnv('ATLAS_HMAC_SECRET', CONNECTOR_HMAC);
+    vi.stubEnv('ATLAS_SOURCE_ACCOUNT_ID', SOURCE_ACCOUNT_ID);
+  }
   const mod = await import('../worker');
   return { registerAtlasEventsWorker: mod.registerAtlasEventsWorker };
 }
 
 const VALID_SECRET = 'a'.repeat(64);
 const VALID_BASE_URL = 'http://atlas-web:3010';
+
+// Phase 12.2 connector env fixtures (must be schema-valid: uuid / url / min-len).
+const CONNECTOR_ORG_ID = '220ef5e0-47df-4493-ae4d-ec0dfe83cabd';
+const CONNECTOR_URL = 'https://atlas-company-os.vercel.app';
+const CONNECTOR_HMAC = 'b'.repeat(48);
+const SOURCE_ACCOUNT_ID = '11111111-1111-1111-1111-111111111111';
+
+function makeConnectorJob(): { id: string; data: ConnectorEvent } {
+  return {
+    id: 'job-conn-1',
+    data: {
+      event_id: 'msg_msg-xyz',
+      schema_version: '1.0',
+      emitted_at: '2026-05-12T08:00:00.000Z',
+      app: 'messaging',
+      org_id: CONNECTOR_ORG_ID,
+      kind: 'conversation_turn',
+      action: 'create',
+      source_ref: { id: 'msg-xyz', parent_id: 'conv-abc' },
+      occurred_at: '2026-05-12T08:00:00.000Z',
+      actors: [
+        { app_user_id: 'contact-1', role: 'sender', hints: { email: 'a@b.com' } },
+      ],
+      participants: [],
+      summary: 'contact: hello there',
+      viewable_by: { scope: 'org' },
+      metadata: { accountId: SOURCE_ACCOUNT_ID },
+    },
+  };
+}
 
 function makeJob(): { id: string; data: AtlasEventJob } {
   return {
@@ -81,7 +133,10 @@ function makeJob(): { id: string; data: AtlasEventJob } {
   };
 }
 
-type Processor = (job: { id: string; data: AtlasEventJob }) => Promise<void>;
+type Processor = (job: {
+  id: string;
+  data: AtlasEventJob | ConnectorEvent;
+}) => Promise<void>;
 
 function captureHandler(registerWorker: ReturnType<typeof vi.fn>): Processor {
   expect(registerWorker).toHaveBeenCalledTimes(1);
@@ -94,6 +149,7 @@ function captureHandler(registerWorker: ReturnType<typeof vi.fn>): Processor {
 describe('registerAtlasEventsWorker', () => {
   beforeEach(() => {
     vi.unstubAllEnvs();
+    connectorMock.getAtlasConnector.mockReset();
   });
 
   afterEach(() => {
@@ -336,6 +392,115 @@ describe('registerAtlasEventsWorker', () => {
       jobId: 'job-123',
       hasSecret: true,
       hasBaseUrl: false,
+    });
+  });
+
+  describe('Phase 12.2 connector jobs', () => {
+    /** Point the mocked singleton at a connector whose emitDirect we control. */
+    function stubConnector(emitDirect: ReturnType<typeof vi.fn>): void {
+      connectorMock.getAtlasConnector.mockReturnValue({ emitDirect });
+    }
+
+    it('delivers a ConnectorEvent via emitDirect, bypassing the Phase B fetch', async () => {
+      const { registerAtlasEventsWorker } = await loadFreshWorker(
+        VALID_SECRET,
+        VALID_BASE_URL,
+      );
+      const { app, queues, log } = buildAppStub();
+      const emitDirect = vi.fn().mockResolvedValue(undefined);
+      stubConnector(emitDirect);
+      const fetchImpl = vi.fn();
+
+      registerAtlasEventsWorker(app, { fetchImpl });
+      const handler = captureHandler(queues.registerWorker);
+
+      const job = makeConnectorJob();
+      await handler(job);
+
+      // emitDirect (SDK sign+POST+retry) gets the event verbatim; the Phase B
+      // serialize+fetch path is never touched.
+      expect(emitDirect).toHaveBeenCalledTimes(1);
+      expect(emitDirect).toHaveBeenCalledWith(job.data);
+      expect(fetchImpl).not.toHaveBeenCalled();
+      const lastInfo = log.info.mock.calls.at(-1)![0];
+      expect(lastInfo).toMatchObject({
+        jobId: 'job-conn-1',
+        eventId: 'msg_msg-xyz',
+        kind: 'conversation_turn',
+      });
+    });
+
+    it('marks complete (no rethrow) when emitDirect fails with a 4xx', async () => {
+      const { registerAtlasEventsWorker } = await loadFreshWorker(
+        VALID_SECRET,
+        VALID_BASE_URL,
+      );
+      const { app, queues, log } = buildAppStub();
+      const emitDirect = vi
+        .fn()
+        .mockRejectedValue(new ConnectorEmitFailedError(1, 400, 'invalid-signature'));
+      stubConnector(emitDirect);
+
+      registerAtlasEventsWorker(app, {});
+      const handler = captureHandler(queues.registerWorker);
+
+      // 4xx is terminal — won't fix itself, so don't let BullMQ loop.
+      await expect(handler(makeConnectorJob())).resolves.toBeUndefined();
+      expect(emitDirect).toHaveBeenCalledTimes(1);
+      const lastWarn = log.warn.mock.calls.at(-1)![0];
+      expect(lastWarn).toMatchObject({ jobId: 'job-conn-1', status: 400 });
+    });
+
+    it('rethrows on 5xx exhaustion so BullMQ retries then DLQs', async () => {
+      const { registerAtlasEventsWorker } = await loadFreshWorker(
+        VALID_SECRET,
+        VALID_BASE_URL,
+      );
+      const { app, queues, log } = buildAppStub();
+      const err = new ConnectorEmitFailedError(5, 502, 'bad gateway');
+      const emitDirect = vi.fn().mockRejectedValue(err);
+      stubConnector(emitDirect);
+
+      registerAtlasEventsWorker(app, {});
+      const handler = captureHandler(queues.registerWorker);
+
+      await expect(handler(makeConnectorJob())).rejects.toBe(err);
+      expect(log.warn).toHaveBeenCalled();
+    });
+
+    it('marks complete when a connector job arrives but the connector is disabled', async () => {
+      const { registerAtlasEventsWorker } = await loadFreshWorker(
+        VALID_SECRET,
+        VALID_BASE_URL,
+      );
+      const { app, queues, log } = buildAppStub();
+      connectorMock.getAtlasConnector.mockReturnValue(null);
+
+      registerAtlasEventsWorker(app, {});
+      const handler = captureHandler(queues.registerWorker);
+
+      await expect(handler(makeConnectorJob())).resolves.toBeUndefined();
+      const lastWarn = log.warn.mock.calls.at(-1)![0];
+      expect(lastWarn).toMatchObject({
+        jobId: 'job-conn-1',
+        eventId: 'msg_msg-xyz',
+      });
+    });
+
+    it('registers when only the connector is enabled, Phase B secret unset (C1 gate decouple)', async () => {
+      const { registerAtlasEventsWorker } = await loadFreshWorker(
+        undefined,
+        undefined,
+        undefined,
+        true,
+      );
+      const { app, queues } = buildAppStub();
+
+      registerAtlasEventsWorker(app, {});
+
+      // Connector-on alone keeps the worker registered even with no Phase B
+      // secret — Phase 10 dropping that secret must not kill connector delivery.
+      expect(queues.registerWorker).toHaveBeenCalledTimes(1);
     });
   });
 });
