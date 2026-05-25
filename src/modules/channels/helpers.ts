@@ -130,17 +130,32 @@ export async function ingestIncomingMessage(
       .limit(1);
 
     let contactId: string;
-    if (identity) {
-      contactId = identity.contactId;
-      const [c] = await tx
-        .select({ blocked: schema.contacts.blocked })
-        .from(schema.contacts)
-        .where(eq(schema.contacts.id, contactId))
-        .limit(1);
-      if (c?.blocked) {
+    const linkedContact = identity
+      ? (
+          await tx
+            .select({
+              id: schema.contacts.id,
+              blocked: schema.contacts.blocked,
+              deletedAt: schema.contacts.deletedAt,
+            })
+            .from(schema.contacts)
+            .where(eq(schema.contacts.id, identity.contactId))
+            .limit(1)
+        )[0]
+      : undefined;
+
+    if (identity && linkedContact && !linkedContact.deletedAt) {
+      // Healthy existing contact — reuse it.
+      contactId = linkedContact.id;
+      if (linkedContact.blocked) {
         return { contactId, conversationId: null, messageId: null, deduped: false, blocked: true };
       }
     } else {
+      // Either no identity yet, or the identity points at a soft-deleted contact.
+      // The identity row survives a soft-delete (the FK cascade only fires on a
+      // hard delete), so a returning sender would otherwise re-attach to a
+      // nameless "ghost" contact. Create a fresh contact and (re)point the
+      // identity at it so the conversation shows a real contact again.
       const [contact] = await tx
         .insert(schema.contacts)
         .values({
@@ -152,12 +167,19 @@ export async function ingestIncomingMessage(
         .returning({ id: schema.contacts.id });
       if (!contact) throw new Error('contact insert failed');
       contactId = contact.id;
-      await tx.insert(schema.contactIdentities).values({
-        contactId,
-        channel: input.channel,
-        identifier: input.from.identifier,
-        metadata: input.from.metadata ?? {},
-      });
+      if (identity) {
+        await tx
+          .update(schema.contactIdentities)
+          .set({ contactId, metadata: input.from.metadata ?? {} })
+          .where(eq(schema.contactIdentities.id, identity.id));
+      } else {
+        await tx.insert(schema.contactIdentities).values({
+          contactId,
+          channel: input.channel,
+          identifier: input.from.identifier,
+          metadata: input.from.metadata ?? {},
+        });
+      }
     }
 
     // 2. Idempotency — dedup by (inboxId, channelMsgId)

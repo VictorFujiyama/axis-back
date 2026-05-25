@@ -81,7 +81,14 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
     { preHandler: app.requireAuth },
     async (req) => {
       const query = listQuery.parse(req.query);
-      const conditions = [isNull(schema.conversations.deletedAt), eq(schema.conversations.accountId, req.user.accountId)];
+      const conditions = [
+        isNull(schema.conversations.deletedAt),
+        eq(schema.conversations.accountId, req.user.accountId),
+        // Hide conversations orphaned by a soft-deleted inbox: they can't send
+        // or receive (inbound + Twilio status webhooks 404 on a deleted inbox),
+        // so showing them only produces stuck "sending" clocks.
+        sql`NOT EXISTS (SELECT 1 FROM inboxes WHERE inboxes.id = conversations.inbox_id AND inboxes.deleted_at IS NOT NULL)`,
+      ];
 
       // Inbox-level access control for agents
       if (req.user.role === 'agent') {
@@ -248,7 +255,13 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
         filter: z.enum(['mentions', 'unattended']).optional(),
       });
       const query = countsQuery.parse(req.query);
-      const base = [isNull(schema.conversations.deletedAt), eq(schema.conversations.accountId, req.user.accountId)];
+      const base = [
+        isNull(schema.conversations.deletedAt),
+        eq(schema.conversations.accountId, req.user.accountId),
+        // Keep counts consistent with the list query: exclude conversations
+        // whose inbox was soft-deleted.
+        sql`NOT EXISTS (SELECT 1 FROM inboxes WHERE inboxes.id = conversations.inbox_id AND inboxes.deleted_at IS NOT NULL)`,
+      ];
       if (req.user.role === 'agent') {
         const allowed = await userInboxIds(app, req.user.sub, req.user.accountId);
         if (allowed.length === 0) return { mine: 0, unassigned: 0, all: 0 };

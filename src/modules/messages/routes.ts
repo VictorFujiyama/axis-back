@@ -541,6 +541,17 @@ export async function dispatchOutbound(
     .where(eq(schema.inboxes.id, conv.inboxId))
     .limit(1);
   if (!inbox) return;
+  if (inbox.deletedAt) {
+    // The inbox was soft-deleted: the channel can't deliver and Twilio status
+    // callbacks 404 against a deleted inbox, which would leave the message
+    // stuck on the "sending" clock forever. Fail it explicitly instead.
+    app.log.warn({ messageId, inboxId: inbox.id }, 'outbound: inbox is deleted');
+    await app.db
+      .update(schema.messages)
+      .set({ failedAt: new Date(), failureReason: 'inbox excluído' })
+      .where(eq(schema.messages.id, messageId));
+    return;
+  }
 
   if (inbox.channelType === 'instagram' || inbox.channelType === 'messenger') {
     // Identifier was stored on the contact identity when inbound message arrived.
