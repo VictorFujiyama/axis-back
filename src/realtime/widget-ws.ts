@@ -107,6 +107,9 @@ export async function widgetWsRoutes(app: FastifyInstance): Promise<void> {
     ctx.unsubscribe = eventBus.onEvent((event: RealtimeEvent) => {
       // Presence events are agent-only; never leak to widget sockets.
       if (event.type === 'presence.update') return;
+      // contact.created is account-scoped (no inboxId) and agent/atlas-only —
+      // never forward CRM contact records to widget visitors.
+      if (event.type === 'contact.created') return;
       if (event.inboxId !== ctx.inboxId) return;
 
       if (event.type === 'message.created') {
