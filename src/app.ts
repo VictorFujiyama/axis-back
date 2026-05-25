@@ -66,6 +66,7 @@ import { loadModules } from './modules/plugins/loader';
 import { modulesRoutes } from './modules/plugins/routes';
 import { googleOAuthRoutes } from './modules/oauth/google/routes';
 import { atlasInboundRoutes } from './modules/atlas-connector/inbound-routes';
+import { atlasBackfillRoutes } from './modules/atlas-connector/backfill-routes';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -234,6 +235,10 @@ export async function buildApp(): Promise<FastifyInstance> {
   // Phase 12.2 inbound push (POST /atlas-events). Plugin-scoped raw-body
   // parser inside; gated by ATLAS_CONNECTOR_ENABLED — no route when disabled.
   await app.register(atlasInboundRoutes);
+
+  // Phase 12.2 history backfill (GET /atlas-connector/backfill). Cursor walk,
+  // contacts-first, account-scoped; gated by ATLAS_CONNECTOR_ENABLED.
+  await app.register(atlasBackfillRoutes);
 
   // Load pluggable modules (ENABLED_MODULES) — after core routes so modules can
   // safely depend on app.requireAuth / app.db / app.queues decorators.
