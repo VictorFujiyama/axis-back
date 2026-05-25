@@ -67,6 +67,7 @@ import { modulesRoutes } from './modules/plugins/routes';
 import { googleOAuthRoutes } from './modules/oauth/google/routes';
 import { atlasInboundRoutes } from './modules/atlas-connector/inbound-routes';
 import { atlasBackfillRoutes } from './modules/atlas-connector/backfill-routes';
+import { atlasMcpRoutes } from './modules/atlas-mcp-client/routes';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -239,6 +240,10 @@ export async function buildApp(): Promise<FastifyInstance> {
   // Phase 12.2 history backfill (GET /atlas-connector/backfill). Cursor walk,
   // contacts-first, account-scoped; gated by ATLAS_CONNECTOR_ENABLED.
   await app.register(atlasBackfillRoutes);
+
+  // Phase 12.2 MCP pull (GET /api/v1/atlas/memory). Front-facing read of Atlas
+  // memory; always registered, returns 503 when ATLAS_MCP_BEARER is unset.
+  await app.register(atlasMcpRoutes);
 
   // Load pluggable modules (ENABLED_MODULES) — after core routes so modules can
   // safely depend on app.requireAuth / app.db / app.queues decorators.
