@@ -65,6 +65,7 @@ import { uploadRoutes } from './modules/uploads/routes';
 import { loadModules } from './modules/plugins/loader';
 import { modulesRoutes } from './modules/plugins/routes';
 import { googleOAuthRoutes } from './modules/oauth/google/routes';
+import { atlasInboundRoutes } from './modules/atlas-connector/inbound-routes';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -229,6 +230,10 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(uploadRoutes);
   await app.register(modulesRoutes);
   await app.register(googleOAuthRoutes);
+
+  // Phase 12.2 inbound push (POST /atlas-events). Plugin-scoped raw-body
+  // parser inside; gated by ATLAS_CONNECTOR_ENABLED — no route when disabled.
+  await app.register(atlasInboundRoutes);
 
   // Load pluggable modules (ENABLED_MODULES) — after core routes so modules can
   // safely depend on app.requireAuth / app.db / app.queues decorators.
