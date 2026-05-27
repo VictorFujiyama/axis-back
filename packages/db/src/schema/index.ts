@@ -22,3 +22,4 @@ export * from './campaigns';
 export * from './catalog-products';
 export * from './atlas-user-links';
 export * from './atlas-activity';
+export * from './atlas-connections';
