@@ -141,6 +141,44 @@ describe('build-connector-event builders', () => {
     expect(ev.metadata).toEqual({ accountId: 'account-1' });
   });
 
+  it('per-account orgId (T-04) — input.orgId overrides config.ATLAS_ORG_ID', async () => {
+    const PER_ACCOUNT_ORG = '9c5a1f2e-0000-4000-8000-000000000abc';
+    const contactRow = {
+      id: 'contact-9',
+      accountId: 'account-9',
+      name: 'Maria',
+      email: 'maria@example.com',
+      phone: '+5511888888888',
+      createdAt: new Date('2026-05-01T09:00:00Z'),
+    };
+    const db = makeDb([[contactRow]]);
+
+    const ev = await buildContactEvent(db, { contactId: 'contact-9', orgId: PER_ACCOUNT_ORG });
+
+    expect(parseConnectorEvent(ev).ok).toBe(true);
+    // The connection's org wins over the global env fallback.
+    expect(ev.org_id).toBe(PER_ACCOUNT_ORG);
+  });
+
+  it('per-account orgId (T-04) — falls back to config.ATLAS_ORG_ID when omitted', async () => {
+    const contactRow = {
+      id: 'contact-8',
+      accountId: 'account-8',
+      name: 'Ana',
+      email: 'ana@example.com',
+      phone: '+5511777777777',
+      createdAt: new Date('2026-05-01T09:00:00Z'),
+    };
+    const db = makeDb([[contactRow]]);
+
+    const ev = await buildContactEvent(db, { contactId: 'contact-8' });
+
+    expect(parseConnectorEvent(ev).ok).toBe(true);
+    // No per-account orgId → the mocked global config supplies it (compat path
+    // for enqueue/worker/backfill until T-05 wires the connection orgId).
+    expect(ev.org_id).toBe('220ef5e0-47df-4493-ae4d-ec0dfe83cabd');
+  });
+
   it('resolveActorHints (user) — joins users for email/display_name', async () => {
     const db = makeDb([[userHints]]);
 
