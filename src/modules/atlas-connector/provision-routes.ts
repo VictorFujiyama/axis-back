@@ -52,6 +52,10 @@ const deregisterBody = z.object({
   atlasOrgId: z.string().uuid(),
 });
 
+const userAccountsQuery = z.object({
+  axisUserId: z.string().uuid(),
+});
+
 export async function atlasProvisionRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/atlas-connector/register',
@@ -158,6 +162,44 @@ export async function atlasProvisionRoutes(app: FastifyInstance): Promise<void> 
       if (existing) clearConnectorCache(existing.atlasAccountId);
 
       return reply.send({ ok: true });
+    },
+  );
+
+  /**
+   * [Connect Flow / Phase 12.2 — T-09] `GET /atlas-connector/user-accounts?axisUserId=…`:
+   * lists the axis accounts a linked user belongs to so Atlas can let the org
+   * owner pick which one to bind (G6). Register answers 409 when the user has >1
+   * account and no `axisAccountId` was given; Atlas resolves the ambiguity by
+   * calling this, presenting the choice, then re-calling register with the
+   * chosen account.
+   *
+   * Same `X-API-Key == ATLAS_API_KEY` gate as register/deregister. Joins
+   * `account_users` (the membership + role) with `accounts` (the display name);
+   * returns `{ ok: true, accounts: [{ accountId, name, role }] }`. A user with no
+   * memberships yields an empty list (200), not an error — Atlas treats it as
+   * "nothing to bind".
+   */
+  app.get(
+    '/atlas-connector/user-accounts',
+    { preHandler: app.requireAtlasApiKey },
+    async (req, reply) => {
+      const parsed = userAccountsQuery.safeParse(req.query);
+      if (!parsed.success) {
+        return reply.code(400).send({ ok: false, error: 'invalid query' });
+      }
+      const { axisUserId } = parsed.data;
+
+      const accounts = await app.db
+        .select({
+          accountId: schema.accountUsers.accountId,
+          name: schema.accounts.name,
+          role: schema.accountUsers.role,
+        })
+        .from(schema.accountUsers)
+        .innerJoin(schema.accounts, eq(schema.accountUsers.accountId, schema.accounts.id))
+        .where(eq(schema.accountUsers.userId, axisUserId));
+
+      return reply.send({ ok: true, accounts });
     },
   );
 }

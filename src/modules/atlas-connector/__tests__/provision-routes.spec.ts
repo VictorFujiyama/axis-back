@@ -36,15 +36,24 @@ vi.mock('../../atlas-events/connector', () => connectorMock);
 const handshakeMock = vi.hoisted(() => ({ runHandshake: vi.fn() }));
 vi.mock('../../../scripts/atlas-handshake', () => handshakeMock);
 
-/** Membership lookup stub: `select({...}).from(accountUsers).where(eq(...))` → rows. */
-function makeDb(memberships: Array<{ accountId: string }>): FastifyInstance['db'] {
-  const where = vi.fn().mockResolvedValue(memberships);
-  const from = vi.fn(() => ({ where }));
+type StubRow = { accountId: string; name?: string; role?: string };
+
+/**
+ * Membership lookup stub. Covers both chains the routes use:
+ *   register:       `select({...}).from(accountUsers).where(eq(...))`
+ *   user-accounts:  `select({...}).from(accountUsers).innerJoin(accounts, …).where(eq(...))`
+ * Both terminate at the same `where`, which resolves the rows. Register only
+ * reads `.accountId` off each row, so the extra `name`/`role` fields are inert.
+ */
+function makeDb(rows: StubRow[]): FastifyInstance['db'] {
+  const where = vi.fn().mockResolvedValue(rows);
+  const innerJoin = vi.fn(() => ({ where }));
+  const from = vi.fn(() => ({ where, innerJoin }));
   const select = vi.fn(() => ({ from }));
   return { select } as unknown as FastifyInstance['db'];
 }
 
-async function buildTestApp(memberships: Array<{ accountId: string }>): Promise<FastifyInstance> {
+async function buildTestApp(rows: StubRow[]): Promise<FastifyInstance> {
   vi.resetModules();
   const Fastify = (await import('fastify')).default;
   const sensible = (await import('@fastify/sensible')).default;
@@ -53,7 +62,7 @@ async function buildTestApp(memberships: Array<{ accountId: string }>): Promise<
 
   const app = Fastify({ logger: false });
   await app.register(sensible);
-  app.decorate('db', makeDb(memberships));
+  app.decorate('db', makeDb(rows));
   await app.register(atlasAuthPlugin);
   await app.register(atlasProvisionRoutes);
   await app.ready();
@@ -93,6 +102,19 @@ function deregister(
     url: '/atlas-connector/deregister',
     headers: { 'content-type': 'application/json', ...headers },
     payload,
+  });
+}
+
+function userAccounts(
+  app: FastifyInstance,
+  query: Record<string, string>,
+  headers: Record<string, string> = { 'x-api-key': API_KEY },
+) {
+  const qs = new URLSearchParams(query).toString();
+  return app.inject({
+    method: 'GET',
+    url: qs ? `/atlas-connector/user-accounts?${qs}` : '/atlas-connector/user-accounts',
+    headers,
   });
 }
 
@@ -368,6 +390,84 @@ describe('POST /atlas-connector/deregister — removal (T-08)', () => {
         atlasOrgId: ATLAS_ORG_ID,
       });
       expect(connectorMock.clearConnectorCache).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('GET /atlas-connector/user-accounts — auth gate (T-09)', () => {
+  it('rejects a missing X-API-Key with 401', async () => {
+    const app = await buildTestApp([{ accountId: ACCOUNT_A, name: 'Acme', role: 'owner' }]);
+    try {
+      const res = await userAccounts(app, { axisUserId: USER_ID }, {});
+      expect(res.statusCode).toBe(401);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects a wrong X-API-Key with 401', async () => {
+    const app = await buildTestApp([{ accountId: ACCOUNT_A, name: 'Acme', role: 'owner' }]);
+    try {
+      const res = await userAccounts(app, { axisUserId: USER_ID }, { 'x-api-key': 'nope' });
+      expect(res.statusCode).toBe(401);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('GET /atlas-connector/user-accounts — query validation (T-09)', () => {
+  it('rejects a missing axisUserId with 400', async () => {
+    const app = await buildTestApp([]);
+    try {
+      const res = await userAccounts(app, {});
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ ok: false });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects a non-uuid axisUserId with 400', async () => {
+    const app = await buildTestApp([]);
+    try {
+      const res = await userAccounts(app, { axisUserId: 'not-a-uuid' });
+      expect(res.statusCode).toBe(400);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('GET /atlas-connector/user-accounts — listing (T-09)', () => {
+  it('returns the user accounts with id, name and role', async () => {
+    const app = await buildTestApp([
+      { accountId: ACCOUNT_A, name: 'Acme', role: 'owner' },
+      { accountId: ACCOUNT_B, name: 'Globex', role: 'admin' },
+    ]);
+    try {
+      const res = await userAccounts(app, { axisUserId: USER_ID });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        ok: true,
+        accounts: [
+          { accountId: ACCOUNT_A, name: 'Acme', role: 'owner' },
+          { accountId: ACCOUNT_B, name: 'Globex', role: 'admin' },
+        ],
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('user with no memberships → empty list, still ok', async () => {
+    const app = await buildTestApp([]);
+    try {
+      const res = await userAccounts(app, { axisUserId: USER_ID });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ ok: true, accounts: [] });
     } finally {
       await app.close();
     }
