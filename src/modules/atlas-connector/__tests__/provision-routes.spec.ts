@@ -23,7 +23,11 @@ const OTHER_ACCOUNT = '12121212-3434-4565-8787-989898989898';
 const HMAC = 'a'.repeat(40);
 const BEARER = 'mcp-bearer-' + 'b'.repeat(20);
 
-const connectionsMock = vi.hoisted(() => ({ upsertConnection: vi.fn() }));
+const connectionsMock = vi.hoisted(() => ({
+  upsertConnection: vi.fn(),
+  deleteConnection: vi.fn(),
+  getConnectionByOrg: vi.fn(),
+}));
 vi.mock('../../atlas-events/connections', () => connectionsMock);
 
 const connectorMock = vi.hoisted(() => ({ clearConnectorCache: vi.fn() }));
@@ -79,12 +83,29 @@ function register(
   });
 }
 
+function deregister(
+  app: FastifyInstance,
+  payload: Record<string, unknown>,
+  headers: Record<string, string> = { 'x-api-key': API_KEY },
+) {
+  return app.inject({
+    method: 'POST',
+    url: '/atlas-connector/deregister',
+    headers: { 'content-type': 'application/json', ...headers },
+    payload,
+  });
+}
+
 beforeEach(() => {
   vi.unstubAllEnvs();
   vi.stubEnv('ATLAS_API_KEY', API_KEY);
   vi.stubEnv('ATLAS_URL', 'https://atlas-company-os.vercel.app');
   connectionsMock.upsertConnection.mockReset();
   connectionsMock.upsertConnection.mockResolvedValue(undefined);
+  connectionsMock.deleteConnection.mockReset();
+  connectionsMock.deleteConnection.mockResolvedValue(1);
+  connectionsMock.getConnectionByOrg.mockReset();
+  connectionsMock.getConnectionByOrg.mockResolvedValue({ atlasAccountId: ACCOUNT_A });
   connectorMock.clearConnectorCache.mockReset();
   handshakeMock.runHandshake.mockReset();
   handshakeMock.runHandshake.mockResolvedValue(null); // success by default
@@ -263,6 +284,90 @@ describe('POST /atlas-connector/register — handshake outcome (T-07)', () => {
       expect(first.statusCode).toBe(200);
       expect(second.statusCode).toBe(200);
       expect(second.json()).toEqual({ ok: true, status: 'active' });
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('POST /atlas-connector/deregister — auth gate (T-08)', () => {
+  it('rejects a missing X-API-Key with 401', async () => {
+    const app = await buildTestApp([]);
+    try {
+      const res = await deregister(app, { atlasOrgId: ATLAS_ORG_ID }, {});
+      expect(res.statusCode).toBe(401);
+      expect(connectionsMock.deleteConnection).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects a wrong X-API-Key with 401', async () => {
+    const app = await buildTestApp([]);
+    try {
+      const res = await deregister(app, { atlasOrgId: ATLAS_ORG_ID }, { 'x-api-key': 'nope' });
+      expect(res.statusCode).toBe(401);
+      expect(connectionsMock.deleteConnection).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('POST /atlas-connector/deregister — body validation (T-08)', () => {
+  it('rejects a missing atlasOrgId with 400', async () => {
+    const app = await buildTestApp([]);
+    try {
+      const res = await deregister(app, {});
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ ok: false });
+      expect(connectionsMock.deleteConnection).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects a non-uuid org id with 400', async () => {
+    const app = await buildTestApp([]);
+    try {
+      const res = await deregister(app, { atlasOrgId: 'not-a-uuid' });
+      expect(res.statusCode).toBe(400);
+      expect(connectionsMock.deleteConnection).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('POST /atlas-connector/deregister — removal (T-08)', () => {
+  it('existing connection → deletes by org, clears that account cache, ok', async () => {
+    connectionsMock.getConnectionByOrg.mockResolvedValueOnce({ atlasAccountId: ACCOUNT_A });
+    const app = await buildTestApp([]);
+    try {
+      const res = await deregister(app, { atlasOrgId: ATLAS_ORG_ID });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ ok: true });
+      expect(connectionsMock.deleteConnection).toHaveBeenCalledWith(expect.anything(), {
+        atlasOrgId: ATLAS_ORG_ID,
+      });
+      expect(connectorMock.clearConnectorCache).toHaveBeenCalledWith(ACCOUNT_A);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('idempotent: no existing connection → still ok, no cache clear', async () => {
+    connectionsMock.getConnectionByOrg.mockResolvedValueOnce(null);
+    connectionsMock.deleteConnection.mockResolvedValueOnce(0);
+    const app = await buildTestApp([]);
+    try {
+      const res = await deregister(app, { atlasOrgId: ATLAS_ORG_ID });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ ok: true });
+      expect(connectionsMock.deleteConnection).toHaveBeenCalledWith(expect.anything(), {
+        atlasOrgId: ATLAS_ORG_ID,
+      });
+      expect(connectorMock.clearConnectorCache).not.toHaveBeenCalled();
     } finally {
       await app.close();
     }

@@ -3,7 +3,12 @@ import { z } from 'zod';
 import { eq } from 'drizzle-orm';
 import { schema } from '@blossom/db';
 import { config } from '../../config';
-import { upsertConnection, type ConnectionStatus } from '../atlas-events/connections';
+import {
+  upsertConnection,
+  deleteConnection,
+  getConnectionByOrg,
+  type ConnectionStatus,
+} from '../atlas-events/connections';
 import { clearConnectorCache } from '../atlas-events/connector';
 import { runHandshake } from '../../scripts/atlas-handshake';
 
@@ -41,6 +46,10 @@ const registerBody = z.object({
   axisAccountId: z.string().uuid().optional(),
   hmacSecret: z.string().min(1),
   mcpBearer: z.string().min(1),
+});
+
+const deregisterBody = z.object({
+  atlasOrgId: z.string().uuid(),
 });
 
 export async function atlasProvisionRoutes(app: FastifyInstance): Promise<void> {
@@ -117,6 +126,38 @@ export async function atlasProvisionRoutes(app: FastifyInstance): Promise<void> 
       }
 
       return reply.send({ ok: true, status });
+    },
+  );
+
+  /**
+   * [Connect Flow / Phase 12.2 — T-08] Deregister: the inverse of register, the
+   * server-to-server call Atlas makes when an org owner disconnects their company
+   * (spec §"Desligar" + the `deregister` contract). Body carries only the org id;
+   * we drop the `atlas_connections` row for that org, which immediately stops the
+   * per-account emit (`getConnectorForAccount` lookups return null) and the
+   * inbound/backfill verification (no connection → 401).
+   *
+   * Same `X-API-Key == ATLAS_API_KEY` gate as register. Idempotent (G8):
+   * deregistering an org with no connection is a no-op that still answers
+   * `{ ok: true }`, so Atlas can retry. The connector cache is keyed by axis
+   * account, not org, so resolve the bound account first to drop its cached
+   * connector; if there is no connection there is nothing to delete or clear.
+   */
+  app.post(
+    '/atlas-connector/deregister',
+    { preHandler: app.requireAtlasApiKey },
+    async (req, reply) => {
+      const parsed = deregisterBody.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ ok: false, error: 'invalid body' });
+      }
+      const { atlasOrgId } = parsed.data;
+
+      const existing = await getConnectionByOrg(app.db, atlasOrgId);
+      await deleteConnection(app.db, { atlasOrgId });
+      if (existing) clearConnectorCache(existing.atlasAccountId);
+
+      return reply.send({ ok: true });
     },
   );
 }
