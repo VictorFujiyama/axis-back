@@ -7,20 +7,31 @@ import {
   buildContactEvent,
   buildConversationTurnEvent,
 } from '../atlas-events/build-connector-event';
+import { getConnectionByOrg } from '../atlas-events/connections';
 
 /**
  * Phase 12.2 — history backfill route (`GET /atlas-connector/backfill`, Berg
  * doc Phase 4e). Atlas's `backfill-app` worker walks pages until `nextCursor`
  * is null, re-entering each event into the standard pipeline (idempotent,
  * L-603). Auth: a GET signs the empty body (L-607); `verifyRequest` never
- * throws (L-612) — map `.reason` to 401, and 401 if the verified org isn't ours
- * (L-611). Contacts-first (spec §12.10.06, L-605): `?phase=contacts` (default)
- * before `?phase=messages` so turns resolve to a real entity, not a phantom
- * (L-604). Anti-leak P0 (L-615): both walks hard-filter `accountId =
- * ATLAS_SOURCE_ACCOUNT_ID` (both tables carry it directly — no JOIN). Cursor:
+ * throws (L-612) — map `.reason` to 401.
+ *
+ * Per-account (Connect Flow, T-06): the HMAC secret, the org id stamped on
+ * rebuilt envelopes, and the account that scopes the walk all come from the
+ * connection resolved by the signed `x-atlas-org-id` header
+ * (`getConnectionByOrg`) — no global `ATLAS_ORG_ID`/`ATLAS_SOURCE_ACCOUNT_ID`.
+ * An org with no connection → 401. The old "verified org ≠ ours" check (L-611)
+ * is now implicit: we look the secret up BY the header org, so a verified
+ * request is by construction for that org's account.
+ *
+ * Contacts-first (spec §12.10.06, L-605): `?phase=contacts` (default) before
+ * `?phase=messages` so turns resolve to a real entity, not a phantom (L-604).
+ * Anti-leak P0 (L-615): both walks hard-filter `accountId =
+ * connection.atlasAccountId` (both tables carry it directly — no JOIN). Cursor:
  * opaque `base64url(JSON({afterCreatedAt, afterId}))` keyset on `(created_at,
  * id)`; Drizzle has no row-tuple compare, so `> a OR (= a AND id > b)`, fetching
- * `limit + 1` to detect more. Envelopes reuse the T-004a builders (pre-validated).
+ * `limit + 1` to detect more. Envelopes reuse the T-004a builders (pre-validated),
+ * threaded with the connection's org id.
  */
 
 export interface DecodedCursor {
@@ -148,33 +159,29 @@ export async function atlasBackfillRoutes(
   app: FastifyInstance,
   opts: BackfillRouteOpts = {},
 ): Promise<void> {
-  // Gated like T-012: the boot precheck (T-003) guarantees ATLAS_ORG_ID +
-  // ATLAS_SOURCE_ACCOUNT_ID whenever the connector is enabled.
-  if (
-    !config.ATLAS_CONNECTOR_ENABLED ||
-    !config.ATLAS_HMAC_SECRET ||
-    !config.ATLAS_ORG_ID ||
-    !config.ATLAS_SOURCE_ACCOUNT_ID
-  ) {
+  // Global on/off only (T-10 retires this gate). The secret/org/account are now
+  // resolved per request from the connection, not the boot env.
+  if (!config.ATLAS_CONNECTOR_ENABLED) {
     return;
   }
-  const secret = config.ATLAS_HMAC_SECRET;
-  const orgId = config.ATLAS_ORG_ID;
-  const accountId = config.ATLAS_SOURCE_ACCOUNT_ID;
-  const buildContact = opts.buildContact ?? ((id) => buildContactEvent(app.db, { contactId: id }));
-  const buildTurn = opts.buildTurn ?? ((i) => buildConversationTurnEvent(app.db, i));
 
   app.get('/atlas-connector/backfill', async (req, reply) => {
+    // Resolve the org's connection (→ secret, account, org id) from the signed
+    // header before verifying. No connection → 401.
+    const orgHeader = headerValue(req, 'x-atlas-org-id');
+    const connection = orgHeader ? await getConnectionByOrg(app.db, orgHeader) : null;
+    if (!connection) return reply.code(401).send({ ok: false, error: 'unknown org' });
+
     // GET signs the empty body (L-607): the bytes we verify must equal what
-    // Atlas signed, which is ''.
+    // Atlas signed, which is ''. org-mismatch is implicit — the secret was
+    // looked up by the header org.
     const verify = verifyRequest(
       '',
       headerValue(req, 'x-atlas-signature'),
-      headerValue(req, 'x-atlas-org-id'),
-      secret,
+      orgHeader,
+      connection.secrets.hmacSecret,
     );
     if (!verify.ok) return reply.code(401).send({ ok: false, error: verify.reason });
-    if (verify.orgId !== orgId) return reply.code(401).send({ ok: false, error: 'org-mismatch' });
 
     const q = req.query as Record<string, string | undefined>;
     const phase: BackfillPhase = q.phase === 'messages' ? 'messages' : 'contacts';
@@ -183,12 +190,21 @@ export async function atlasBackfillRoutes(
     const cursor = q.cursor ? decodeCursor(q.cursor) : null;
     if (q.cursor && !cursor) return reply.code(400).send({ ok: false, error: 'malformed-cursor' });
 
+    // Builders stamp the connection's org id (T-04); tests inject their own.
+    const orgId = connection.atlasOrgId;
+    const buildContact =
+      opts.buildContact ?? ((id: string) => buildContactEvent(app.db, { contactId: id, orgId }));
+    const buildTurn =
+      opts.buildTurn ??
+      ((i: { conversationId: string; messageId: string }) =>
+        buildConversationTurnEvent(app.db, { ...i, orgId }));
+
     const { events, nextCursor } = await backfillPage({
       db: app.db,
       phase,
       cursor,
       limit,
-      accountId,
+      accountId: connection.atlasAccountId,
       buildContact,
       buildTurn,
     });
