@@ -3,11 +3,17 @@ import type { FastifyInstance } from 'fastify';
 import { signRequest, type ConnectorEvent } from '@atlas/connectors';
 import type { DB } from '@blossom/db';
 
-// T-014: GET /atlas-connector/backfill. The HMAC/gating/cursor-validation paths
-// are exercised through a real Fastify app (dynamic-import + stubEnv, L-418 /
-// T-012 precedent); the cursor-walk + contacts-first + anti-leak logic is unit-
-// tested against `backfillPage` with a chainable mock db + injected builders so
-// we don't have to mock the T-004a builders' own queries.
+// T-014/T-06: GET /atlas-connector/backfill. The HMAC/gating/cursor-validation
+// paths are exercised through a real Fastify app (dynamic-import + stubEnv,
+// L-418 / T-012 precedent); the cursor-walk + contacts-first + anti-leak logic
+// is unit-tested against `backfillPage` with a chainable mock db + injected
+// builders so we don't have to mock the T-004a builders' own queries.
+//
+// Per-account (T-06): the route resolves the HMAC secret + account + org from
+// the connection keyed by the signed `x-atlas-org-id` header. We mock
+// `getConnectionByOrg` (enqueue.spec pattern) — connected for ATLAS_ORG_ID,
+// unknown otherwise — so a `verifyRequest` against the connection's secret runs
+// without DB/crypto.
 //
 // `signRequest` is a pure value fn (no L-617 instanceof trap) — importing the
 // top-level SDK copy is fine.
@@ -15,6 +21,25 @@ import type { DB } from '@blossom/db';
 const TEST_SECRET = 'test-atlas-hmac-secret-' + 'a'.repeat(32);
 const ATLAS_ORG_ID = '220ef5e0-47df-4493-ae4d-ec0dfe83cabd';
 const ACCOUNT_ID = '33333333-4444-5555-6666-777777777777';
+
+// Per-account connection store (T-06). Mock so the route resolves a per-org
+// secret/account/org without DB or crypto.
+const connectionsMock = vi.hoisted(() => ({ getConnectionByOrg: vi.fn() }));
+vi.mock('../../atlas-events/connections', () => connectionsMock);
+
+/** A decrypted `atlas_connections` view (what `getConnectionByOrg` returns). */
+function fakeConnection(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'atlas-conn-1',
+    atlasAccountId: ACCOUNT_ID,
+    atlasOrgId: ATLAS_ORG_ID,
+    status: 'active' as const,
+    secrets: { hmacSecret: TEST_SECRET, mcpBearer: 'mcp-bearer-xyz' },
+    createdAt: new Date('2026-05-01T00:00:00.000Z'),
+    updatedAt: new Date('2026-05-01T00:00:00.000Z'),
+    ...overrides,
+  };
+}
 
 type Row = { id: string; createdAt: Date; conversationId?: string };
 const crow = (id: string, iso: string): Row => ({ id, createdAt: new Date(iso) });
@@ -65,11 +90,14 @@ async function buildTestApp(opts: {
 
 beforeEach(() => {
   vi.unstubAllEnvs();
-  vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'true');
+  // ATLAS_URL is the connector master switch (Connect Flow T-10): set → the
+  // route registers; secret/org/account resolved per-org from atlas_connections.
   vi.stubEnv('ATLAS_URL', 'https://atlas-company-os.vercel.app');
-  vi.stubEnv('ATLAS_ORG_ID', ATLAS_ORG_ID);
-  vi.stubEnv('ATLAS_HMAC_SECRET', TEST_SECRET);
-  vi.stubEnv('ATLAS_SOURCE_ACCOUNT_ID', ACCOUNT_ID);
+  // Per-org connection lookup: connected for ATLAS_ORG_ID, unknown otherwise.
+  connectionsMock.getConnectionByOrg.mockReset();
+  connectionsMock.getConnectionByOrg.mockImplementation(async (_db: unknown, org: string) =>
+    org === ATLAS_ORG_ID ? fakeConnection() : null,
+  );
 });
 
 afterEach(() => {
@@ -83,8 +111,8 @@ function signedHeaders() {
 }
 
 describe('atlas backfill route — gating + auth (T-014)', () => {
-  it('404 when ATLAS_CONNECTOR_ENABLED=false', async () => {
-    vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'false');
+  it('404 when ATLAS_URL is unset (connector off)', async () => {
+    vi.stubEnv('ATLAS_URL', undefined as unknown as string);
     const app = await buildTestApp({});
     try {
       const res = await app.inject({ method: 'GET', url: '/atlas-connector/backfill' });
@@ -109,9 +137,12 @@ describe('atlas backfill route — gating + auth (T-014)', () => {
     }
   });
 
-  it('401 when the verified org ≠ configured org', async () => {
+  it('401 when the org has no connection (T-06)', async () => {
     const app = await buildTestApp({});
     try {
+      // OTHER org → getConnectionByOrg returns null → 401 before any HMAC work.
+      // Sign with a valid secret to prove the rejection is the missing
+      // connection, not a bad signature.
       const other = '11111111-2222-3333-4444-555555555555';
       const { signature, orgIdHeader } = signRequest('', other, TEST_SECRET);
       const res = await app.inject({
@@ -120,7 +151,7 @@ describe('atlas backfill route — gating + auth (T-014)', () => {
         headers: { 'x-atlas-signature': signature, 'x-atlas-org-id': orgIdHeader },
       });
       expect(res.statusCode).toBe(401);
-      expect(res.json()).toMatchObject({ error: 'org-mismatch' });
+      expect(res.json()).toMatchObject({ error: 'unknown org' });
     } finally {
       await app.close();
     }

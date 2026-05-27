@@ -79,8 +79,8 @@ function authHeader(app: FastifyInstance): string {
 
 beforeEach(() => {
   vi.unstubAllEnvs();
-  // isAtlasMcpConfigured() needs both. ATLAS_CONNECTOR_ENABLED stays false, so
-  // the connector boot precheck (T-003) never fires for these tests.
+  // isAtlasMcpConfigured() needs both. This app registers only the MCP-pull
+  // route, so ATLAS_URL being set never pulls in the connector data-plane.
   vi.stubEnv('ATLAS_URL', 'https://atlas-company-os.vercel.app');
   vi.stubEnv('ATLAS_MCP_BEARER', BEARER);
 });

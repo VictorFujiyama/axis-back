@@ -67,6 +67,7 @@ import { modulesRoutes } from './modules/plugins/routes';
 import { googleOAuthRoutes } from './modules/oauth/google/routes';
 import { atlasInboundRoutes } from './modules/atlas-connector/inbound-routes';
 import { atlasBackfillRoutes } from './modules/atlas-connector/backfill-routes';
+import { atlasProvisionRoutes } from './modules/atlas-connector/provision-routes';
 import { atlasMcpRoutes } from './modules/atlas-mcp-client/routes';
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -234,12 +235,16 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(googleOAuthRoutes);
 
   // Phase 12.2 inbound push (POST /atlas-events). Plugin-scoped raw-body
-  // parser inside; gated by ATLAS_CONNECTOR_ENABLED — no route when disabled.
+  // parser inside; gated by ATLAS_URL (connector master switch) — no route when unset.
   await app.register(atlasInboundRoutes);
 
   // Phase 12.2 history backfill (GET /atlas-connector/backfill). Cursor walk,
-  // contacts-first, account-scoped; gated by ATLAS_CONNECTOR_ENABLED.
+  // contacts-first, account-scoped; gated by ATLAS_URL (connector master switch).
   await app.register(atlasBackfillRoutes);
+
+  // Connect Flow auto-provision (POST /atlas-connector/register, T-07). Control
+  // plane: X-API-Key gated, always registered (creates per-account connections).
+  await app.register(atlasProvisionRoutes);
 
   // Phase 12.2 MCP pull (GET /api/v1/atlas/memory). Front-facing read of Atlas
   // memory; always registered, returns 503 when ATLAS_MCP_BEARER is unset.

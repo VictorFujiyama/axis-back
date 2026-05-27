@@ -2,42 +2,59 @@ import type { FastifyInstance } from 'fastify';
 import { AtlasConnector, type ConnectorEvent } from '@atlas/connectors';
 import { config } from '../../config';
 import { QUEUE_NAMES } from '../../queue';
+import { getConnection } from './connections';
 
 /**
- * [12.2.10] Process-singleton `AtlasConnector` for the messaging connector.
+ * [Connect Flow / Phase 12.2] Per-account `AtlasConnector` (spec G3).
  *
- * Gated on `ATLAS_CONNECTOR_ENABLED`: returns `null` when the Phase 12.2 path
- * is off so callers (enqueue listeners in T-006, the worker in T-007) skip the
- * SDK client entirely and fall through to the legacy Phase B leg.
+ * One `AtlasConnector` per axis account: looks up the account's
+ * `atlas_connections` row, builds an
+ * `AtlasConnector` stamped with THAT connection's `org_id` + HMAC secret (the
+ * Atlas base URL stays global — `config.ATLAS_URL`, spec §7), and caches it.
+ * Returns `null` when the account has no connection — callers (T-05 emit) treat
+ * that as the anti-leak rule: only accounts WITH a connection emit.
  *
- * The `queueAdapter` defers `.emit()` to the existing BullMQ `atlas-events`
- * queue rather than POSTing inline: the listener side enqueues a job (jobId =
- * `event_id` for idempotency, L-603), and the worker side dequeues and calls
- * `.emitDirect()` for the actual sign + POST + retry. One connector serves both
- * paths in-process — `emitDirect` bypasses the adapter, so the worker reuses
- * this same instance.
+ * Cache is keyed by `accountId` and additionally guarded on the connection's
+ * `org_id` + `hmacSecret`, so a re-register that rotates the secret (T-07
+ * upsert) transparently rebuilds the connector rather than emitting with a stale
+ * HMAC. The `queueAdapter` mirrors the global connector: `.emit()` defers to the
+ * shared `atlas-events` BullMQ queue (jobId = `event_id`), the worker calls
+ * `.emitDirect()`.
  */
-let connector: AtlasConnector | null = null;
+const accountConnectors = new Map<
+  string,
+  { connector: AtlasConnector; orgId: string; hmacSecret: string }
+>();
 
-export function getAtlasConnector(app: FastifyInstance): AtlasConnector | null {
-  if (!config.ATLAS_CONNECTOR_ENABLED) return null;
-  if (connector) return connector;
+export async function getConnectorForAccount(
+  app: FastifyInstance,
+  accountId: string,
+): Promise<AtlasConnector | null> {
+  const conn = await getConnection(app.db, accountId);
+  if (!conn) return null;
 
-  const { ATLAS_URL, ATLAS_ORG_ID, ATLAS_HMAC_SECRET } = config;
-  // The boot precheck in config.ts throws when ATLAS_CONNECTOR_ENABLED=true with
-  // any of these unset, so reaching here with a hole is an unreachable invariant.
-  // Assert loudly rather than silently disabling the connector.
-  if (!ATLAS_URL || !ATLAS_ORG_ID || !ATLAS_HMAC_SECRET) {
+  // The per-account path keeps only ATLAS_URL global; without it there is no
+  // Atlas to point the connector at. The boot config marks it optional, so guard
+  // loudly here rather than constructing a connector aimed at `undefined`.
+  if (!config.ATLAS_URL) {
     throw new Error(
-      'getAtlasConnector: ATLAS_CONNECTOR_ENABLED=true but ATLAS_URL/ATLAS_ORG_ID/ATLAS_HMAC_SECRET unset (boot precheck should have caught this).',
+      'getConnectorForAccount: ATLAS_URL unset — the Atlas base URL stays global (spec §7) and is required to build a per-account connector.',
     );
   }
 
-  connector = new AtlasConnector({
-    atlasBaseUrl: ATLAS_URL,
+  const orgId = conn.atlasOrgId;
+  const { hmacSecret } = conn.secrets;
+
+  const cached = accountConnectors.get(accountId);
+  if (cached && cached.orgId === orgId && cached.hmacSecret === hmacSecret) {
+    return cached.connector;
+  }
+
+  const built = new AtlasConnector({
+    atlasBaseUrl: config.ATLAS_URL,
     app: 'messaging',
-    orgId: ATLAS_ORG_ID,
-    hmacSecret: ATLAS_HMAC_SECRET,
+    orgId,
+    hmacSecret,
     queueAdapter: {
       enqueue: async (event: ConnectorEvent) => {
         await app.queues
@@ -46,5 +63,16 @@ export function getAtlasConnector(app: FastifyInstance): AtlasConnector | null {
       },
     },
   });
-  return connector;
+  accountConnectors.set(accountId, { connector: built, orgId, hmacSecret });
+  return built;
+}
+
+/**
+ * Drop cached per-account connector(s). Call after a re-register/deregister so
+ * the next emit rebuilds against fresh connection state (T-07/T-08), and to
+ * reset module state between tests. No arg clears every account.
+ */
+export function clearConnectorCache(accountId?: string): void {
+  if (accountId) accountConnectors.delete(accountId);
+  else accountConnectors.clear();
 }

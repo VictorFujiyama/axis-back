@@ -126,47 +126,21 @@ const envSchema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((v) => v === 'true'),
-  // ---- Atlas integration (Phase 12.2 — Connector Bridge cutover) ----
+  // ---- Atlas integration (Phase 12.2 — Connector Bridge, per-account) ----
   // Base URL of the Atlas instance the connector emits to / pulls from
   // (e.g. https://atlas-company-os.vercel.app). Distinct from ATLAS_BASE_URL
   // (legacy Phase A/B leg) so the connector and Phase B paths can target
-  // different hosts during the soak. Required when ATLAS_CONNECTOR_ENABLED=true.
+  // different hosts. This is now the connector's MASTER SWITCH: when set, the
+  // emit/inbound/backfill paths go live and resolve org + HMAC secret PER
+  // ACCOUNT from `atlas_connections` (Connect Flow T-10 retired the per-org env
+  // globals ATLAS_ORG_ID/ATLAS_HMAC_SECRET/ATLAS_SOURCE_ACCOUNT_ID and the
+  // ATLAS_CONNECTOR_ENABLED/ATLAS_DUAL_EMIT switches — org/secret/source-account
+  // are no longer boot config).
   ATLAS_URL: z.string().url().optional(),
-  // Atlas org UUID the messaging connector is installed for. Bound into the
-  // HMAC payload (`${t}.${orgId}.${rawBody}`) and stamped on every envelope's
-  // `org_id`. Single-org V1 (one connector = one Atlas org). Required when
-  // ATLAS_CONNECTOR_ENABLED=true.
-  ATLAS_ORG_ID: z.string().uuid().optional(),
-  // Shared HMAC secret for the Phase 12.2 connector (48 hex chars from Berg).
-  // Kept separate from ATLAS_EVENTS_HMAC_SECRET (Phase B) — the two HMAC
-  // primitives differ (`${t}.${orgId}.${rawBody}` vs `${t}.${rawBody}`), so a
-  // single secret can't serve both. Required when ATLAS_CONNECTOR_ENABLED=true.
-  ATLAS_HMAC_SECRET: z.string().min(32).optional(),
   // Bearer token for pulling Atlas memory via the scoped MCP endpoint
   // (POST /api/connectors/atlas-mcp). 43 base64url chars from Berg. Optional —
   // the MCP pull helper no-ops without it; not required for emit/handshake.
   ATLAS_MCP_BEARER: z.string().min(20).optional(),
-  // axis-back account UUID that maps to the connector's Atlas org. ANTI-LEAK
-  // P0: axis-back is multi-account but the connector is single-org, so every
-  // emit/bulk/backfill path MUST filter to this account or it stamps another
-  // tenant's traffic with Berg's org_id (cross-tenant leak). Required when
-  // ATLAS_CONNECTOR_ENABLED=true.
-  ATLAS_SOURCE_ACCOUNT_ID: z.string().uuid().optional(),
-  // Master switch for the Phase 12.2 connector path (emit + inbound + backfill).
-  // Default false so envs without the integration boot fine. Enum-string (not
-  // z.coerce.boolean) because the latter coerces the literal 'false' to true.
-  ATLAS_CONNECTOR_ENABLED: z
-    .enum(['true', 'false'])
-    .default('false')
-    .transform((v) => v === 'true'),
-  // Soak switch (Phase 9): when true, the worker POSTs each event to BOTH the
-  // Phase 12.2 connector AND the legacy Phase B endpoint for ≥24h side-by-side
-  // comparison. Requires the Phase B leg (ATLAS_EVENTS_HMAC_SECRET +
-  // ATLAS_BASE_URL) to be set. Default false. Phase 10 flips this off.
-  ATLAS_DUAL_EMIT: z
-    .enum(['true', 'false'])
-    .default('false')
-    .transform((v) => v === 'true'),
 });
 
 export type Config = z.infer<typeof envSchema>;
@@ -197,45 +171,10 @@ if (config.MCP_SERVER_ENABLED) {
   }
 }
 
-// Phase 12.2 connector precheck. Caught at boot so a half-configured cutover
-// crash-loops loudly instead of silently dropping events or leaking another
-// account's traffic into Berg's org. The connector cannot run without its base
-// URL, org id, HMAC secret, and the anti-leak source account scope.
-if (config.ATLAS_CONNECTOR_ENABLED) {
-  const missing = (
-    [
-      ['ATLAS_URL', config.ATLAS_URL],
-      ['ATLAS_ORG_ID', config.ATLAS_ORG_ID],
-      ['ATLAS_HMAC_SECRET', config.ATLAS_HMAC_SECRET],
-      ['ATLAS_SOURCE_ACCOUNT_ID', config.ATLAS_SOURCE_ACCOUNT_ID],
-    ] as const
-  )
-    .filter(([, v]) => !v)
-    .map(([k]) => k);
-  if (missing.length > 0) {
-    throw new Error(
-      `ATLAS_CONNECTOR_ENABLED=true requires ${missing.join(', ')}.`,
-    );
-  }
-  // Dual-emit replays each event onto the legacy Phase B leg too — without its
-  // secret + base URL the Phase B POST silently no-ops and the soak comparison
-  // is meaningless.
-  if (config.ATLAS_DUAL_EMIT) {
-    const dualMissing = (
-      [
-        ['ATLAS_EVENTS_HMAC_SECRET', config.ATLAS_EVENTS_HMAC_SECRET],
-        ['ATLAS_BASE_URL', config.ATLAS_BASE_URL],
-      ] as const
-    )
-      .filter(([, v]) => !v)
-      .map(([k]) => k);
-    if (dualMissing.length > 0) {
-      throw new Error(
-        `ATLAS_DUAL_EMIT=true requires the Phase B leg: ${dualMissing.join(', ')}.`,
-      );
-    }
-  }
-}
+// Connect Flow (Phase 12.2 per-account): the connector no longer has a boot
+// precheck. ATLAS_URL alone gates the path; org id, HMAC secret, and the source
+// account are resolved per request from `atlas_connections`, so a half-config
+// can't leak another tenant's traffic — an org with no connection just 401s.
 
 // Safety net: refuse to boot in production with weak or dev-default secrets.
 if (config.NODE_ENV === 'production') {

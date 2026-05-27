@@ -211,6 +211,13 @@
       "when": 1779719730291,
       "tag": "0029_slow_fenris",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1779857519042,
+      "tag": "0030_icy_champions",
+      "breakpoints": true
     }
   ]
 }

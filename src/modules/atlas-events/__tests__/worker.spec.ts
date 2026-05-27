@@ -5,14 +5,16 @@ import { ConnectorEmitFailedError, type ConnectorEvent } from '@atlas/connectors
 
 import type { AtlasEventJob } from '../enqueue';
 
-// Mock the connector singleton: T-007 worker tests verify the worker's DISPATCH
-// + error contract (4xx terminal vs 5xx rethrow vs disabled), NOT the SDK's
-// retry internals (covered by the SDK's own suite). The mock drives emitDirect's
-// outcome without real backoff sleeps or a live Atlas endpoint. Legacy/§12.1
-// jobs never hit it (isConnectorEvent === false), so the existing cases are
-// untouched. Mirrors enqueue.spec's vi.hoisted+vi.mock pattern (T-006).
+// Mock the per-account connector resolver: worker tests verify the worker's
+// DISPATCH + error contract (4xx terminal vs 5xx rethrow vs no-connection), NOT
+// the SDK's retry internals (covered by the SDK's own suite). The mock drives
+// emitDirect's outcome without real backoff sleeps or a live Atlas endpoint.
+// Post-T-05 the worker resolves the connector by the job's `metadata.accountId`
+// via `getConnectorForAccount` (async). Legacy/§12.1 jobs never hit it
+// (isConnectorEvent === false), so those cases are untouched. Mirrors
+// enqueue.spec's vi.hoisted+vi.mock pattern.
 const connectorMock = vi.hoisted(() => ({
-  getAtlasConnector: vi.fn(),
+  getConnectorForAccount: vi.fn(),
 }));
 vi.mock('../connector', () => connectorMock);
 
@@ -75,13 +77,8 @@ async function loadFreshWorker(
     delete process.env.ATLAS_EVENTS_ENDPOINT;
   }
   if (connectorEnabled) {
-    // config.ts's boot precheck requires all four when the connector is on —
-    // stub them or importing config throws (mirrors enqueue.spec).
-    vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'true');
+    // ATLAS_URL alone is the connector master switch now (Connect Flow T-10).
     vi.stubEnv('ATLAS_URL', CONNECTOR_URL);
-    vi.stubEnv('ATLAS_ORG_ID', CONNECTOR_ORG_ID);
-    vi.stubEnv('ATLAS_HMAC_SECRET', CONNECTOR_HMAC);
-    vi.stubEnv('ATLAS_SOURCE_ACCOUNT_ID', SOURCE_ACCOUNT_ID);
   }
   const mod = await import('../worker');
   return { registerAtlasEventsWorker: mod.registerAtlasEventsWorker };
@@ -93,7 +90,6 @@ const VALID_BASE_URL = 'http://atlas-web:3010';
 // Phase 12.2 connector env fixtures (must be schema-valid: uuid / url / min-len).
 const CONNECTOR_ORG_ID = '220ef5e0-47df-4493-ae4d-ec0dfe83cabd';
 const CONNECTOR_URL = 'https://atlas-company-os.vercel.app';
-const CONNECTOR_HMAC = 'b'.repeat(48);
 const SOURCE_ACCOUNT_ID = '11111111-1111-1111-1111-111111111111';
 
 function makeConnectorJob(): { id: string; data: ConnectorEvent } {
@@ -149,7 +145,7 @@ function captureHandler(registerWorker: ReturnType<typeof vi.fn>): Processor {
 describe('registerAtlasEventsWorker', () => {
   beforeEach(() => {
     vi.unstubAllEnvs();
-    connectorMock.getAtlasConnector.mockReset();
+    connectorMock.getConnectorForAccount.mockReset();
   });
 
   afterEach(() => {
@@ -396,9 +392,9 @@ describe('registerAtlasEventsWorker', () => {
   });
 
   describe('Phase 12.2 connector jobs', () => {
-    /** Point the mocked singleton at a connector whose emitDirect we control. */
+    /** Resolve the job's account to a connector whose emitDirect we control. */
     function stubConnector(emitDirect: ReturnType<typeof vi.fn>): void {
-      connectorMock.getAtlasConnector.mockReturnValue({ emitDirect });
+      connectorMock.getConnectorForAccount.mockResolvedValue({ emitDirect });
     }
 
     it('delivers a ConnectorEvent via emitDirect, bypassing the Phase B fetch', async () => {
@@ -468,18 +464,20 @@ describe('registerAtlasEventsWorker', () => {
       expect(log.warn).toHaveBeenCalled();
     });
 
-    it('marks complete when a connector job arrives but the connector is disabled', async () => {
+    it('marks complete when a connector job arrives but its account has no connection', async () => {
       const { registerAtlasEventsWorker } = await loadFreshWorker(
         VALID_SECRET,
         VALID_BASE_URL,
       );
       const { app, queues, log } = buildAppStub();
-      connectorMock.getAtlasConnector.mockReturnValue(null);
+      connectorMock.getConnectorForAccount.mockResolvedValue(null);
 
       registerAtlasEventsWorker(app, {});
       const handler = captureHandler(queues.registerWorker);
 
       await expect(handler(makeConnectorJob())).resolves.toBeUndefined();
+      // Resolved by the job's metadata.accountId; null connection → no delivery.
+      expect(connectorMock.getConnectorForAccount).toHaveBeenCalledWith(app, SOURCE_ACCOUNT_ID);
       const lastWarn = log.warn.mock.calls.at(-1)![0];
       expect(lastWarn).toMatchObject({
         jobId: 'job-conn-1',

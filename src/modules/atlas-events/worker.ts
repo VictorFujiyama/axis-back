@@ -3,7 +3,7 @@ import { ConnectorEmitFailedError, type ConnectorEvent } from '@atlas/connectors
 import { config } from '../../config';
 import { QUEUE_NAMES } from '../../queue';
 import { signOutboundPayload } from '../webhooks/sign';
-import { getAtlasConnector } from './connector';
+import { getConnectorForAccount } from './connector';
 import type { AtlasEventJob } from './enqueue';
 
 const TIMEOUT_MS = 5_000;
@@ -20,9 +20,10 @@ export interface AtlasEventsWorkerDeps {
  *  - {@link AtlasEventJob} — legacy Phase B / §12.1 envelope jobs, delivered
  *    via {@link serializeJob} + `signOutboundPayload` (`${t}.${body}`) to the
  *    Phase B endpoint.
- * During the soak (Phase 9, `ATLAS_DUAL_EMIT`) BOTH shapes flow concurrently as
- * SEPARATE jobs with distinct jobIds + event_ids (L-609) — one job → one POST,
- * dispatched here by shape. NOT one job → two POSTs.
+ * Connect Flow (Phase 10): dual-emit is retired — with the connector on
+ * (`ATLAS_URL` set) the enqueuer produces connector jobs only. Both shapes
+ * still dispatch here by shape so any legacy jobs queued during the cutover
+ * drain cleanly — one job → one POST. NOT one job → two POSTs.
  */
 type AtlasEventQueueJob = AtlasEventJob | ConnectorEvent;
 
@@ -131,6 +132,12 @@ function jobLogContext(job: AtlasEventJob): Record<string, unknown> {
  * (L-602). Runs independent of the Phase B secret/baseUrl so Phase 10 (dropping
  * the Phase B leg) can't disable connector delivery.
  *
+ * The connector is resolved PER ACCOUNT (spec G5, Connect Flow): the queued
+ * event carries `metadata.accountId`, so we look up THAT account's connection
+ * and sign/POST with its org/secret. A job whose account has no connection
+ * (deregistered, or the row is gone) is marked complete — there is nowhere to
+ * deliver it.
+ *
  * Error contract mirrors the Phase B leg: the SDK throws
  * `ConnectorEmitFailedError` once retries exhaust. A 4xx is terminal — a bad
  * signature/schema/rate-limit won't fix itself, so mark complete and don't let
@@ -142,13 +149,16 @@ async function deliverConnectorEvent(
   jobId: string | undefined,
   event: ConnectorEvent,
 ): Promise<void> {
-  const connector = getAtlasConnector(app);
+  const accountId =
+    typeof event.metadata['accountId'] === 'string' ? event.metadata['accountId'] : undefined;
+  const connector = accountId ? await getConnectorForAccount(app, accountId) : null;
   if (!connector) {
-    // A connector job drained while ATLAS_CONNECTOR_ENABLED is off (a flag flip
-    // during a deploy window). Mark complete — the path is intentionally off.
+    // The job's account has no Atlas connection (deregistered, the per-account
+    // mapping is gone, or the event lacks accountId metadata). Mark complete —
+    // there is nowhere to deliver it.
     app.log.warn(
-      { jobId, eventId: event.event_id, kind: event.kind },
-      'atlas-events worker: connector job but connector disabled — marking complete',
+      { jobId, eventId: event.event_id, kind: event.kind, accountId },
+      'atlas-events worker: connector job but no connection for account — marking complete',
     );
     return;
   }
@@ -206,7 +216,7 @@ export function registerAtlasEventsWorker(
   app: FastifyInstance,
   deps: AtlasEventsWorkerDeps = {},
 ): void {
-  if (!config.ATLAS_EVENTS_HMAC_SECRET && !config.ATLAS_CONNECTOR_ENABLED) {
+  if (!config.ATLAS_EVENTS_HMAC_SECRET && !config.ATLAS_URL) {
     app.log.info('atlas-events worker: disabled (no HMAC secret, connector off)');
     return;
   }

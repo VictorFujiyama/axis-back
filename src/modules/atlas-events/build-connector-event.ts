@@ -1,7 +1,6 @@
 import { eq } from 'drizzle-orm';
 import { schema, type DB } from '@blossom/db';
 import { parseConnectorEvent, type ConnectorEvent } from '@atlas/connectors';
-import { config } from '../../config';
 
 /**
  * Phase 12.2 Connector Bridge — `ConnectorEvent` builders (the cutover wire
@@ -47,10 +46,15 @@ function validateConnectorEvent(ev: ConnectorEvent): ConnectorEvent {
   return r.event;
 }
 
-/** Common envelope fields every kind shares. `org_id` is the single Atlas org
- * (L-611); an unset value falls to `''` and fails `validateConnectorEvent`'s
- * uuid check loudly rather than shipping a malformed envelope. */
-function connectorBase(occurredAt: string): Pick<
+/** Common envelope fields every kind shares. `org_id` comes from the per-account
+ * connection (Connect Flow): each builder threads the connection's `orgId` down
+ * to here. With no `orgId` the value falls to `''`, which fails
+ * `validateConnectorEvent`'s uuid check loudly rather than shipping a malformed
+ * envelope (the global `config.ATLAS_ORG_ID` fallback was retired in T-10). */
+function connectorBase(
+  occurredAt: string,
+  orgId?: string,
+): Pick<
   ConnectorEvent,
   | 'schema_version'
   | 'emitted_at'
@@ -65,7 +69,7 @@ function connectorBase(occurredAt: string): Pick<
     emitted_at: new Date().toISOString(),
     app: APP_SLUG,
     app_version: APP_VERSION,
-    org_id: config.ATLAS_ORG_ID ?? '',
+    org_id: orgId ?? '',
     occurred_at: occurredAt,
     viewable_by: ORG_VIEWABLE,
   };
@@ -177,7 +181,7 @@ async function loadMessage(db: DB, messageId: string) {
  * (low-value, spec §12.1.06); human/contact turns embed their summary. */
 export async function buildConversationTurnEvent(
   db: DB,
-  input: { conversationId: string; messageId: string; meta?: AtlasMeta },
+  input: { conversationId: string; messageId: string; meta?: AtlasMeta; orgId?: string },
 ): Promise<ConnectorEvent> {
   const conv = await loadConversation(db, input.conversationId);
   const accountId = await loadAccountId(db, conv.inboxId);
@@ -191,7 +195,7 @@ export async function buildConversationTurnEvent(
   const isLowValue = senderType === 'bot' || senderType === 'system';
 
   return validateConnectorEvent({
-    ...connectorBase(msg.createdAt.toISOString()),
+    ...connectorBase(msg.createdAt.toISOString(), input.orgId),
     event_id: `msg_${msg.id}`,
     kind: 'conversation_turn',
     action: 'create',
@@ -208,13 +212,13 @@ export async function buildConversationTurnEvent(
  * durable memory). `event_id=conv_<id>:resolved` (L-603). */
 export async function buildConversationSummaryEvent(
   db: DB,
-  input: { conversationId: string },
+  input: { conversationId: string; orgId?: string },
 ): Promise<ConnectorEvent> {
   const conv = await loadConversation(db, input.conversationId);
   const accountId = await loadAccountId(db, conv.inboxId);
 
   return validateConnectorEvent({
-    ...connectorBase(new Date().toISOString()),
+    ...connectorBase(new Date().toISOString(), input.orgId),
     event_id: `conv_${conv.id}:resolved`,
     kind: 'conversation_summary',
     action: 'update',
@@ -231,14 +235,14 @@ export async function buildConversationSummaryEvent(
  * occurrence distinct. */
 export async function buildHandoffEvent(
   db: DB,
-  input: { conversationId: string },
+  input: { conversationId: string; orgId?: string },
 ): Promise<ConnectorEvent> {
   const conv = await loadConversation(db, input.conversationId);
   const accountId = await loadAccountId(db, conv.inboxId);
   const now = new Date().toISOString();
 
   return validateConnectorEvent({
-    ...connectorBase(now),
+    ...connectorBase(now, input.orgId),
     event_id: `conv_${conv.id}:handoff:${Date.parse(now)}`,
     kind: 'handoff_to_human',
     action: 'update',
@@ -255,7 +259,7 @@ export async function buildHandoffEvent(
  * one entity (L-605, spec §12.10.06). */
 export async function buildContactEvent(
   db: DB,
-  input: { contactId: string },
+  input: { contactId: string; orgId?: string },
 ): Promise<ConnectorEvent> {
   const [c] = await db
     .select({
@@ -273,7 +277,7 @@ export async function buildContactEvent(
   if (!c.accountId) throw new Error(`build-connector-event: contact ${c.id} missing accountId`);
 
   return validateConnectorEvent({
-    ...connectorBase(c.createdAt.toISOString()),
+    ...connectorBase(c.createdAt.toISOString(), input.orgId),
     event_id: `contact_${c.id}`,
     kind: 'contact',
     action: 'create',
