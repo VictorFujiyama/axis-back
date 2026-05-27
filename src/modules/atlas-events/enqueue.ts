@@ -1,9 +1,10 @@
 import type { FastifyInstance } from 'fastify';
+import { eq } from 'drizzle-orm';
+import { schema, type DB } from '@blossom/db';
 import { config } from '../../config';
 import { eventBus, type RealtimeEvent } from '../../realtime/event-bus';
 import { QUEUE_NAMES } from '../../queue';
-import type { DB } from '@blossom/db';
-import { type AtlasConnector, type ConnectorEvent } from '@atlas/connectors';
+import { type ConnectorEvent } from '@atlas/connectors';
 import {
   buildConversationTurnEnvelope,
   buildHandoffEnvelope,
@@ -16,7 +17,8 @@ import {
   buildHandoffEvent,
   buildContactEvent,
 } from './build-connector-event';
-import { getAtlasConnector } from './connector';
+import { getConnectorForAccount } from './connector';
+import { getConnection } from './connections';
 
 export interface AtlasEventActor {
   kind: 'contact' | 'user' | 'bot' | 'system';
@@ -80,15 +82,19 @@ interface LegacyMappedJob {
  * Subscribe to eventBus and enqueue outbound Atlas events. Two independent legs
  * run per event (spec §11 flag matrix), each in its own try/catch so one can't
  * block the other:
- *   1. Connector (Phase 12.2) — gated SOLELY on `ATLAS_CONNECTOR_ENABLED` via
- *      `getAtlasConnector` (NOT `USE_PHASE_12_ENVELOPE`, §11 C-A). Builds a
- *      `ConnectorEvent` and `.emit()`s it; queueAdapter uses `jobId=event_id`.
+ *   1. Connector (Phase 12.2) — gated on `ATLAS_CONNECTOR_ENABLED`, but now
+ *      resolves a connector PER ACCOUNT (spec G5, Connect Flow): the event's
+ *      axis account → its `atlas_connections` row → `.emit()` stamped with that
+ *      connection's org/secret. An account with NO connection never emits
+ *      (anti-leak is implicit, no global `ATLAS_SOURCE_ACCOUNT_ID`). queueAdapter
+ *      uses `jobId=event_id`. (T-10 swaps the `ATLAS_CONNECTOR_ENABLED` gate for
+ *      the per-account/`ATLAS_URL` model once the global env is removed.)
  *   2. Legacy (Phase B / §12.1) — runs while the Phase B secret is set AND
  *      (connector-off, prod today, OR dual-emit soak). Branches on
  *      `USE_PHASE_12_ENVELOPE`. Connector-only (Phase 10) skips it.
  * C1 gate decouple (§11): the subscription survives when EITHER the Phase B
  * secret OR the connector is set — Phase 10 dropping the secret must not kill
- * the connector. Worker.ts (T-007) dispatches the queued shapes.
+ * the connector. Worker.ts dispatches the queued shapes.
  */
 export function subscribeAtlasEvents(app: FastifyInstance): void {
   if (!config.ATLAS_EVENTS_HMAC_SECRET && !config.ATLAS_CONNECTOR_ENABLED) {
@@ -96,7 +102,7 @@ export function subscribeAtlasEvents(app: FastifyInstance): void {
     return;
   }
 
-  const connector = getAtlasConnector(app);
+  const connectorEnabled = config.ATLAS_CONNECTOR_ENABLED;
   const queue = app.queues.getQueue<AtlasEventJob>(QUEUE_NAMES.ATLAS_EVENTS);
 
   // Phase B leg runs when its secret is set AND (connector-off OR dual-emit).
@@ -105,9 +111,9 @@ export function subscribeAtlasEvents(app: FastifyInstance): void {
     (!config.ATLAS_CONNECTOR_ENABLED || config.ATLAS_DUAL_EMIT);
 
   eventBus.onEvent(async (event: RealtimeEvent) => {
-    if (connector) {
+    if (connectorEnabled) {
       try {
-        await emitConnectorEvent(app.db, connector, event);
+        await emitConnectorEvent(app, event);
       } catch (err) {
         app.log.warn({ err, eventType: event.type }, 'atlas-events: connector emit failed');
       }
@@ -129,27 +135,62 @@ export function subscribeAtlasEvents(app: FastifyInstance): void {
 }
 
 /**
- * Build the connector envelope for an event and `.emit()` it — unless it
- * belongs to another account. Anti-leak P0 (spec §10b, L-615): the connector
- * maps a SINGLE axis-back account to the Atlas org, so an event whose resolved
- * account differs from `ATLAS_SOURCE_ACCOUNT_ID` must never be stamped with the
- * connector org_id. We drop AFTER building (the builder resolves the account
- * from the inbox/contact row into `metadata.accountId`) but BEFORE emit.
+ * Resolve the event's axis account, look up that account's Atlas connection,
+ * and `.emit()` the connector event stamped with the connection's `org_id`.
+ *
+ * Anti-leak is now implicit and per-account (spec G5): only an account that has
+ * a row in `atlas_connections` emits — an event whose account has no connection
+ * is dropped BEFORE building, with no global `ATLAS_SOURCE_ACCOUNT_ID` compare.
+ * The `org_id` stamped on the envelope comes from the connection (threaded into
+ * the builder), so each account's events carry that account's org/secret.
+ *
+ * `getConnection` runs once here for the org + existence check and again inside
+ * `getConnectorForAccount` (its rotation-safe cache guard re-reads it) — a cheap
+ * extra row read per emit, kept for the clean per-account boundary.
  */
-async function emitConnectorEvent(
-  db: DB,
-  connector: AtlasConnector,
-  event: RealtimeEvent,
-): Promise<void> {
-  const built = await buildConnectorEventForEvent(db, event);
+async function emitConnectorEvent(app: FastifyInstance, event: RealtimeEvent): Promise<void> {
+  const accountId = await resolveEventAccountId(app.db, event);
+  if (!accountId) return;
+
+  const conn = await getConnection(app.db, accountId);
+  if (!conn) return; // no connection for this account → never emit (anti-leak)
+
+  const connector = await getConnectorForAccount(app, accountId);
+  if (!connector) return; // defensive: connection vanished between the two reads
+
+  const built = await buildConnectorEventForEvent(app.db, event, conn.atlasOrgId);
   if (!built) return;
-  if (built.metadata['accountId'] !== config.ATLAS_SOURCE_ACCOUNT_ID) return;
   await connector.emit(built);
+}
+
+/**
+ * Resolve the axis `accountId` an event belongs to, without building the full
+ * envelope. Account-scoped events (`contact.created`) carry it directly;
+ * conversation-scoped events carry `inboxId`, so map inbox → account. Returns
+ * null when the event has no connector mapping (e.g. a bot-assigned handoff).
+ */
+async function resolveEventAccountId(db: DB, event: RealtimeEvent): Promise<string | null> {
+  if (event.type === 'contact.created') return event.accountId;
+  if (event.type === 'conversation.assigned' && event.assignedBotId !== null) return null;
+  if (
+    event.type === 'message.created' ||
+    event.type === 'conversation.resolved' ||
+    event.type === 'conversation.assigned'
+  ) {
+    const [row] = await db
+      .select({ accountId: schema.inboxes.accountId })
+      .from(schema.inboxes)
+      .where(eq(schema.inboxes.id, event.inboxId))
+      .limit(1);
+    return row?.accountId ?? null;
+  }
+  return null;
 }
 
 async function buildConnectorEventForEvent(
   db: DB,
   event: RealtimeEvent,
+  orgId: string,
 ): Promise<ConnectorEvent | null> {
   if (event.type === 'message.created') {
     // Forward the MCP-write `meta` so bot/system turns carry `atlas_user_id`
@@ -158,20 +199,21 @@ async function buildConnectorEventForEvent(
       conversationId: event.conversationId,
       messageId: event.message.id,
       meta: event.meta,
+      orgId,
     });
   }
 
   if (event.type === 'conversation.resolved') {
-    return buildConversationSummaryEvent(db, { conversationId: event.conversationId });
+    return buildConversationSummaryEvent(db, { conversationId: event.conversationId, orgId });
   }
 
   if (event.type === 'conversation.assigned') {
     if (event.assignedBotId !== null) return null;
-    return buildHandoffEvent(db, { conversationId: event.conversationId });
+    return buildHandoffEvent(db, { conversationId: event.conversationId, orgId });
   }
 
   if (event.type === 'contact.created') {
-    return buildContactEvent(db, { contactId: event.contact.id });
+    return buildContactEvent(db, { contactId: event.contact.id, orgId });
   }
 
   return null;

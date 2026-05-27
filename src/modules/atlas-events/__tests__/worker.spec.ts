@@ -5,14 +5,16 @@ import { ConnectorEmitFailedError, type ConnectorEvent } from '@atlas/connectors
 
 import type { AtlasEventJob } from '../enqueue';
 
-// Mock the connector singleton: T-007 worker tests verify the worker's DISPATCH
-// + error contract (4xx terminal vs 5xx rethrow vs disabled), NOT the SDK's
-// retry internals (covered by the SDK's own suite). The mock drives emitDirect's
-// outcome without real backoff sleeps or a live Atlas endpoint. Legacy/§12.1
-// jobs never hit it (isConnectorEvent === false), so the existing cases are
-// untouched. Mirrors enqueue.spec's vi.hoisted+vi.mock pattern (T-006).
+// Mock the per-account connector resolver: worker tests verify the worker's
+// DISPATCH + error contract (4xx terminal vs 5xx rethrow vs no-connection), NOT
+// the SDK's retry internals (covered by the SDK's own suite). The mock drives
+// emitDirect's outcome without real backoff sleeps or a live Atlas endpoint.
+// Post-T-05 the worker resolves the connector by the job's `metadata.accountId`
+// via `getConnectorForAccount` (async). Legacy/§12.1 jobs never hit it
+// (isConnectorEvent === false), so those cases are untouched. Mirrors
+// enqueue.spec's vi.hoisted+vi.mock pattern.
 const connectorMock = vi.hoisted(() => ({
-  getAtlasConnector: vi.fn(),
+  getConnectorForAccount: vi.fn(),
 }));
 vi.mock('../connector', () => connectorMock);
 
@@ -149,7 +151,7 @@ function captureHandler(registerWorker: ReturnType<typeof vi.fn>): Processor {
 describe('registerAtlasEventsWorker', () => {
   beforeEach(() => {
     vi.unstubAllEnvs();
-    connectorMock.getAtlasConnector.mockReset();
+    connectorMock.getConnectorForAccount.mockReset();
   });
 
   afterEach(() => {
@@ -396,9 +398,9 @@ describe('registerAtlasEventsWorker', () => {
   });
 
   describe('Phase 12.2 connector jobs', () => {
-    /** Point the mocked singleton at a connector whose emitDirect we control. */
+    /** Resolve the job's account to a connector whose emitDirect we control. */
     function stubConnector(emitDirect: ReturnType<typeof vi.fn>): void {
-      connectorMock.getAtlasConnector.mockReturnValue({ emitDirect });
+      connectorMock.getConnectorForAccount.mockResolvedValue({ emitDirect });
     }
 
     it('delivers a ConnectorEvent via emitDirect, bypassing the Phase B fetch', async () => {
@@ -468,18 +470,20 @@ describe('registerAtlasEventsWorker', () => {
       expect(log.warn).toHaveBeenCalled();
     });
 
-    it('marks complete when a connector job arrives but the connector is disabled', async () => {
+    it('marks complete when a connector job arrives but its account has no connection', async () => {
       const { registerAtlasEventsWorker } = await loadFreshWorker(
         VALID_SECRET,
         VALID_BASE_URL,
       );
       const { app, queues, log } = buildAppStub();
-      connectorMock.getAtlasConnector.mockReturnValue(null);
+      connectorMock.getConnectorForAccount.mockResolvedValue(null);
 
       registerAtlasEventsWorker(app, {});
       const handler = captureHandler(queues.registerWorker);
 
       await expect(handler(makeConnectorJob())).resolves.toBeUndefined();
+      // Resolved by the job's metadata.accountId; null connection → no delivery.
+      expect(connectorMock.getConnectorForAccount).toHaveBeenCalledWith(app, SOURCE_ACCOUNT_ID);
       const lastWarn = log.warn.mock.calls.at(-1)![0];
       expect(lastWarn).toMatchObject({
         jobId: 'job-conn-1',
