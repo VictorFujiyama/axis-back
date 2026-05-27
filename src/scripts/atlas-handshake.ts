@@ -101,10 +101,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
 
 async function main(): Promise<void> {
   const { dryRun } = parseArgs(process.argv.slice(2));
-  const { ATLAS_URL, ATLAS_ORG_ID, ATLAS_HMAC_SECRET } = config;
+  // Per-account model (Connect Flow T-10): org id + HMAC secret are no longer
+  // global boot config — the running app resolves them per account from
+  // `atlas_connections`. This manual single-org tool reads them ad-hoc from the
+  // environment when explicitly invoked. ATLAS_URL stays the one global base.
+  const { ATLAS_URL } = config;
+  const ATLAS_ORG_ID = process.env.ATLAS_ORG_ID;
+  const ATLAS_HMAC_SECRET = process.env.ATLAS_HMAC_SECRET;
   if (!ATLAS_URL || !ATLAS_ORG_ID || !ATLAS_HMAC_SECRET) {
     console.error(
-      'Missing connector config: ATLAS_URL, ATLAS_ORG_ID and ATLAS_HMAC_SECRET are all required.',
+      'Missing connector config: ATLAS_URL (config) plus ATLAS_ORG_ID and ATLAS_HMAC_SECRET (env) are all required.',
     );
     process.exit(1);
   }

@@ -2,14 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import type { DB } from '@blossom/db';
 import { parseConnectorEvent } from '@atlas/connectors';
 
-// build-connector-event reads `config.ATLAS_ORG_ID` (optional in real config,
-// so unset in the test env). It must be a valid UUID or `validateConnectorEvent`
-// throws on every build (historic note, T-004a). Pin the real connector org id.
-// Path is resolved relative to THIS test file: src/modules/atlas-events/__tests__/
-// → three levels up reaches src/config (the same module build-connector-event imports).
-vi.mock('../../../config', () => ({
-  config: { ATLAS_ORG_ID: '220ef5e0-47df-4493-ae4d-ec0dfe83cabd' },
-}));
+// build-connector-event no longer reads `config.ATLAS_ORG_ID` (Connect Flow
+// T-10 removed the global fallback): each builder threads the connection's
+// `orgId` in, and omitting it yields org_id '' which fails validation loudly.
 
 import {
   buildContactEvent,
@@ -39,6 +34,9 @@ const convRow = {
 const inboxRow = { accountId: 'account-1' };
 const contactHints = { email: 'joao@example.com', phone: '+5511999999999', name: 'João' };
 const userHints = { email: 'agent@blossom.com', name: 'Agent Smith' };
+// Per-account org id threaded into each builder (Connect Flow T-10 — there is no
+// global config.ATLAS_ORG_ID fallback; the caller always supplies it).
+const TEST_ORG_ID = '220ef5e0-47df-4493-ae4d-ec0dfe83cabd';
 
 describe('build-connector-event builders', () => {
   it('conversation_turn (contact sender) — valid envelope + sender hints', async () => {
@@ -56,6 +54,7 @@ describe('build-connector-event builders', () => {
     const ev = await buildConversationTurnEvent(db, {
       conversationId: 'conv-1',
       messageId: 'msg-1',
+      orgId: TEST_ORG_ID,
     });
 
     expect(parseConnectorEvent(ev).ok).toBe(true);
@@ -86,6 +85,7 @@ describe('build-connector-event builders', () => {
       conversationId: 'conv-1',
       messageId: 'msg-2',
       meta: { atlasAppUserId: 'user_clerk_atlas_999' },
+      orgId: TEST_ORG_ID,
     });
 
     expect(parseConnectorEvent(ev).ok).toBe(true);
@@ -99,7 +99,7 @@ describe('build-connector-event builders', () => {
   it('conversation_summary — valid envelope + resolved event_id', async () => {
     const db = makeDb([[convRow], [inboxRow], [contactHints], [userHints]]);
 
-    const ev = await buildConversationSummaryEvent(db, { conversationId: 'conv-1' });
+    const ev = await buildConversationSummaryEvent(db, { conversationId: 'conv-1', orgId: TEST_ORG_ID });
 
     expect(parseConnectorEvent(ev).ok).toBe(true);
     expect(ev.kind).toBe('conversation_summary');
@@ -111,7 +111,7 @@ describe('build-connector-event builders', () => {
   it('handoff_to_human — valid envelope + timestamped event_id', async () => {
     const db = makeDb([[convRow], [inboxRow], [contactHints], [userHints]]);
 
-    const ev = await buildHandoffEvent(db, { conversationId: 'conv-1' });
+    const ev = await buildHandoffEvent(db, { conversationId: 'conv-1', orgId: TEST_ORG_ID });
 
     expect(parseConnectorEvent(ev).ok).toBe(true);
     expect(ev.kind).toBe('handoff_to_human');
@@ -130,7 +130,7 @@ describe('build-connector-event builders', () => {
     };
     const db = makeDb([[contactRow]]);
 
-    const ev = await buildContactEvent(db, { contactId: 'contact-1' });
+    const ev = await buildContactEvent(db, { contactId: 'contact-1', orgId: TEST_ORG_ID });
 
     expect(parseConnectorEvent(ev).ok).toBe(true);
     expect(ev.kind).toBe('contact');
@@ -141,7 +141,7 @@ describe('build-connector-event builders', () => {
     expect(ev.metadata).toEqual({ accountId: 'account-1' });
   });
 
-  it('per-account orgId (T-04) — input.orgId overrides config.ATLAS_ORG_ID', async () => {
+  it('per-account orgId (Connect Flow) — input.orgId is stamped on the envelope', async () => {
     const PER_ACCOUNT_ORG = '9c5a1f2e-0000-4000-8000-000000000abc';
     const contactRow = {
       id: 'contact-9',
@@ -156,11 +156,11 @@ describe('build-connector-event builders', () => {
     const ev = await buildContactEvent(db, { contactId: 'contact-9', orgId: PER_ACCOUNT_ORG });
 
     expect(parseConnectorEvent(ev).ok).toBe(true);
-    // The connection's org wins over the global env fallback.
+    // The connection's org is stamped on the envelope's org_id.
     expect(ev.org_id).toBe(PER_ACCOUNT_ORG);
   });
 
-  it('per-account orgId (T-04) — falls back to config.ATLAS_ORG_ID when omitted', async () => {
+  it('per-account orgId (Connect Flow) — omitting orgId yields org_id "" and fails validation', async () => {
     const contactRow = {
       id: 'contact-8',
       accountId: 'account-8',
@@ -171,12 +171,10 @@ describe('build-connector-event builders', () => {
     };
     const db = makeDb([[contactRow]]);
 
-    const ev = await buildContactEvent(db, { contactId: 'contact-8' });
-
-    expect(parseConnectorEvent(ev).ok).toBe(true);
-    // No per-account orgId → the mocked global config supplies it (compat path
-    // for enqueue/worker/backfill until T-05 wires the connection orgId).
-    expect(ev.org_id).toBe('220ef5e0-47df-4493-ae4d-ec0dfe83cabd');
+    // No per-account orgId and no global fallback (T-10 removed config.ATLAS_ORG_ID)
+    // → org_id falls to '' and validateConnectorEvent throws loudly rather than
+    // shipping a malformed envelope.
+    await expect(buildContactEvent(db, { contactId: 'contact-8' })).rejects.toThrow();
   });
 
   it('resolveActorHints (user) — joins users for email/display_name', async () => {

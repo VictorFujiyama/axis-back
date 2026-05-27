@@ -82,33 +82,33 @@ interface LegacyMappedJob {
  * Subscribe to eventBus and enqueue outbound Atlas events. Two independent legs
  * run per event (spec §11 flag matrix), each in its own try/catch so one can't
  * block the other:
- *   1. Connector (Phase 12.2) — gated on `ATLAS_CONNECTOR_ENABLED`, but now
- *      resolves a connector PER ACCOUNT (spec G5, Connect Flow): the event's
- *      axis account → its `atlas_connections` row → `.emit()` stamped with that
- *      connection's org/secret. An account with NO connection never emits
- *      (anti-leak is implicit, no global `ATLAS_SOURCE_ACCOUNT_ID`). queueAdapter
- *      uses `jobId=event_id`. (T-10 swaps the `ATLAS_CONNECTOR_ENABLED` gate for
- *      the per-account/`ATLAS_URL` model once the global env is removed.)
- *   2. Legacy (Phase B / §12.1) — runs while the Phase B secret is set AND
- *      (connector-off, prod today, OR dual-emit soak). Branches on
- *      `USE_PHASE_12_ENVELOPE`. Connector-only (Phase 10) skips it.
+ *   1. Connector (Phase 12.2) — gated on `ATLAS_URL` (the connector master
+ *      switch), resolving a connector PER ACCOUNT (spec G5, Connect Flow): the
+ *      event's axis account → its `atlas_connections` row → `.emit()` stamped
+ *      with that connection's org/secret. An account with NO connection never
+ *      emits (anti-leak is implicit, no global `ATLAS_SOURCE_ACCOUNT_ID`).
+ *      queueAdapter uses `jobId=event_id`.
+ *   2. Legacy (Phase B / §12.1) — runs while the Phase B secret is set AND the
+ *      connector is off (no `ATLAS_URL`). Branches on `USE_PHASE_12_ENVELOPE`.
+ *      Connector-on (post-Phase 10) skips it — connector-only delivery.
  * C1 gate decouple (§11): the subscription survives when EITHER the Phase B
  * secret OR the connector is set — Phase 10 dropping the secret must not kill
  * the connector. Worker.ts dispatches the queued shapes.
  */
 export function subscribeAtlasEvents(app: FastifyInstance): void {
-  if (!config.ATLAS_EVENTS_HMAC_SECRET && !config.ATLAS_CONNECTOR_ENABLED) {
+  if (!config.ATLAS_EVENTS_HMAC_SECRET && !config.ATLAS_URL) {
     app.log.info('atlas-events: disabled (no HMAC secret, connector off)');
     return;
   }
 
-  const connectorEnabled = config.ATLAS_CONNECTOR_ENABLED;
+  // ATLAS_URL is the connector master switch (Connect Flow T-10): set → the
+  // per-account connector leg is live.
+  const connectorEnabled = !!config.ATLAS_URL;
   const queue = app.queues.getQueue<AtlasEventJob>(QUEUE_NAMES.ATLAS_EVENTS);
 
-  // Phase B leg runs when its secret is set AND (connector-off OR dual-emit).
-  const runLegacy =
-    !!config.ATLAS_EVENTS_HMAC_SECRET &&
-    (!config.ATLAS_CONNECTOR_ENABLED || config.ATLAS_DUAL_EMIT);
+  // Phase B leg runs when its secret is set AND the connector is off — once the
+  // connector is on, delivery is connector-only (Phase 10, dual-emit retired).
+  const runLegacy = !!config.ATLAS_EVENTS_HMAC_SECRET && !connectorEnabled;
 
   eventBus.onEvent(async (event: RealtimeEvent) => {
     if (connectorEnabled) {

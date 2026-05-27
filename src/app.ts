@@ -235,11 +235,11 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(googleOAuthRoutes);
 
   // Phase 12.2 inbound push (POST /atlas-events). Plugin-scoped raw-body
-  // parser inside; gated by ATLAS_CONNECTOR_ENABLED — no route when disabled.
+  // parser inside; gated by ATLAS_URL (connector master switch) — no route when unset.
   await app.register(atlasInboundRoutes);
 
   // Phase 12.2 history backfill (GET /atlas-connector/backfill). Cursor walk,
-  // contacts-first, account-scoped; gated by ATLAS_CONNECTOR_ENABLED.
+  // contacts-first, account-scoped; gated by ATLAS_URL (connector master switch).
   await app.register(atlasBackfillRoutes);
 
   // Connect Flow auto-provision (POST /atlas-connector/register, T-07). Control

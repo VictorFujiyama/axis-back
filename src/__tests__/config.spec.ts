@@ -282,21 +282,7 @@ describe('config — USE_PHASE_12_ENVELOPE + ATLAS_EVENTS_ENDPOINT', () => {
   });
 });
 
-describe('config — ATLAS_CONNECTOR_ENABLED (Phase 12.2)', () => {
-  const ORG_ID = '220ef5e0-47df-4493-ae4d-ec0dfe83cabd';
-  const ACCOUNT_ID = '11111111-2222-3333-4444-555555555555';
-  const HMAC = 'a'.repeat(48);
-
-  // Stub the four required vars for an enabled connector. Callers override or
-  // clear individual vars to exercise the precheck branches.
-  function stubConnectorRequired() {
-    vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'true');
-    vi.stubEnv('ATLAS_URL', 'https://atlas-company-os.vercel.app');
-    vi.stubEnv('ATLAS_ORG_ID', ORG_ID);
-    vi.stubEnv('ATLAS_HMAC_SECRET', HMAC);
-    vi.stubEnv('ATLAS_SOURCE_ACCOUNT_ID', ACCOUNT_ID);
-  }
-
+describe('config — ATLAS_URL + ATLAS_MCP_BEARER (Phase 12.2 connector)', () => {
   beforeEach(() => {
     vi.unstubAllEnvs();
   });
@@ -306,94 +292,30 @@ describe('config — ATLAS_CONNECTOR_ENABLED (Phase 12.2)', () => {
     vi.resetModules();
   });
 
-  it('defaults ATLAS_CONNECTOR_ENABLED + ATLAS_DUAL_EMIT to false when unset', async () => {
-    const config = await loadFreshConfig();
-
-    expect(config.ATLAS_CONNECTOR_ENABLED).toBe(false);
-    expect(config.ATLAS_DUAL_EMIT).toBe(false);
-  });
-
-  it('treats ATLAS_CONNECTOR_ENABLED="false" as false (not coerced to true)', async () => {
-    vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'false');
+  // Connect Flow T-10 retired the per-org env globals + the boot precheck:
+  // ATLAS_URL is now the sole connector switch (org/secret/source-account are
+  // resolved per-account from `atlas_connections`, not boot config).
+  it('defaults ATLAS_URL to undefined when unset (connector off)', async () => {
+    vi.stubEnv('ATLAS_URL', '');
+    delete process.env.ATLAS_URL;
 
     const config = await loadFreshConfig();
 
-    expect(config.ATLAS_CONNECTOR_ENABLED).toBe(false);
+    expect(config.ATLAS_URL).toBeUndefined();
   });
 
-  it('parses ATLAS_CONNECTOR_ENABLED=true with all four required vars set', async () => {
-    stubConnectorRequired();
-
-    const config = await loadFreshConfig();
-
-    expect(config.ATLAS_CONNECTOR_ENABLED).toBe(true);
-    expect(config.ATLAS_URL).toBe('https://atlas-company-os.vercel.app');
-    expect(config.ATLAS_ORG_ID).toBe(ORG_ID);
-    expect(config.ATLAS_HMAC_SECRET).toBe(HMAC);
-    expect(config.ATLAS_SOURCE_ACCOUNT_ID).toBe(ACCOUNT_ID);
-  });
-
-  it('rejects ATLAS_CONNECTOR_ENABLED=true when ATLAS_SOURCE_ACCOUNT_ID is unset (anti-leak)', async () => {
-    stubConnectorRequired();
-    vi.stubEnv('ATLAS_SOURCE_ACCOUNT_ID', '');
-    delete process.env.ATLAS_SOURCE_ACCOUNT_ID;
-
-    await expect(loadFreshConfig()).rejects.toThrow(
-      /ATLAS_CONNECTOR_ENABLED=true requires .*ATLAS_SOURCE_ACCOUNT_ID/,
-    );
-  });
-
-  it('rejects ATLAS_CONNECTOR_ENABLED=true when org id + secret are unset', async () => {
-    vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'true');
+  it('parses ATLAS_URL when set (connector master switch)', async () => {
     vi.stubEnv('ATLAS_URL', 'https://atlas-company-os.vercel.app');
-    vi.stubEnv('ATLAS_SOURCE_ACCOUNT_ID', ACCOUNT_ID);
-    vi.stubEnv('ATLAS_ORG_ID', '');
-    vi.stubEnv('ATLAS_HMAC_SECRET', '');
-    delete process.env.ATLAS_ORG_ID;
-    delete process.env.ATLAS_HMAC_SECRET;
-
-    await expect(loadFreshConfig()).rejects.toThrow(
-      /ATLAS_ORG_ID, ATLAS_HMAC_SECRET/,
-    );
-  });
-
-  it('rejects a non-UUID ATLAS_ORG_ID', async () => {
-    stubConnectorRequired();
-    vi.stubEnv('ATLAS_ORG_ID', 'not-a-uuid');
-
-    await expect(loadFreshConfig()).rejects.toThrow();
-  });
-
-  it('rejects an ATLAS_HMAC_SECRET shorter than 32 characters', async () => {
-    stubConnectorRequired();
-    vi.stubEnv('ATLAS_HMAC_SECRET', 'too-short');
-
-    await expect(loadFreshConfig()).rejects.toThrow();
-  });
-
-  it('rejects ATLAS_DUAL_EMIT=true without the Phase B leg', async () => {
-    stubConnectorRequired();
-    vi.stubEnv('ATLAS_DUAL_EMIT', 'true');
-    vi.stubEnv('ATLAS_EVENTS_HMAC_SECRET', '');
-    vi.stubEnv('ATLAS_BASE_URL', '');
-    delete process.env.ATLAS_EVENTS_HMAC_SECRET;
-    delete process.env.ATLAS_BASE_URL;
-
-    await expect(loadFreshConfig()).rejects.toThrow(
-      /ATLAS_DUAL_EMIT=true requires the Phase B leg/,
-    );
-  });
-
-  it('parses ATLAS_DUAL_EMIT=true when the Phase B leg is set', async () => {
-    stubConnectorRequired();
-    vi.stubEnv('ATLAS_DUAL_EMIT', 'true');
-    vi.stubEnv('ATLAS_EVENTS_HMAC_SECRET', 'b'.repeat(32));
-    vi.stubEnv('ATLAS_BASE_URL', 'https://atlas-company-os.vercel.app');
 
     const config = await loadFreshConfig();
 
-    expect(config.ATLAS_DUAL_EMIT).toBe(true);
-    expect(config.ATLAS_EVENTS_HMAC_SECRET).toBe('b'.repeat(32));
+    expect(config.ATLAS_URL).toBe('https://atlas-company-os.vercel.app');
+  });
+
+  it('rejects a non-URL ATLAS_URL', async () => {
+    vi.stubEnv('ATLAS_URL', 'not-a-url');
+
+    await expect(loadFreshConfig()).rejects.toThrow();
   });
 
   it('parses the optional ATLAS_MCP_BEARER and rejects one shorter than 20 chars', async () => {

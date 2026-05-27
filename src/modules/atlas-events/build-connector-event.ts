@@ -1,7 +1,6 @@
 import { eq } from 'drizzle-orm';
 import { schema, type DB } from '@blossom/db';
 import { parseConnectorEvent, type ConnectorEvent } from '@atlas/connectors';
-import { config } from '../../config';
 
 /**
  * Phase 12.2 Connector Bridge — `ConnectorEvent` builders (the cutover wire
@@ -47,13 +46,11 @@ function validateConnectorEvent(ev: ConnectorEvent): ConnectorEvent {
   return r.event;
 }
 
-/** Common envelope fields every kind shares. `org_id` now comes from the
- * per-account connection (T-04): each builder threads the connection's `orgId`
- * down to here. The `config.ATLAS_ORG_ID` fallback keeps the old single-org
- * callers (enqueue/worker/backfill) building between tasks until T-05 wires the
- * per-account orgId in; once the global env is removed (T-10) the fallback is
- * `undefined` and an unset value falls to `''`, failing `validateConnectorEvent`'s
- * uuid check loudly rather than shipping a malformed envelope. */
+/** Common envelope fields every kind shares. `org_id` comes from the per-account
+ * connection (Connect Flow): each builder threads the connection's `orgId` down
+ * to here. With no `orgId` the value falls to `''`, which fails
+ * `validateConnectorEvent`'s uuid check loudly rather than shipping a malformed
+ * envelope (the global `config.ATLAS_ORG_ID` fallback was retired in T-10). */
 function connectorBase(
   occurredAt: string,
   orgId?: string,
@@ -72,7 +69,7 @@ function connectorBase(
     emitted_at: new Date().toISOString(),
     app: APP_SLUG,
     app_version: APP_VERSION,
-    org_id: orgId ?? config.ATLAS_ORG_ID ?? '',
+    org_id: orgId ?? '',
     occurred_at: occurredAt,
     viewable_by: ORG_VIEWABLE,
   };

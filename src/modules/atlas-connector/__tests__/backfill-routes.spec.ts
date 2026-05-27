@@ -90,13 +90,9 @@ async function buildTestApp(opts: {
 
 beforeEach(() => {
   vi.unstubAllEnvs();
-  // Boot precheck still requires these when enabled (the route no longer reads
-  // them — T-10 removes them from config).
-  vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'true');
+  // ATLAS_URL is the connector master switch (Connect Flow T-10): set → the
+  // route registers; secret/org/account resolved per-org from atlas_connections.
   vi.stubEnv('ATLAS_URL', 'https://atlas-company-os.vercel.app');
-  vi.stubEnv('ATLAS_ORG_ID', ATLAS_ORG_ID);
-  vi.stubEnv('ATLAS_HMAC_SECRET', TEST_SECRET);
-  vi.stubEnv('ATLAS_SOURCE_ACCOUNT_ID', ACCOUNT_ID);
   // Per-org connection lookup: connected for ATLAS_ORG_ID, unknown otherwise.
   connectionsMock.getConnectionByOrg.mockReset();
   connectionsMock.getConnectionByOrg.mockImplementation(async (_db: unknown, org: string) =>
@@ -115,8 +111,8 @@ function signedHeaders() {
 }
 
 describe('atlas backfill route — gating + auth (T-014)', () => {
-  it('404 when ATLAS_CONNECTOR_ENABLED=false', async () => {
-    vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'false');
+  it('404 when ATLAS_URL is unset (connector off)', async () => {
+    vi.stubEnv('ATLAS_URL', undefined as unknown as string);
     const app = await buildTestApp({});
     try {
       const res = await app.inject({ method: 'GET', url: '/atlas-connector/backfill' });

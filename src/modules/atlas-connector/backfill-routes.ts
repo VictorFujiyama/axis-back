@@ -159,9 +159,9 @@ export async function atlasBackfillRoutes(
   app: FastifyInstance,
   opts: BackfillRouteOpts = {},
 ): Promise<void> {
-  // Global on/off only (T-10 retires this gate). The secret/org/account are now
-  // resolved per request from the connection, not the boot env.
-  if (!config.ATLAS_CONNECTOR_ENABLED) {
+  // ATLAS_URL is the connector master switch (Connect Flow T-10). The
+  // secret/org/account are resolved per request from the connection, not boot env.
+  if (!config.ATLAS_URL) {
     return;
   }
 

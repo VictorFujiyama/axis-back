@@ -10,7 +10,7 @@ import { signRequest, type ConnectorEvent } from '@atlas/connectors';
 // Uses the L-418 dynamic-import pattern (mcp-server.spec.ts precedent): each
 // case parses a fresh `config` singleton from the stubbed environment, since
 // config.ts reads `process.env` at module load and the plugin reads
-// `config.ATLAS_CONNECTOR_ENABLED` at registration time.
+// `config.ATLAS_URL` (the connector master switch) at registration time.
 //
 // Per-account (T-06): the route now resolves the HMAC secret per org from
 // `atlas_connections`. We mock `getConnectionByOrg` (the same module-mock
@@ -96,13 +96,9 @@ async function buildTestApp(): Promise<{ app: FastifyInstance; capture: InsertCa
 
 beforeEach(() => {
   vi.unstubAllEnvs();
-  // Boot precheck (T-003) requires all four when the connector is enabled
-  // (the route no longer reads them — T-10 removes them from config).
-  vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'true');
+  // ATLAS_URL is the connector master switch (Connect Flow T-10): set → the
+  // route registers; the per-org secret is resolved from atlas_connections.
   vi.stubEnv('ATLAS_URL', 'https://atlas-company-os.vercel.app');
-  vi.stubEnv('ATLAS_ORG_ID', ATLAS_ORG_ID);
-  vi.stubEnv('ATLAS_HMAC_SECRET', TEST_SECRET);
-  vi.stubEnv('ATLAS_SOURCE_ACCOUNT_ID', ATLAS_ORG_ID);
   // Per-org connection lookup: connected for ATLAS_ORG_ID, unknown otherwise.
   connectionsMock.getConnectionByOrg.mockReset();
   connectionsMock.getConnectionByOrg.mockImplementation(async (_db: unknown, org: string) =>
@@ -116,8 +112,8 @@ afterEach(() => {
 });
 
 describe('atlas inbound route — disabled by default (T-012)', () => {
-  it('returns 404 when ATLAS_CONNECTOR_ENABLED=false', async () => {
-    vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'false');
+  it('returns 404 when ATLAS_URL is unset (connector off)', async () => {
+    vi.stubEnv('ATLAS_URL', undefined as unknown as string);
     const { app } = await buildTestApp();
     try {
       const res = await app.inject({

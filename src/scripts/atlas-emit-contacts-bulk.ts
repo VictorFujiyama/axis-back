@@ -33,6 +33,9 @@ export interface BulkEmitOpts {
   connector: Pick<AtlasConnector, 'emitDirect'>;
   /** Account scope (anti-leak P0). Empty/missing is rejected. */
   accountId: string;
+  /** Atlas org id stamped on each built envelope (per-account, Connect Flow
+   * T-10). Used by the default builder; ignored when `buildEvent` is injected. */
+  orgId?: string;
   batchSize: number;
   dryRun: boolean;
   /** Builder, injectable for tests. Defaults to `buildContactEvent`. */
@@ -58,7 +61,7 @@ export async function emitContactsBulk(opts: BulkEmitOpts): Promise<BulkEmitResu
   }
   const log = opts.log ?? (() => {});
   const buildEvent =
-    opts.buildEvent ?? ((id: string) => buildContactEvent(opts.db, { contactId: id }));
+    opts.buildEvent ?? ((id: string) => buildContactEvent(opts.db, { contactId: id, orgId: opts.orgId }));
 
   let cursor: { createdAt: Date; id: string } | null = null;
   let pages = 0;
@@ -140,7 +143,15 @@ export function parseArgs(argv: string[], defaultAccount: string | undefined): P
 }
 
 async function main(): Promise<void> {
-  const { dryRun, batchSize, account } = parseArgs(process.argv.slice(2), config.ATLAS_SOURCE_ACCOUNT_ID);
+  // Per-account model (Connect Flow T-10): the account scope, org id, and HMAC
+  // secret are no longer global boot config — the running app resolves them per
+  // account from `atlas_connections`. This manual single-account seed tool reads
+  // them ad-hoc from the environment when explicitly invoked. ATLAS_URL stays
+  // the one global base.
+  const { dryRun, batchSize, account } = parseArgs(
+    process.argv.slice(2),
+    process.env.ATLAS_SOURCE_ACCOUNT_ID,
+  );
 
   if (!account) {
     console.error(
@@ -148,10 +159,12 @@ async function main(): Promise<void> {
     );
     process.exit(1);
   }
-  const { ATLAS_URL, ATLAS_ORG_ID, ATLAS_HMAC_SECRET } = config;
+  const { ATLAS_URL } = config;
+  const ATLAS_ORG_ID = process.env.ATLAS_ORG_ID;
+  const ATLAS_HMAC_SECRET = process.env.ATLAS_HMAC_SECRET;
   if (!ATLAS_URL || !ATLAS_ORG_ID || !ATLAS_HMAC_SECRET) {
     console.error(
-      'Missing connector config: ATLAS_URL, ATLAS_ORG_ID and ATLAS_HMAC_SECRET are all required.',
+      'Missing connector config: ATLAS_URL (config) plus ATLAS_ORG_ID and ATLAS_HMAC_SECRET (env) are all required.',
     );
     process.exit(1);
   }
@@ -173,6 +186,7 @@ async function main(): Promise<void> {
       db,
       connector,
       accountId: account,
+      orgId: ATLAS_ORG_ID,
       batchSize,
       dryRun,
       log: (m) => console.log(`  ${m}`),

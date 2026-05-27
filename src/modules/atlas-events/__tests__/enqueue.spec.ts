@@ -81,7 +81,6 @@ function buildAppStub(rowSets: Array<unknown[]> = []): AppStub {
 // 'false' (Phase B literal). Mode-agnostic cases inherit the default 'true'.
 interface ConnectorEnv {
   enabled: boolean;
-  dualEmit?: boolean;
 }
 
 async function loadFreshModules(
@@ -100,18 +99,9 @@ async function loadFreshModules(
   }
   vi.stubEnv('USE_PHASE_12_ENVELOPE', envelopeMode);
   if (connector?.enabled) {
-    // All four are required by config.ts's boot precheck when the connector is
-    // on — stub them or importing config throws.
-    vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'true');
+    // ATLAS_URL alone is the connector master switch now (Connect Flow T-10):
+    // org/secret/source-account are resolved per-account, not from boot env.
     vi.stubEnv('ATLAS_URL', CONNECTOR_URL);
-    vi.stubEnv('ATLAS_ORG_ID', ORG_ID);
-    vi.stubEnv('ATLAS_HMAC_SECRET', HMAC_SECRET);
-    vi.stubEnv('ATLAS_SOURCE_ACCOUNT_ID', SOURCE_ACCOUNT_ID);
-    if (connector.dualEmit) {
-      // ATLAS_DUAL_EMIT precheck also requires the Phase B leg (secret + base url).
-      vi.stubEnv('ATLAS_DUAL_EMIT', 'true');
-      vi.stubEnv('ATLAS_BASE_URL', PHASE_B_BASE_URL);
-    }
   }
   const eventBusModule = await import('../../../realtime/event-bus');
   const enqueueModule = await import('../enqueue');
@@ -153,7 +143,6 @@ const OTHER_ACCOUNT_ID = '22222222-2222-2222-2222-222222222222';
 const ORG_ID = '220ef5e0-47df-4493-ae4d-ec0dfe83cabd';
 const HMAC_SECRET = 'b'.repeat(48);
 const CONNECTOR_URL = 'https://atlas-company-os.vercel.app';
-const PHASE_B_BASE_URL = 'https://atlas.example.com';
 
 /** A stand-in `ConnectorEvent` for the builder mocks. The emit path reads only
  * `event_id`; the listener's anti-leak filter reads `metadata.accountId` (which
@@ -620,12 +609,12 @@ describe('subscribeAtlasEvents', () => {
       expect(queues.add).toHaveBeenCalledTimes(2); // summary + handoff (bot-assigned dropped)
     });
 
-    // Dual-emit soak (Phase 9): one event → 2 jobs, distinct keyspaces (L-609).
-    it('dual-emits both the connector event and the Phase B legacy job', async () => {
+    // Connector-only (Phase 10, dual-emit retired): with the connector on
+    // (ATLAS_URL set) the Phase B leg is suppressed even when its secret is set.
+    it('suppresses the Phase B leg when the connector is on, even with the secret set', async () => {
       builderMocks.buildConversationTurnEvent.mockResolvedValue(fakeConnectorEvent());
       const { eventBus, subscribeAtlasEvents } = await loadFreshModules(VALID_SECRET, 'false', {
         enabled: true,
-        dualEmit: true,
       });
       const { app, queues } = buildAppStub([[inboxAccountRow]]);
 
@@ -638,13 +627,11 @@ describe('subscribeAtlasEvents', () => {
       });
       await flushMicrotasks();
 
-      expect(queues.add).toHaveBeenCalledTimes(2);
-      const names = queues.add.mock.calls.map((c) => c[0]);
-      expect(names).toContain('atlas-events'); // connector
-      expect(names).toContain('message_sent'); // Phase B legacy
-      const jobIds = queues.add.mock.calls.map((c) => (c[2] as { jobId: string }).jobId);
-      expect(jobIds).toContain('msg_msg-xyz'); // connector event_id keyspace
-      expect(jobIds).toContain('conv-abc:message_sent:msg-xyz'); // Phase B keyspace
+      // Only the connector job — no Phase B legacy job.
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [name, , opts] = queues.add.mock.calls[0]!;
+      expect(name).toBe('atlas-events'); // connector only
+      expect((opts as { jobId: string }).jobId).toBe('msg_msg-xyz'); // connector keyspace
     });
   });
 });

@@ -77,13 +77,8 @@ async function loadFreshWorker(
     delete process.env.ATLAS_EVENTS_ENDPOINT;
   }
   if (connectorEnabled) {
-    // config.ts's boot precheck requires all four when the connector is on —
-    // stub them or importing config throws (mirrors enqueue.spec).
-    vi.stubEnv('ATLAS_CONNECTOR_ENABLED', 'true');
+    // ATLAS_URL alone is the connector master switch now (Connect Flow T-10).
     vi.stubEnv('ATLAS_URL', CONNECTOR_URL);
-    vi.stubEnv('ATLAS_ORG_ID', CONNECTOR_ORG_ID);
-    vi.stubEnv('ATLAS_HMAC_SECRET', CONNECTOR_HMAC);
-    vi.stubEnv('ATLAS_SOURCE_ACCOUNT_ID', SOURCE_ACCOUNT_ID);
   }
   const mod = await import('../worker');
   return { registerAtlasEventsWorker: mod.registerAtlasEventsWorker };
@@ -95,7 +90,6 @@ const VALID_BASE_URL = 'http://atlas-web:3010';
 // Phase 12.2 connector env fixtures (must be schema-valid: uuid / url / min-len).
 const CONNECTOR_ORG_ID = '220ef5e0-47df-4493-ae4d-ec0dfe83cabd';
 const CONNECTOR_URL = 'https://atlas-company-os.vercel.app';
-const CONNECTOR_HMAC = 'b'.repeat(48);
 const SOURCE_ACCOUNT_ID = '11111111-1111-1111-1111-111111111111';
 
 function makeConnectorJob(): { id: string; data: ConnectorEvent } {

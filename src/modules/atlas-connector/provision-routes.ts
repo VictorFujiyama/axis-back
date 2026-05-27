@@ -34,10 +34,10 @@ import { runHandshake } from '../../scripts/atlas-handshake';
  * per-person SSO link — a handshake failure persists the connection as `error`
  * (still re-tryable) rather than throwing the whole request away.
  *
- * Always registered (control-plane): unlike the inbound/emit data-plane routes,
- * this is not gated by `ATLAS_CONNECTOR_ENABLED` — the `atlas_connections` table
- * is the source of truth for the per-account model, and gating the route that
- * CREATES connections behind the legacy global flag would be self-defeating.
+ * Always registered (control-plane): unlike the inbound/emit data-plane routes
+ * (gated by `ATLAS_URL`), this is never gated — the `atlas_connections` table is
+ * the source of truth for the per-account model, and gating the route that
+ * CREATES connections behind the connector switch would be self-defeating.
  */
 
 const registerBody = z.object({

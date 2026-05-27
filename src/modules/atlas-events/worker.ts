@@ -20,9 +20,10 @@ export interface AtlasEventsWorkerDeps {
  *  - {@link AtlasEventJob} — legacy Phase B / §12.1 envelope jobs, delivered
  *    via {@link serializeJob} + `signOutboundPayload` (`${t}.${body}`) to the
  *    Phase B endpoint.
- * During the soak (Phase 9, `ATLAS_DUAL_EMIT`) BOTH shapes flow concurrently as
- * SEPARATE jobs with distinct jobIds + event_ids (L-609) — one job → one POST,
- * dispatched here by shape. NOT one job → two POSTs.
+ * Connect Flow (Phase 10): dual-emit is retired — with the connector on
+ * (`ATLAS_URL` set) the enqueuer produces connector jobs only. Both shapes
+ * still dispatch here by shape so any legacy jobs queued during the cutover
+ * drain cleanly — one job → one POST. NOT one job → two POSTs.
  */
 type AtlasEventQueueJob = AtlasEventJob | ConnectorEvent;
 
@@ -215,7 +216,7 @@ export function registerAtlasEventsWorker(
   app: FastifyInstance,
   deps: AtlasEventsWorkerDeps = {},
 ): void {
-  if (!config.ATLAS_EVENTS_HMAC_SECRET && !config.ATLAS_CONNECTOR_ENABLED) {
+  if (!config.ATLAS_EVENTS_HMAC_SECRET && !config.ATLAS_URL) {
     app.log.info('atlas-events worker: disabled (no HMAC secret, connector off)');
     return;
   }

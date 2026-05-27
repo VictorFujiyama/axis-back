@@ -36,9 +36,10 @@ import { getConnectionByOrg } from '../atlas-events/connections';
  * parses `rawBody` itself), which also lets malformed JSON reach the handler
  * so the SDK returns its uniform 400 rather than Fastify's own error shape.
  *
- * Off by default: when `ATLAS_CONNECTOR_ENABLED=false` the plugin registers no
- * route, so `/atlas-events` falls through to Fastify's default 404. (T-10
- * retires this global gate once the connector flow is fully per-account.)
+ * Off by default: when `ATLAS_URL` is unset (the connector master switch, Connect
+ * Flow T-10) the plugin registers no route, so `/atlas-events` falls through to
+ * Fastify's default 404. When set, every connected org's secret is resolved
+ * per-request from `atlas_connections`.
  *
  * Idempotent: `atlas_activity.event_id` is UNIQUE; a re-pushed event
  * `onConflictDoNothing`s onto the same row (Atlas reuses its own activity id,
@@ -58,7 +59,7 @@ function headerValue(req: FastifyRequest, name: string): string | null {
 }
 
 export async function atlasInboundRoutes(app: FastifyInstance): Promise<void> {
-  if (!config.ATLAS_CONNECTOR_ENABLED) {
+  if (!config.ATLAS_URL) {
     return;
   }
 
