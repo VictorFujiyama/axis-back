@@ -1,6 +1,11 @@
 import { eq } from 'drizzle-orm';
 import { schema, type DB } from '@blossom/db';
 import { parseConnectorEvent, type ConnectorEvent } from '@atlas/connectors';
+import {
+  LEAD_QUALIFIED_KIND,
+  parseLeadQualifiedPayload,
+  type LeadQualifiedContact,
+} from './lead-qualified';
 
 /**
  * Phase 12.2 Connector Bridge — `ConnectorEvent` builders (the cutover wire
@@ -251,6 +256,90 @@ export async function buildHandoffEvent(
     participants: await buildParticipants(db, conv),
     summary: 'Bot handed off to a human agent',
     metadata: { accountId },
+  });
+}
+
+/** `lead_qualified` — the inbox tagged a conversation as a qualified lead. The
+ * typed payload (LeadQualifiedPayloadSchema) is parked in `metadata.lead_qualified`
+ * because the connector envelope has no first-class slot for kind-specific
+ * payloads (`kind` is open string, `metadata` is free-form JSONB — spec
+ * §12.1.01). The Atlas-side handler (T-04/T-05) reads it from there.
+ *
+ * `event_id=conv_<id>:lead_qualified:<taggedAt_ms>` — keyed on the qualifying
+ * timestamp so re-tagging the same conversation at a later time legitimately
+ * yields a new event (D6 re-engagement), while a replay of the same envelope
+ * dedupes on `(source_app, event_id)`. The caller (T-03 trigger) threads a
+ * stable `taggedAt` from the tag row's `createdAt` so retries collapse.
+ *
+ * Identity hints: name/phone/email on the contact actor mirror the typed
+ * payload's `contact` so the Atlas-side dedup (phone → email per D4) doesn't
+ * need to re-read the source. Either-or identity is allowed at the envelope
+ * level — the handler enforces D4 "no phone and no email → skip materialize". */
+export async function buildLeadQualifiedEnvelope(
+  db: DB,
+  input: {
+    conversationId: string;
+    accountId: string;
+    orgId: string;
+    /** ISO 8601 with offset. Defaults to now; T-03 trigger threads the tag's createdAt. */
+    taggedAt?: string;
+    /** Optional running summary at qualify time. Capped to SUMMARY_CAP downstream. */
+    convSummary?: string;
+  },
+): Promise<ConnectorEvent> {
+  const taggedAt = input.taggedAt ?? new Date().toISOString();
+  const conv = await loadConversation(db, input.conversationId);
+
+  const [c] = await db
+    .select({
+      id: schema.contacts.id,
+      name: schema.contacts.name,
+      email: schema.contacts.email,
+      phone: schema.contacts.phone,
+    })
+    .from(schema.contacts)
+    .where(eq(schema.contacts.id, conv.contactId))
+    .limit(1);
+  if (!c) throw new Error(`build-connector-event: contact ${conv.contactId} not found`);
+
+  const contact: LeadQualifiedContact = {};
+  if (c.name) contact.name = c.name;
+  if (c.phone) contact.phone = c.phone;
+  if (c.email) contact.email = c.email;
+
+  const payloadResult = parseLeadQualifiedPayload({
+    contact,
+    source_ref: conv.id,
+    ...(input.convSummary ? { conv_summary: input.convSummary.slice(0, SUMMARY_CAP) } : {}),
+    tagged_at: taggedAt,
+  });
+  if (!payloadResult.ok) {
+    throw new Error(
+      `build-connector-event: invalid lead_qualified payload: ${JSON.stringify(payloadResult.error.issues)}`,
+    );
+  }
+
+  const display = c.name ?? c.phone ?? c.email ?? 'Unnamed contact';
+
+  return validateConnectorEvent({
+    ...connectorBase(taggedAt, input.orgId),
+    event_id: `conv_${conv.id}:lead_qualified:${Date.parse(taggedAt)}`,
+    kind: LEAD_QUALIFIED_KIND,
+    action: 'create',
+    source_ref: { id: conv.id },
+    actors: [
+      {
+        app_user_id: c.id,
+        role: 'sender',
+        hints: { email: c.email ?? null, phone: c.phone ?? null, display_name: c.name ?? null },
+      },
+    ],
+    participants: await buildParticipants(db, conv),
+    summary: `Lead qualified: ${display}`.slice(0, SUMMARY_CAP),
+    metadata: {
+      accountId: input.accountId,
+      lead_qualified: payloadResult.payload,
+    },
   });
 }
 

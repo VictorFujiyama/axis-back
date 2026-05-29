@@ -11,8 +11,10 @@ import {
   buildConversationSummaryEvent,
   buildConversationTurnEvent,
   buildHandoffEvent,
+  buildLeadQualifiedEnvelope,
   resolveActorHints,
 } from '../build-connector-event';
+import { LEAD_QUALIFIED_KIND } from '../lead-qualified';
 
 // Every builder query is select→from→where→limit(1). makeDb hands back one row
 // set per query, in call order. See build-envelope.spec.ts for the precedent.
@@ -175,6 +177,139 @@ describe('build-connector-event builders', () => {
     // → org_id falls to '' and validateConnectorEvent throws loudly rather than
     // shipping a malformed envelope.
     await expect(buildContactEvent(db, { contactId: 'contact-8' })).rejects.toThrow();
+  });
+
+  describe('lead_qualified envelope (T-02)', () => {
+    // The builder runs four queries in order: loadConversation, contact (mine,
+    // for typed payload + hints), contact-participant, user-participant. Each
+    // test seeds rowSets matching that fixed order.
+    const TAGGED_AT = '2026-05-29T13:00:00.000Z';
+    const TAGGED_AT_MS = Date.parse(TAGGED_AT);
+
+    it('contact with phone only — payload omits email, hints carry null email', async () => {
+      const contactRow = {
+        id: 'contact-1',
+        name: 'João',
+        email: null,
+        phone: '+5511999999999',
+      };
+      const db = makeDb([[convRow], [contactRow], [contactHints], [userHints]]);
+
+      const ev = await buildLeadQualifiedEnvelope(db, {
+        conversationId: 'conv-1',
+        accountId: 'account-1',
+        orgId: TEST_ORG_ID,
+        taggedAt: TAGGED_AT,
+      });
+
+      expect(parseConnectorEvent(ev).ok).toBe(true);
+      expect(ev.kind).toBe(LEAD_QUALIFIED_KIND);
+      expect(ev.action).toBe('create');
+      expect(ev.event_id).toBe(`conv_conv-1:lead_qualified:${TAGGED_AT_MS}`);
+      expect(ev.source_ref).toEqual({ id: 'conv-1' });
+      expect(ev.summary).toBe('Lead qualified: João');
+      // payload is parked under metadata.lead_qualified (envelope kind is open string).
+      const payload = (ev.metadata as Record<string, unknown>)['lead_qualified'] as Record<
+        string,
+        unknown
+      >;
+      expect(payload).toBeDefined();
+      expect(payload['contact']).toEqual({ name: 'João', phone: '+5511999999999' });
+      expect(payload['source_ref']).toBe('conv-1');
+      expect(payload['tagged_at']).toBe(TAGGED_AT);
+      expect(payload['conv_summary']).toBeUndefined();
+      // actor hints mirror the typed contact — null for the missing channel so
+      // the Atlas-side dedup doesn't re-read the source.
+      expect(ev.actors[0]?.hints?.phone).toBe('+5511999999999');
+      expect(ev.actors[0]?.hints?.email).toBeNull();
+      expect(ev.metadata['accountId']).toBe('account-1');
+    });
+
+    it('contact with email only — payload omits phone, identity hints fall through to email', async () => {
+      const contactRow = {
+        id: 'contact-2',
+        name: null,
+        email: 'maria@example.com',
+        phone: null,
+      };
+      const db = makeDb([[convRow], [contactRow], [contactHints], [userHints]]);
+
+      const ev = await buildLeadQualifiedEnvelope(db, {
+        conversationId: 'conv-1',
+        accountId: 'account-1',
+        orgId: TEST_ORG_ID,
+        taggedAt: TAGGED_AT,
+      });
+
+      expect(parseConnectorEvent(ev).ok).toBe(true);
+      // No name and no phone — summary falls through to email.
+      expect(ev.summary).toBe('Lead qualified: maria@example.com');
+      const payload = (ev.metadata as Record<string, unknown>)['lead_qualified'] as Record<
+        string,
+        unknown
+      >;
+      expect(payload['contact']).toEqual({ email: 'maria@example.com' });
+    });
+
+    it('contact with both phone and email — payload carries both, conv_summary forwarded', async () => {
+      const contactRow = {
+        id: 'contact-3',
+        name: 'Ana',
+        email: 'ana@example.com',
+        phone: '+5511777777777',
+      };
+      const db = makeDb([[convRow], [contactRow], [contactHints], [userHints]]);
+
+      const ev = await buildLeadQualifiedEnvelope(db, {
+        conversationId: 'conv-1',
+        accountId: 'account-1',
+        orgId: TEST_ORG_ID,
+        taggedAt: TAGGED_AT,
+        convSummary: 'Asked about pricing, asked when we can start.',
+      });
+
+      expect(parseConnectorEvent(ev).ok).toBe(true);
+      const payload = (ev.metadata as Record<string, unknown>)['lead_qualified'] as Record<
+        string,
+        unknown
+      >;
+      expect(payload['contact']).toEqual({
+        name: 'Ana',
+        phone: '+5511777777777',
+        email: 'ana@example.com',
+      });
+      expect(payload['conv_summary']).toBe('Asked about pricing, asked when we can start.');
+      // participants come from the conv (contact + assigned user) so the
+      // Atlas-side handler can reuse identity-federation without re-querying.
+      expect(ev.participants).toHaveLength(2);
+    });
+
+    it('omitting taggedAt — defaults to now, envelope still parses', async () => {
+      const contactRow = {
+        id: 'contact-4',
+        name: 'Carla',
+        email: null,
+        phone: '+5511666666666',
+      };
+      const db = makeDb([[convRow], [contactRow], [contactHints], [userHints]]);
+
+      const before = Date.now();
+      const ev = await buildLeadQualifiedEnvelope(db, {
+        conversationId: 'conv-1',
+        accountId: 'account-1',
+        orgId: TEST_ORG_ID,
+      });
+      const after = Date.now();
+
+      expect(parseConnectorEvent(ev).ok).toBe(true);
+      const payload = (ev.metadata as Record<string, unknown>)['lead_qualified'] as Record<
+        string,
+        unknown
+      >;
+      const taggedAtMs = Date.parse(payload['tagged_at'] as string);
+      expect(taggedAtMs).toBeGreaterThanOrEqual(before);
+      expect(taggedAtMs).toBeLessThanOrEqual(after);
+    });
   });
 
   it('resolveActorHints (user) — joins users for email/display_name', async () => {
