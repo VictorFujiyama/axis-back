@@ -209,7 +209,10 @@ export async function buildConversationTurnEvent(
     participants: await buildParticipants(db, conv),
     summary: `${senderType}: ${content}`.slice(0, SUMMARY_CAP),
     embedding_text: isLowValue ? null : undefined,
-    metadata: { accountId },
+    // `inboxId` + `senderType` ride the metadata so the Atlas worker (T-16)
+    // can gate `qualifier-agent` enqueue on (a) inbox has playbook, (b) the
+    // turn is from the customer — without re-querying axis-back state.
+    metadata: { accountId, inboxId: conv.inboxId, senderType },
   });
 }
 

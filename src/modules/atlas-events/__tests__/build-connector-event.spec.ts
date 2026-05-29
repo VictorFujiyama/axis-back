@@ -69,6 +69,8 @@ describe('build-connector-event builders', () => {
     // participants carry contact + assigned user, each with hints.
     expect(ev.participants).toHaveLength(2);
     expect(ev.participants[1]?.hints?.email).toBe('agent@blossom.com');
+    // T-16: metadata carries inboxId + senderType for Atlas qualifier-agent gating.
+    expect(ev.metadata).toEqual({ accountId: 'account-1', inboxId: 'inbox-1', senderType: 'contact' });
   });
 
   it('conversation_turn (bot sender) — valid envelope + atlas_user_id hint', async () => {
@@ -96,6 +98,8 @@ describe('build-connector-event builders', () => {
     expect(ev.actors[0]?.hints?.atlas_user_id).toBe('user_clerk_atlas_999');
     // bot/system turns skip the embed budget (spec §12.1.06).
     expect(ev.embedding_text).toBeNull();
+    // T-16: bot senderType lets the Atlas worker skip the qualifier-agent enqueue.
+    expect(ev.metadata).toEqual({ accountId: 'account-1', inboxId: 'inbox-1', senderType: 'bot' });
   });
 
   it('conversation_summary — valid envelope + resolved event_id', async () => {
