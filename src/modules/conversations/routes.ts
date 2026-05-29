@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { canAccessConversation, userInboxIds } from './access';
 import { eventBus } from '../../realtime/event-bus';
+import { emitConversationTagged } from '../atlas-events/tagged-trigger';
 import { writeAudit } from '../../lib/audit';
 import { QUEUE_NAMES, type SnoozeReopenJob } from '../../queue';
 import { renderTranscript, sendTranscriptEmail } from './transcript';
@@ -664,10 +665,18 @@ export async function conversationRoutes(app: FastifyInstance): Promise<void> {
       if (!(await canAccessConversation(app, req.user, id))) {
         return reply.forbidden();
       }
-      await app.db
+      // [crm-T-03] `.returning` exposes only the rows that truly inserted —
+      // re-applying an existing (conv, tag) PK no-ops here, so the trigger
+      // does not re-fire `lead_qualified` on a duplicate REST call.
+      const inserted = await app.db
         .insert(schema.conversationTags)
         .values(body.tagIds.map((tagId) => ({ conversationId: id, tagId })))
-        .onConflictDoNothing();
+        .onConflictDoNothing()
+        .returning({ tagId: schema.conversationTags.tagId });
+      await emitConversationTagged(app.db, {
+        conversationId: id,
+        tagIds: inserted.map((r) => r.tagId),
+      });
       return reply.code(204).send();
     },
   );

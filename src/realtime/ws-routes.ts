@@ -78,6 +78,11 @@ function eventRoom(e: RealtimeEvent): string[] {
       // Consumed only by the atlas-events listener; the agent socket drops it
       // before this is reached. [] keeps the switch exhaustive (noImplicitReturns).
       return [];
+    case 'conversation.tagged':
+      // [crm-T-03] Internal-only event consumed by the atlas-events listener
+      // (router for `lead_qualified`). Sockets drop it — front-side tag UI
+      // re-reads via REST, not via this bus event.
+      return [];
   }
 }
 

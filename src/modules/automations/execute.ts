@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { eventBus } from '../../realtime/event-bus';
+import { emitConversationTagged } from '../atlas-events/tagged-trigger';
 
 export const ActionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('assign_user'), userId: z.string().uuid() }),
@@ -79,6 +80,12 @@ async function runSingle(action: Action, ctx: ExecuteContext): Promise<void> {
         await app.db
           .insert(schema.conversationTags)
           .values({ conversationId, tagId: action.tagId });
+        // [crm-T-03] Insert succeeded → freshly applied tag, fire the trigger.
+        // 23505 (caught below) means the row already existed → no re-emit.
+        await emitConversationTagged(app.db, {
+          conversationId,
+          tagIds: [action.tagId],
+        });
       } catch (err) {
         if ((err as { code?: string }).code !== '23505') throw err;
       }

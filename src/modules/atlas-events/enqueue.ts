@@ -16,6 +16,7 @@ import {
   buildConversationSummaryEvent,
   buildHandoffEvent,
   buildContactEvent,
+  buildLeadQualifiedEnvelope,
 } from './build-connector-event';
 import { getConnectorForAccount } from './connector';
 import { getConnection } from './connections';
@@ -175,7 +176,8 @@ async function resolveEventAccountId(db: DB, event: RealtimeEvent): Promise<stri
   if (
     event.type === 'message.created' ||
     event.type === 'conversation.resolved' ||
-    event.type === 'conversation.assigned'
+    event.type === 'conversation.assigned' ||
+    event.type === 'conversation.tagged'
   ) {
     const [row] = await db
       .select({ accountId: schema.inboxes.accountId })
@@ -214,6 +216,31 @@ async function buildConnectorEventForEvent(
 
   if (event.type === 'contact.created') {
     return buildContactEvent(db, { contactId: event.contact.id, orgId });
+  }
+
+  // [crm-T-03] `conversation.tagged` → if the tag name is `qualified`
+  // (case-insensitive, D3) and the inbox has a resolvable account, build a
+  // `lead_qualified` envelope (T-02). Other tag names drop here — they were
+  // emitted on the bus for forward-compat but have no connector mapping.
+  if (event.type === 'conversation.tagged') {
+    const [tag] = await db
+      .select({ name: schema.tags.name })
+      .from(schema.tags)
+      .where(eq(schema.tags.id, event.tagId))
+      .limit(1);
+    if (!tag || tag.name.toLowerCase() !== 'qualified') return null;
+    const [inbox] = await db
+      .select({ accountId: schema.inboxes.accountId })
+      .from(schema.inboxes)
+      .where(eq(schema.inboxes.id, event.inboxId))
+      .limit(1);
+    if (!inbox?.accountId) return null;
+    return buildLeadQualifiedEnvelope(db, {
+      conversationId: event.conversationId,
+      accountId: inbox.accountId,
+      orgId,
+      taggedAt: event.taggedAt,
+    });
   }
 
   return null;

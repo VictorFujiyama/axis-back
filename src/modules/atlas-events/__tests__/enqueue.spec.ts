@@ -17,6 +17,7 @@ const builderMocks = vi.hoisted(() => ({
   buildConversationSummaryEvent: vi.fn(),
   buildHandoffEvent: vi.fn(),
   buildContactEvent: vi.fn(),
+  buildLeadQualifiedEnvelope: vi.fn(),
 }));
 vi.mock('../build-connector-event', () => builderMocks);
 
@@ -476,6 +477,7 @@ describe('subscribeAtlasEvents', () => {
       builderMocks.buildConversationSummaryEvent.mockReset();
       builderMocks.buildHandoffEvent.mockReset();
       builderMocks.buildContactEvent.mockReset();
+      builderMocks.buildLeadQualifiedEnvelope.mockReset();
       connectionsMock.getConnection.mockReset();
       // Default: the resolved account HAS a connection. The anti-leak case below
       // overrides it to null (no connection → no emit).
@@ -607,6 +609,129 @@ describe('subscribeAtlasEvents', () => {
         orgId: ORG_ID,
       });
       expect(queues.add).toHaveBeenCalledTimes(2); // summary + handoff (bot-assigned dropped)
+    });
+
+    // [crm-T-03] conversation.tagged → buildLeadQualifiedEnvelope when the tag
+    // name is `qualified` (case-insensitive, D3). Three rowSets are consumed:
+    //   1) resolveEventAccountId — inbox → accountId
+    //   2) buildConnectorEventForEvent — tag → name lookup
+    //   3) buildConnectorEventForEvent — inbox → accountId (re-resolved so the
+    //      builder gets the value via input.accountId, not via DB join)
+    it('routes conversation.tagged with tag name "qualified" to buildLeadQualifiedEnvelope and emits', async () => {
+      builderMocks.buildLeadQualifiedEnvelope.mockResolvedValue(
+        fakeConnectorEvent({
+          kind: 'lead_qualified',
+          event_id: 'conv_conv-q:lead_qualified:1748520000000',
+        }),
+      );
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
+        enabled: true,
+      });
+      const { app, queues } = buildAppStub([
+        [inboxAccountRow],
+        [{ name: 'qualified' }],
+        [inboxAccountRow],
+      ]);
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'conversation.tagged',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-q',
+        tagId: 'tag-q',
+        taggedAt: '2026-05-29T12:00:00.000Z',
+      });
+      await flushMicrotasks();
+
+      expect(builderMocks.buildLeadQualifiedEnvelope).toHaveBeenCalledTimes(1);
+      expect(builderMocks.buildLeadQualifiedEnvelope).toHaveBeenCalledWith(app.db, {
+        conversationId: 'conv-q',
+        accountId: SOURCE_ACCOUNT_ID,
+        orgId: ORG_ID,
+        taggedAt: '2026-05-29T12:00:00.000Z',
+      });
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [name, , opts] = queues.add.mock.calls[0]!;
+      expect(name).toBe('atlas-events');
+      expect(opts).toEqual({ jobId: 'conv_conv-q:lead_qualified:1748520000000' });
+    });
+
+    // [crm-T-03] D3 case-insensitive contract: `Qualified` (capitalized) MUST
+    // still route to the builder so a UI that title-cases tag names doesn't
+    // silently miss the qualifying signal.
+    it('routes conversation.tagged with tag name "Qualified" (mixed case) to buildLeadQualifiedEnvelope', async () => {
+      builderMocks.buildLeadQualifiedEnvelope.mockResolvedValue(
+        fakeConnectorEvent({ kind: 'lead_qualified', event_id: 'conv_conv-q:lead_qualified:1' }),
+      );
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
+        enabled: true,
+      });
+      const { app, queues } = buildAppStub([
+        [inboxAccountRow],
+        [{ name: 'Qualified' }],
+        [inboxAccountRow],
+      ]);
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'conversation.tagged',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-q',
+        tagId: 'tag-q',
+        taggedAt: '2026-05-29T12:00:00.000Z',
+      });
+      await flushMicrotasks();
+
+      expect(builderMocks.buildLeadQualifiedEnvelope).toHaveBeenCalledTimes(1);
+      expect(queues.add).toHaveBeenCalledTimes(1);
+    });
+
+    // [crm-T-03] Non-qualifying tags emit on the bus for forward-compat
+    // (future kinds) but produce no envelope — the connector leg drops them.
+    it('drops conversation.tagged when the tag name is not "qualified"', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
+        enabled: true,
+      });
+      // 2 rowSets: resolveEventAccountId + tag name lookup (early return after).
+      const { app, queues } = buildAppStub([
+        [inboxAccountRow],
+        [{ name: 'follow-up' }],
+      ]);
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'conversation.tagged',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-x',
+        tagId: 'tag-x',
+        taggedAt: '2026-05-29T12:00:00.000Z',
+      });
+      await flushMicrotasks();
+
+      expect(builderMocks.buildLeadQualifiedEnvelope).not.toHaveBeenCalled();
+      expect(queues.add).not.toHaveBeenCalled();
+    });
+
+    // [crm-T-03] Defensive: if the tag row vanished between insert and the
+    // listener's lookup (rare delete race), the builder must NOT be invoked.
+    it('drops conversation.tagged when the tag row no longer exists', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
+        enabled: true,
+      });
+      const { app, queues } = buildAppStub([[inboxAccountRow], []]);
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'conversation.tagged',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-x',
+        tagId: 'tag-gone',
+        taggedAt: '2026-05-29T12:00:00.000Z',
+      });
+      await flushMicrotasks();
+
+      expect(builderMocks.buildLeadQualifiedEnvelope).not.toHaveBeenCalled();
+      expect(queues.add).not.toHaveBeenCalled();
     });
 
     // Connector-only (Phase 10, dual-emit retired): with the connector on

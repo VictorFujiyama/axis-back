@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { userInboxIds } from './access';
+import { emitConversationTagged } from '../atlas-events/tagged-trigger';
 
 const bulkBody = z.object({
   ids: z.array(z.string().uuid()).min(1).max(200),
@@ -72,12 +73,23 @@ export async function bulkConversationRoutes(app: FastifyInstance): Promise<void
           .select({ id: schema.conversations.id })
           .from(schema.conversations)
           .where(convWhere);
+        // [crm-T-03] Share a single `taggedAt` across the batch so all emits
+        // for a bulk tag carry the same `tagged_at` (T-02 `event_id` keys off
+        // `Date.parse(taggedAt)`); 23505 means the row already existed, so the
+        // trigger only fires on the rows that truly inserted.
+        const taggedAt = new Date().toISOString();
+        const tagId = body.tagId;
         for (const c of convs) {
           try {
             await app.db
               .insert(schema.conversationTags)
-              .values({ conversationId: c.id, tagId: body.tagId });
+              .values({ conversationId: c.id, tagId });
             affected++;
+            await emitConversationTagged(app.db, {
+              conversationId: c.id,
+              tagIds: [tagId],
+              taggedAt,
+            });
           } catch (err) {
             if ((err as { code?: string }).code !== '23505') throw err;
           }

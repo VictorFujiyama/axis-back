@@ -111,6 +111,28 @@ export type RealtimeEvent =
       type: 'contact.created';
       accountId: string;
       contact: RealtimeContact;
+    }
+  | {
+      /**
+       * [crm-T-03] A tag was freshly applied to a conversation. Emitted by the
+       * 4 in-tree `conversationTags.insert` sites (REST, bulk, automation, bot)
+       * AFTER the row truly inserted — noop inserts must not re-fire. The
+       * atlas-events listener resolves the tag name and, if `qualified`
+       * (case-insensitive, D3), routes to `buildLeadQualifiedEnvelope`; other
+       * tag names are no-ops at the connector layer (no envelope is built).
+       * Realtime sockets drop this event — front-side tag UI re-reads via REST.
+       *
+       * `taggedAt` is captured per emit so re-tagging the same conversation
+       * after a delete yields a distinct `event_id`
+       * (`conv_<id>:lead_qualified:<ms>`), reaching the handler as legitimate
+       * re-engagement (D6); replays of the same envelope dedupe on
+       * `(source_app, event_id)` at Atlas (T-06).
+       */
+      type: 'conversation.tagged';
+      inboxId: string;
+      conversationId: string;
+      tagId: string;
+      taggedAt: string;
     };
 
 export interface RealtimeMessage {

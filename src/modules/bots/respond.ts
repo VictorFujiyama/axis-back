@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { decryptJSON } from '../../crypto';
 import { eventBus } from '../../realtime/event-bus';
+import { emitConversationTagged } from '../atlas-events/tagged-trigger';
 
 const idParams = z.object({ id: z.string().uuid() });
 
@@ -274,7 +275,11 @@ export async function botRespondRoutes(app: FastifyInstance): Promise<void> {
 
         case 'tag': {
           if (body.add?.length) {
-            await app.db
+            // [crm-T-03] `.returning` exposes the rows that truly inserted —
+            // bot replays must not re-fire `lead_qualified` on a duplicate
+            // tag.add. The trigger uses the same idempotency contract as the
+            // REST handler.
+            const inserted = await app.db
               .insert(schema.conversationTags)
               .values(
                 body.add.map((tagId) => ({
@@ -282,7 +287,12 @@ export async function botRespondRoutes(app: FastifyInstance): Promise<void> {
                   tagId,
                 })),
               )
-              .onConflictDoNothing();
+              .onConflictDoNothing()
+              .returning({ tagId: schema.conversationTags.tagId });
+            await emitConversationTagged(app.db, {
+              conversationId: body.conversationId,
+              tagIds: inserted.map((r) => r.tagId),
+            });
           }
           if (body.remove?.length) {
             await app.db
