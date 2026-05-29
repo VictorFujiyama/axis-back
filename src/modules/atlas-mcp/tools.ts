@@ -2,6 +2,7 @@ import { and, asc, desc, eq, gte, isNull, sql, type SQL } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema, type DB } from '@blossom/db';
+import { emitConversationTagged } from '../atlas-events/tagged-trigger';
 import { eventBus } from '../../realtime/event-bus';
 import { getOrCreateAtlasBotUser } from './atlas-bot';
 
@@ -567,5 +568,132 @@ export async function resolveHandler(
     conversationId: updated.id,
     status: 'resolved',
     resolvedBy: updated.resolvedBy ?? bot.id,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// messaging.tag (T-15)
+// ──────────────────────────────────────────────────────────────────────────────
+
+export const tagInputSchema = z.object({
+  conversationId: uuid,
+  tag: z.string().trim().min(1).max(60),
+  action: z.enum(['add', 'remove']),
+});
+export type TagInput = z.infer<typeof tagInputSchema>;
+
+export interface TagResult {
+  conversationId: string;
+  tagId: string | null;
+  tagName: string;
+  action: 'add' | 'remove';
+  // True when conversationTags was actually mutated (insert produced a row /
+  // delete removed one); false on no-op (already present / never linked).
+  applied: boolean;
+}
+
+async function resolveTagByName(
+  db: DB,
+  name: string,
+): Promise<{ id: string } | null> {
+  const [row] = await db
+    .select({ id: schema.tags.id })
+    .from(schema.tags)
+    .where(eq(schema.tags.name, name))
+    .limit(1);
+  return row ? { id: row.id } : null;
+}
+
+export async function tagHandler(
+  db: DB,
+  _app: FastifyInstance,
+  input: TagInput,
+  ctx: AtlasRequestContext,
+): Promise<TagResult> {
+  const conv = await loadConversationScope(db, input.conversationId);
+  await requireAtlasUserLink(db, conv.accountId, ctx);
+
+  // Normalize to match the lowercase+trim convention enforced by
+  // `tags/routes.ts:9` so the trigger T-03 case match (`'qualified'`) lines up
+  // regardless of agent capitalization.
+  const name = input.tag.trim().toLowerCase();
+  if (!name) {
+    throw new MessagingToolError('bad_request', 'tag name must be a non-empty string');
+  }
+
+  if (input.action === 'add') {
+    let tag = await resolveTagByName(db, name);
+    if (!tag) {
+      try {
+        const [created] = await db
+          .insert(schema.tags)
+          .values({ name, accountId: conv.accountId })
+          .returning({ id: schema.tags.id });
+        if (created) tag = { id: created.id };
+      } catch (err) {
+        // tags.name is globally unique — a 23505 means another account beat us
+        // to it. Re-lookup and reuse: cross-account reuse is the existing
+        // schema's reality (`tags/routes.ts:43` also surfaces 23505 as a
+        // conflict for the explicit-create path).
+        if ((err as { code?: string }).code !== '23505') throw err;
+      }
+      if (!tag) tag = await resolveTagByName(db, name);
+      if (!tag) {
+        throw new Error('tag: failed to resolve or create tag after 23505 race');
+      }
+    }
+
+    // Same emit contract as the four REST/bulk/automation/bot insert sites
+    // (T-03): `.onConflictDoNothing().returning(...)` exposes only the rows
+    // that truly inserted, so re-applying an existing tag does not re-fire
+    // `lead_qualified`. The `qualified` case continues to flow through
+    // `enqueue.ts:buildConnectorEventForEvent` → `buildLeadQualifiedEnvelope`.
+    const inserted = await db
+      .insert(schema.conversationTags)
+      .values({ conversationId: conv.id, tagId: tag.id })
+      .onConflictDoNothing()
+      .returning({ tagId: schema.conversationTags.tagId });
+    if (inserted.length > 0) {
+      await emitConversationTagged(db, {
+        conversationId: conv.id,
+        tagIds: inserted.map((r) => r.tagId),
+      });
+    }
+
+    return {
+      conversationId: conv.id,
+      tagId: tag.id,
+      tagName: name,
+      action: 'add',
+      applied: inserted.length > 0,
+    };
+  }
+
+  // action === 'remove'
+  const tag = await resolveTagByName(db, name);
+  if (!tag) {
+    return {
+      conversationId: conv.id,
+      tagId: null,
+      tagName: name,
+      action: 'remove',
+      applied: false,
+    };
+  }
+  const removed = await db
+    .delete(schema.conversationTags)
+    .where(
+      and(
+        eq(schema.conversationTags.conversationId, conv.id),
+        eq(schema.conversationTags.tagId, tag.id),
+      ),
+    )
+    .returning({ tagId: schema.conversationTags.tagId });
+  return {
+    conversationId: conv.id,
+    tagId: tag.id,
+    tagName: name,
+    action: 'remove',
+    applied: removed.length > 0,
   };
 }

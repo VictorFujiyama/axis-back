@@ -38,7 +38,7 @@ describe('emitConversationTagged', () => {
     const db = makeDb('inbox-1');
     await emitConversationTagged(db, { conversationId: 'conv-1', tagIds: [] });
     expect(events).toHaveLength(0);
-    expect((db as { select: ReturnType<typeof vi.fn> }).select).not.toHaveBeenCalled();
+    expect((db as unknown as { select: ReturnType<typeof vi.fn> }).select).not.toHaveBeenCalled();
   });
 
   it('is a no-op when the conversation row is gone (race with delete)', async () => {

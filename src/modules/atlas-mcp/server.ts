@@ -18,6 +18,8 @@ import {
   searchInputSchema,
   sendMessageHandler,
   sendMessageInputSchema,
+  tagHandler,
+  tagInputSchema,
 } from './tools';
 
 /**
@@ -224,6 +226,31 @@ export function buildMcpServer(
       try {
         const bound = requireCtx(ctx);
         const result = await resolveHandler(db, app, args, bound);
+        return toToolResult(result);
+      } catch (err) {
+        const mapped = mapToolError(err);
+        if (mapped) return mapped;
+        throw err;
+      }
+    },
+  );
+
+  // ── messaging.tag (T-15) ─────────────────────────────────────────────────
+  // Lowercases the input tag name to match `tags.name` storage and keep the
+  // T-03 `qualified` trigger case match aligned. Auto-creates the tag in the
+  // conversation's account if it does not yet exist globally; cross-account
+  // reuse on 23505 falls back to the existing row.
+  server.registerTool(
+    'messaging.tag',
+    {
+      description:
+        "Add or remove a tag on a conversation. `action: 'add'` upserts the conversation_tags edge (and auto-creates the tag row if needed); `action: 'remove'` deletes the edge. Tagging with name `qualified` fires the lead_qualified envelope to Atlas (same path as the REST/bot/automation tag-insert sites).",
+      inputSchema: tagInputSchema.shape,
+    },
+    async (args) => {
+      try {
+        const bound = requireCtx(ctx);
+        const result = await tagHandler(db, app, args, bound);
         return toToolResult(result);
       } catch (err) {
         const mapped = mapToolError(err);

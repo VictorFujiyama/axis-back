@@ -144,7 +144,7 @@ const BOT_USER_ROW = {
 };
 
 describe('buildMcpServer — InMemoryTransport pair', () => {
-  it('exposes all six messaging.* tools via listTools() (T-015b read + T-023 write)', async () => {
+  it('exposes all seven messaging.* tools via listTools() (T-015b read + T-023 write + T-15 tag)', async () => {
     const db = makeDb([]);
     const { client, close } = await connectPair(db, CTX);
     try {
@@ -157,6 +157,7 @@ describe('buildMcpServer — InMemoryTransport pair', () => {
         'messaging.resolve',
         'messaging.search',
         'messaging.send_message',
+        'messaging.tag',
       ]);
     } finally {
       await close();

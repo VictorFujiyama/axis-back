@@ -10,6 +10,7 @@ import {
   resolveHandler,
   searchHandler,
   sendMessageHandler,
+  tagHandler,
 } from '../tools';
 import { buildAtlasBotEmail } from '../atlas-bot';
 import { eventBus } from '../../../realtime/event-bus';
@@ -433,5 +434,223 @@ describe('resolveHandler', () => {
         meta: { atlasAppUserId: ATLAS_APP_USER_ID, atlasOrgId: ATLAS_ORG_ID },
       }),
     );
+  });
+});
+
+// ─── tagHandler (T-15) ────────────────────────────────────────────────────────
+
+const TAG_ID = '99999999-9999-9999-9999-999999999999';
+
+/**
+ * Drizzle mock for `tagHandler`. The handler issues these chains, in order:
+ *   - select(...).from(...).innerJoin(...).where(...).limit(1)          loadConversationScope
+ *   - select(...).from(...).where(...).limit(1)                         requireAtlasUserLink
+ *   - select(...).from(tags).where(name).limit(1)                       resolveTagByName
+ *   - insert(tags).values(...).returning(...)                           [add] auto-create when missing
+ *   - insert(conversation_tags).values(...).onConflictDoNothing().returning(...)
+ *   - select(...).from(conversations).where(...).limit(1)               emitConversationTagged inbox lookup
+ *   - delete(conversation_tags).where(...).returning(...)               [remove]
+ *
+ * `selectLimits` queue feeds every `.limit()` in declaration order. The insert
+ * chain supports both shapes — plain `.values().returning(...)` (tag create)
+ * AND `.values().onConflictDoNothing().returning(...)` (edge upsert) — by
+ * exposing `.returning` AND `.onConflictDoNothing` on the same `values()`
+ * builder; each `.returning(...)` call consumes the next entry in
+ * `insertReturnings`.
+ */
+function makeTagDb(opts: {
+  selectLimits?: Array<unknown[]>;
+  // Each entry is the rowset OR an Error for the corresponding `.returning(...)`
+  // resolution; consumed in call order across both tag and edge inserts.
+  insertReturnings?: Array<unknown[] | Error>;
+  deleteReturnings?: Array<unknown[]>;
+}): {
+  db: DB;
+  insertSpy: ReturnType<typeof vi.fn>;
+  onConflictSpy: ReturnType<typeof vi.fn>;
+  deleteSpy: ReturnType<typeof vi.fn>;
+} {
+  const selectLimit = vi.fn();
+  for (const rs of opts.selectLimits ?? []) selectLimit.mockResolvedValueOnce(rs);
+  const orderBy = vi.fn().mockReturnValue({ limit: selectLimit });
+  const selectWhere = vi.fn().mockReturnValue({ limit: selectLimit, orderBy });
+  const innerJoin = vi.fn().mockReturnValue({ where: selectWhere });
+  const selectFrom = vi.fn().mockReturnValue({ where: selectWhere, innerJoin });
+  const select = vi.fn().mockReturnValue({ from: selectFrom });
+
+  const insertReturning = vi.fn();
+  for (const rs of opts.insertReturnings ?? []) {
+    if (rs instanceof Error) insertReturning.mockRejectedValueOnce(rs);
+    else insertReturning.mockResolvedValueOnce(rs);
+  }
+  const onConflictBuilder = { returning: insertReturning };
+  const onConflictSpy = vi.fn().mockReturnValue(onConflictBuilder);
+  const insertValues = vi.fn().mockReturnValue({
+    returning: insertReturning,
+    onConflictDoNothing: onConflictSpy,
+  });
+  const insertSpy = vi.fn().mockReturnValue({ values: insertValues });
+
+  const deleteReturning = vi.fn();
+  for (const rs of opts.deleteReturnings ?? []) deleteReturning.mockResolvedValueOnce(rs);
+  const deleteWhere = vi.fn().mockReturnValue({ returning: deleteReturning });
+  const deleteSpy = vi.fn().mockReturnValue({ where: deleteWhere });
+
+  return {
+    db: { select, insert: insertSpy, delete: deleteSpy } as unknown as DB,
+    insertSpy,
+    onConflictSpy,
+    deleteSpy,
+  };
+}
+
+describe('tagHandler', () => {
+  let emitSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    emitSpy = vi.spyOn(eventBus, 'emitEvent').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    emitSpy.mockRestore();
+  });
+
+  it('action=add: existing tag, new edge → upserts conversation_tags and fires conversation.tagged', async () => {
+    const { db, onConflictSpy } = makeTagDb({
+      selectLimits: [
+        [CONV_SCOPE_ROW],                   // loadConversationScope
+        [{ id: 'link-1' }],                 // requireAtlasUserLink
+        [{ id: TAG_ID }],                   // resolveTagByName → hit
+        [{ inboxId: INBOX_ID }],            // emitConversationTagged inbox lookup
+      ],
+      insertReturnings: [
+        // No tag auto-create needed — resolveTagByName hit.
+        [{ tagId: TAG_ID }],                // conversation_tags edge inserted
+      ],
+    });
+
+    const result = await tagHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID, tag: 'qualified', action: 'add' },
+      CTX,
+    );
+
+    expect(result).toEqual({
+      conversationId: CONV_ID,
+      tagId: TAG_ID,
+      tagName: 'qualified',
+      action: 'add',
+      applied: true,
+    });
+    expect(onConflictSpy).toHaveBeenCalledTimes(1);
+    expect(emitSpy).toHaveBeenCalledTimes(1);
+    expect(emitSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'conversation.tagged',
+        conversationId: CONV_ID,
+        inboxId: INBOX_ID,
+        tagId: TAG_ID,
+      }),
+    );
+  });
+
+  it('action=add: tag not yet in DB → auto-creates with conv.accountId then upserts the edge', async () => {
+    const { db, insertSpy } = makeTagDb({
+      selectLimits: [
+        [CONV_SCOPE_ROW],                   // loadConversationScope
+        [{ id: 'link-1' }],                 // requireAtlasUserLink
+        [],                                 // resolveTagByName → miss
+        [{ inboxId: INBOX_ID }],            // emitConversationTagged inbox lookup
+      ],
+      insertReturnings: [
+        [{ id: TAG_ID }],                   // tags insert (auto-create)
+        [{ tagId: TAG_ID }],                // conversation_tags edge inserted
+      ],
+    });
+
+    const result = await tagHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID, tag: 'Qualified', action: 'add' },
+      CTX,
+    );
+
+    expect(result.tagName).toBe('qualified'); // lowercased
+    expect(result.applied).toBe(true);
+    // Two distinct .insert(...) calls: one into `tags`, one into `conversation_tags`.
+    expect(insertSpy).toHaveBeenCalledTimes(2);
+    expect(emitSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('action=add: edge already present → no emit (idempotent re-tag)', async () => {
+    const { db, onConflictSpy } = makeTagDb({
+      selectLimits: [
+        [CONV_SCOPE_ROW],
+        [{ id: 'link-1' }],
+        [{ id: TAG_ID }],
+        // No inbox lookup expected since emit is skipped
+      ],
+      insertReturnings: [
+        [], // onConflictDoNothing returned no rows — edge already there
+      ],
+    });
+
+    const result = await tagHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID, tag: 'qualified', action: 'add' },
+      CTX,
+    );
+
+    expect(result.applied).toBe(false);
+    expect(onConflictSpy).toHaveBeenCalledTimes(1);
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  it('action=remove: existing tag + edge → deletes and reports applied=true', async () => {
+    const { db, deleteSpy } = makeTagDb({
+      selectLimits: [
+        [CONV_SCOPE_ROW],
+        [{ id: 'link-1' }],
+        [{ id: TAG_ID }],
+      ],
+      deleteReturnings: [[{ tagId: TAG_ID }]],
+    });
+
+    const result = await tagHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID, tag: 'qualified', action: 'remove' },
+      CTX,
+    );
+
+    expect(result).toEqual({
+      conversationId: CONV_ID,
+      tagId: TAG_ID,
+      tagName: 'qualified',
+      action: 'remove',
+      applied: true,
+    });
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    expect(emitSpy).not.toHaveBeenCalled(); // remove never re-fires lead_qualified
+  });
+
+  it('throws MessagingToolError("forbidden") when atlas_user_link is missing for this Atlas user', async () => {
+    const { db } = makeTagDb({
+      selectLimits: [
+        [CONV_SCOPE_ROW],          // loadConversationScope
+        [],                        // requireAtlasUserLink → empty
+      ],
+    });
+
+    const promise = tagHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID, tag: 'qualified', action: 'add' },
+      CTX,
+    );
+
+    await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
+    await expect(promise).rejects.toMatchObject({ code: 'forbidden' });
+    expect(emitSpy).not.toHaveBeenCalled();
   });
 });
