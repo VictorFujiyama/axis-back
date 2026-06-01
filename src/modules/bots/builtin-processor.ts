@@ -77,11 +77,24 @@ export async function processBuiltinBot(
   }
 
   // ── 2. Resolve API key ────────────────────────────────────────────
+  // Two shapes coexist:
+  // - Legacy bots: secret = encryptJSON(rawApiKey) → decrypts to string.
+  // - playbook-in-axis auto-bots (spec D16): secret = encryptJSON({apiKey, provider}).
   let botApiKey: string | null = null;
   try {
-    botApiKey = decryptJSON<string>(bot.secret);
+    const decrypted = decryptJSON<unknown>(bot.secret);
+    if (typeof decrypted === 'string') {
+      botApiKey = decrypted;
+    } else if (
+      decrypted !== null &&
+      typeof decrypted === 'object' &&
+      'apiKey' in decrypted &&
+      typeof (decrypted as { apiKey?: unknown }).apiKey === 'string'
+    ) {
+      botApiKey = (decrypted as { apiKey: string }).apiKey;
+    }
     // If it starts with 'blsk_' it's a webhook secret, not an API key
-    if (botApiKey.startsWith('blsk_')) botApiKey = null;
+    if (botApiKey && botApiKey.startsWith('blsk_')) botApiKey = null;
   } catch {
     // Secret might not contain a valid API key
   }
