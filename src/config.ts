@@ -141,6 +141,22 @@ const envSchema = z.object({
   // (POST /api/connectors/atlas-mcp). 43 base64url chars from Berg. Optional —
   // the MCP pull helper no-ops without it; not required for emit/handshake.
   ATLAS_MCP_BEARER: z.string().min(20).optional(),
+  // ---- playbook-in-axis feature flag (D37/D40) ----
+  // Master switch for the playbook-in-axis feature: axis owns the messaging
+  // playbook (inbox_playbooks table) + auto-bot lifecycle, and the Atlas worker
+  // reads it via the `messaging.get_inbox_playbook` MCP tool. Default `true`
+  // (feature on after deploy). Flip to `false` as a fast rollback WITHOUT a
+  // revert: PATCH inbox playbook returns 400 "feature disabled", auto-bot logic
+  // is skipped, and the MCP tool returns `{exists: false}` so the Atlas worker
+  // degrades gracefully to its legacy `readPlaybook` fallback.
+  // Enum-string instead of `z.coerce.boolean()` because the latter coerces the
+  // literal string `'false'` to `true` (any non-empty string is truthy) — which
+  // would silently defeat the rollback path. Mirrors MCP_SERVER_ENABLED /
+  // USE_PHASE_12_ENVELOPE / ALLOW_UNSIGNED_WEBHOOKS above.
+  PLAYBOOK_IN_AXIS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
 });
 
 export type Config = z.infer<typeof envSchema>;
