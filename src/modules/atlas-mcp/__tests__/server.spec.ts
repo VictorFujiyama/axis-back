@@ -158,6 +158,7 @@ describe('buildMcpServer — InMemoryTransport pair', () => {
         'messaging.search',
         'messaging.send_message',
         'messaging.tag',
+        'messaging.unassign_bot',
       ]);
     } finally {
       await close();

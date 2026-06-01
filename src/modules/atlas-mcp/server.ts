@@ -20,6 +20,8 @@ import {
   sendMessageInputSchema,
   tagHandler,
   tagInputSchema,
+  unassignBotHandler,
+  unassignBotInputSchema,
 } from './tools';
 
 /**
@@ -251,6 +253,30 @@ export function buildMcpServer(
       try {
         const bound = requireCtx(ctx);
         const result = await tagHandler(db, app, args, bound);
+        return toToolResult(result);
+      } catch (err) {
+        const mapped = mapToolError(err);
+        if (mapped) return mapped;
+        throw err;
+      }
+    },
+  );
+
+  // ── messaging.unassign_bot (T-16 — Fase G smart handoff) ──────────────────
+  // Releases the Atlas-bot from a conversation (bot→human reverse handoff,
+  // D29). Scoped to the bot's account (D32); only the assigned bot may release,
+  // a different bot is a conflict, an already-free conversation is a no-op.
+  server.registerTool(
+    'messaging.unassign_bot',
+    {
+      description:
+        "Release the Atlas-bot from a conversation so it returns to the inbox's general queue for a human to pick up. Sets status to 'open' and clears the bot assignment. No-op if the conversation already has no bot; errors if a different bot owns it.",
+      inputSchema: unassignBotInputSchema.shape,
+    },
+    async (args) => {
+      try {
+        const bound = requireCtx(ctx);
+        const result = await unassignBotHandler(db, app, args, bound);
         return toToolResult(result);
       } catch (err) {
         const mapped = mapToolError(err);

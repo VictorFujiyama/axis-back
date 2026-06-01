@@ -27,7 +27,11 @@ import { getOrCreateAtlasBotUser } from './atlas-bot';
  * `atlas_user_links` because they mutate state.
  */
 
-export type MessagingToolErrorCode = 'not_found' | 'forbidden' | 'bad_request';
+export type MessagingToolErrorCode =
+  | 'not_found'
+  | 'forbidden'
+  | 'bad_request'
+  | 'conflict';
 
 export class MessagingToolError extends Error {
   readonly code: MessagingToolErrorCode;
@@ -311,6 +315,42 @@ async function requireAtlasUserLink(
       'Atlas user not linked — open /messaging in Atlas web first to activate the link, then retry.',
     );
   }
+}
+
+/**
+ * Like {@link requireAtlasUserLink} but RETURNS the bound `axisUserId` instead
+ * of discarding it. The Fase G handoff tools (T-16/T-17) need the linked axis
+ * user to (a) prove the Atlas-bot is the assigned bot before releasing a
+ * conversation, and (b) enforce D32 multi-tenancy: the lookup is scoped to the
+ * conversation's `accountId`, so a bot linked to a different account finds no
+ * row here and is rejected as `forbidden` (cross-tenant), exactly like the
+ * existing write-tool gate. For the bot caller `ctx.atlasAppUserId` is
+ * `atlas-bot:<orgId>` (T-00a/T-00c), so the resolved `axisUserId` is the bot
+ * user that `inbox.defaultBotId` (T-19) stamps onto new conversations.
+ */
+async function resolveAtlasUserLink(
+  db: DB,
+  accountId: string,
+  ctx: AtlasRequestContext,
+): Promise<{ axisUserId: string }> {
+  const [row] = await db
+    .select({ axisUserId: schema.atlasUserLinks.axisUserId })
+    .from(schema.atlasUserLinks)
+    .where(
+      and(
+        eq(schema.atlasUserLinks.accountId, accountId),
+        eq(schema.atlasUserLinks.atlasOrgId, ctx.atlasOrgId),
+        eq(schema.atlasUserLinks.atlasAppUserId, ctx.atlasAppUserId),
+      ),
+    )
+    .limit(1);
+  if (!row) {
+    throw new MessagingToolError(
+      'forbidden',
+      'Atlas user not linked — open /messaging in Atlas web first to activate the link, then retry.',
+    );
+  }
+  return { axisUserId: row.axisUserId };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -696,4 +736,88 @@ export async function tagHandler(
     action: 'remove',
     applied: removed.length > 0,
   };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// messaging.unassign_bot (T-16 — Fase G smart handoff: D27/D29/D31/D32)
+// ──────────────────────────────────────────────────────────────────────────────
+
+export const unassignBotInputSchema = z.object({ conversationId: uuid });
+export type UnassignBotInput = z.infer<typeof unassignBotInputSchema>;
+
+export interface UnassignBotResult {
+  ok: true;
+  conversationId: string;
+  status: 'open';
+  // False when the bot assignment was actually cleared; true when the
+  // conversation already had no bot (idempotent no-op).
+  unchanged: boolean;
+}
+
+/**
+ * Release the Atlas-bot from a conversation so it returns to the inbox's
+ * general queue for a human to pick up (D29 reverse handoff bot→human).
+ *
+ * Gate + tenancy (D31/D32): `resolveAtlasUserLink` is scoped to the
+ * conversation's account, so only the Atlas-bot mapped to that account can
+ * release it — a cross-account caller gets `forbidden`. The conversation must
+ * currently be assigned to THIS bot; a different bot (or a human-managed
+ * thread) is a `conflict` and is left untouched. An already-unassigned
+ * conversation is an idempotent no-op (`unchanged: true`, no event).
+ *
+ * On release the conversation flips to `status='open'` and stamps
+ * `waitingForAgentSince` (the same field `send_message` clears), surfacing it
+ * to human agents, then emits `conversation.assigned` (bot→null) for realtime.
+ */
+export async function unassignBotHandler(
+  db: DB,
+  _app: FastifyInstance,
+  input: UnassignBotInput,
+  ctx: AtlasRequestContext,
+): Promise<UnassignBotResult> {
+  const conv = await loadConversationScope(db, input.conversationId);
+  const { axisUserId: botUserId } = await resolveAtlasUserLink(db, conv.accountId, ctx);
+
+  // Idempotent: no bot to release → report ok without mutating or emitting.
+  if (conv.assignedBotId === null) {
+    return { ok: true, conversationId: conv.id, status: 'open', unchanged: true };
+  }
+  // Only the bot that owns the conversation may release it.
+  if (conv.assignedBotId !== botUserId) {
+    throw new MessagingToolError(
+      'conflict',
+      `conversation ${conv.id} is assigned to a different bot`,
+    );
+  }
+
+  const now = new Date();
+  const [updated] = await db
+    .update(schema.conversations)
+    .set({
+      assignedBotId: null,
+      status: 'open',
+      waitingForAgentSince: now,
+      updatedAt: now,
+    })
+    .where(eq(schema.conversations.id, conv.id))
+    .returning({
+      id: schema.conversations.id,
+      inboxId: schema.conversations.inboxId,
+      assignedUserId: schema.conversations.assignedUserId,
+      assignedTeamId: schema.conversations.assignedTeamId,
+      assignedBotId: schema.conversations.assignedBotId,
+    });
+  if (!updated) throw new Error('unassign_bot: update returned no row');
+
+  eventBus.emitEvent({
+    type: 'conversation.assigned',
+    inboxId: updated.inboxId,
+    conversationId: updated.id,
+    assignedUserId: updated.assignedUserId,
+    assignedTeamId: updated.assignedTeamId,
+    assignedBotId: updated.assignedBotId,
+    meta: { atlasAppUserId: ctx.atlasAppUserId, atlasOrgId: ctx.atlasOrgId },
+  });
+
+  return { ok: true, conversationId: updated.id, status: 'open', unchanged: false };
 }

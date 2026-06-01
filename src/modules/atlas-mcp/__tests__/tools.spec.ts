@@ -11,6 +11,7 @@ import {
   searchHandler,
   sendMessageHandler,
   tagHandler,
+  unassignBotHandler,
 } from '../tools';
 import { buildAtlasBotEmail } from '../atlas-bot';
 import { eventBus } from '../../../realtime/event-bus';
@@ -651,6 +652,125 @@ describe('tagHandler', () => {
 
     await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
     await expect(promise).rejects.toMatchObject({ code: 'forbidden' });
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ─── unassignBotHandler (T-16 — Fase G smart handoff) ─────────────────────────
+
+const OTHER_ACCOUNT_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+const OTHER_BOT_USER_ID = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+
+describe('unassignBotHandler', () => {
+  let emitSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    emitSpy = vi.spyOn(eventBus, 'emitEvent').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    emitSpy.mockRestore();
+  });
+
+  it('releases the bot, flips status to open, and emits conversation.assigned (bot→null)', async () => {
+    const updatedConv = {
+      id: CONV_ID,
+      inboxId: INBOX_ID,
+      assignedUserId: null,
+      assignedTeamId: null,
+      assignedBotId: null,
+    };
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [{ ...CONV_SCOPE_ROW, assignedBotId: BOT_USER_ID }], // loadConversationScope
+        [{ axisUserId: BOT_USER_ID }],                       // resolveAtlasUserLink → bot link
+      ],
+      updateReturnings: [[updatedConv]],
+    });
+
+    const result = await unassignBotHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID },
+      CTX,
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      conversationId: CONV_ID,
+      status: 'open',
+      unchanged: false,
+    });
+    expect(emitSpy).toHaveBeenCalledTimes(1);
+    expect(emitSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'conversation.assigned',
+        conversationId: CONV_ID,
+        inboxId: INBOX_ID,
+        assignedBotId: null,
+        meta: { atlasAppUserId: ATLAS_APP_USER_ID, atlasOrgId: ATLAS_ORG_ID },
+      }),
+    );
+  });
+
+  it('throws MessagingToolError("not_found") when the conversation does not exist', async () => {
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [], // loadConversationScope → empty
+      ],
+    });
+
+    const promise = unassignBotHandler(db, appStub, { conversationId: CONV_ID }, CTX);
+
+    await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
+    await expect(promise).rejects.toMatchObject({ code: 'not_found' });
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  it('throws MessagingToolError("forbidden") cross-tenant: bot not linked to the conversation account', async () => {
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [{ ...CONV_SCOPE_ROW, accountId: OTHER_ACCOUNT_ID, assignedBotId: BOT_USER_ID }], // scope (other account)
+        [],                                                                               // resolveAtlasUserLink → no link for that account
+      ],
+    });
+
+    const promise = unassignBotHandler(db, appStub, { conversationId: CONV_ID }, CTX);
+
+    await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
+    await expect(promise).rejects.toMatchObject({ code: 'forbidden' });
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  it('throws MessagingToolError("conflict") when a different bot is assigned', async () => {
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [{ ...CONV_SCOPE_ROW, assignedBotId: OTHER_BOT_USER_ID }], // scope: a different bot owns it
+        [{ axisUserId: BOT_USER_ID }],                            // resolveAtlasUserLink → our bot
+      ],
+    });
+
+    const promise = unassignBotHandler(db, appStub, { conversationId: CONV_ID }, CTX);
+
+    await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
+    await expect(promise).rejects.toMatchObject({ code: 'conflict' });
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  it('is idempotent: already unassigned → returns ok unchanged without mutating or emitting', async () => {
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [{ ...CONV_SCOPE_ROW, assignedBotId: null }], // scope: no bot assigned
+        [{ axisUserId: BOT_USER_ID }],                // resolveAtlasUserLink → our bot
+      ],
+    });
+
+    const result = await unassignBotHandler(db, appStub, { conversationId: CONV_ID }, CTX);
+
+    expect(result).toEqual({
+      ok: true,
+      conversationId: CONV_ID,
+      status: 'open',
+      unchanged: true,
+    });
     expect(emitSpy).not.toHaveBeenCalled();
   });
 });
