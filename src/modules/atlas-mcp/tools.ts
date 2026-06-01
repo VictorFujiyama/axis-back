@@ -1,7 +1,8 @@
-import { and, asc, desc, eq, gte, isNull, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, isNull, like, sql, type SQL } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema, type DB } from '@blossom/db';
+import { config } from '../../config';
 import { emitConversationTagged } from '../atlas-events/tagged-trigger';
 import { eventBus } from '../../realtime/event-bus';
 import { getOrCreateAtlasBotUser } from './atlas-bot';
@@ -930,5 +931,101 @@ export async function assignUserHandler(
     conversationId: updated.id,
     assignedUserId: updated.assignedUserId ?? input.axisUserId,
     status: 'open',
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// messaging.get_inbox_playbook (T-06 — playbook-in-axis D26/D27/D40)
+// ──────────────────────────────────────────────────────────────────────────────
+
+export const getInboxPlaybookInputSchema = z.object({ inboxId: uuid });
+export type GetInboxPlaybookInput = z.infer<typeof getInboxPlaybookInputSchema>;
+
+export type GetInboxPlaybookResult =
+  | { exists: false }
+  | {
+      exists: true;
+      content: string;
+      etag: string;
+      version: number;
+      updatedAt: Date;
+    };
+
+/**
+ * Read the locally-stored playbook for an inbox (D1: axis-back is the source of
+ * truth). Atlas-worker calls this via MCP to fetch the playbook it observes
+ * conversations against (D26).
+ *
+ * Unlike the other read tools (which are intentionally not account-scoped —
+ * L-408 trusts the inbound HMAC and Atlas decides visibility), this tool leaks
+ * inbox content cross-org if unguarded, so it carries an explicit cross-tenant
+ * check (D27): the playbook is only returned when the inbox's account matches
+ * the account the calling Atlas org is bound to via its `atlas-bot:%` link in
+ * `atlas_user_links`. A missing link or an account mismatch is `forbidden`.
+ *
+ * Degrades gracefully when the feature flag is off (D40) or the inbox /
+ * playbook row is absent — returns `{exists: false}` rather than throwing, so
+ * the Atlas worker falls back to its legacy `readPlaybook` path during a
+ * rollback without surfacing a hard error.
+ */
+export async function getInboxPlaybookHandler(
+  db: DB,
+  input: GetInboxPlaybookInput,
+  ctx: AtlasRequestContext,
+): Promise<GetInboxPlaybookResult> {
+  // D40 — feature flag off: behave as if no playbook exists so the Atlas worker
+  // falls back to its legacy readPlaybook path.
+  if (!config.PLAYBOOK_IN_AXIS_ENABLED) {
+    return { exists: false };
+  }
+
+  // Resolve the inbox (its account drives the cross-tenant check). A
+  // non-existent inbox degrades to {exists:false} (D26) — not a 404.
+  const [inbox] = await db
+    .select({ accountId: schema.inboxes.accountId })
+    .from(schema.inboxes)
+    .where(eq(schema.inboxes.id, input.inboxId))
+    .limit(1);
+  if (!inbox || inbox.accountId === null) {
+    return { exists: false };
+  }
+
+  // D27 — cross-tenant gate. The Atlas org is bound to exactly one axis account
+  // through its provisioned `atlas-bot:<orgId>` link (D31). Reading an inbox
+  // that belongs to a different account is a cross-tenant leak → forbidden.
+  const [link] = await db
+    .select({ accountId: schema.atlasUserLinks.accountId })
+    .from(schema.atlasUserLinks)
+    .where(
+      and(
+        eq(schema.atlasUserLinks.atlasOrgId, ctx.atlasOrgId),
+        like(schema.atlasUserLinks.atlasAppUserId, 'atlas-bot:%'),
+      ),
+    )
+    .limit(1);
+  if (!link || link.accountId !== inbox.accountId) {
+    throw new MessagingToolError('forbidden', 'cross-tenant access denied');
+  }
+
+  const [playbook] = await db
+    .select({
+      content: schema.inboxPlaybooks.content,
+      etag: schema.inboxPlaybooks.etag,
+      version: schema.inboxPlaybooks.version,
+      updatedAt: schema.inboxPlaybooks.updatedAt,
+    })
+    .from(schema.inboxPlaybooks)
+    .where(eq(schema.inboxPlaybooks.inboxId, input.inboxId))
+    .limit(1);
+  if (!playbook) {
+    return { exists: false };
+  }
+
+  return {
+    exists: true,
+    content: playbook.content,
+    etag: playbook.etag,
+    version: playbook.version,
+    updatedAt: playbook.updatedAt,
   };
 }

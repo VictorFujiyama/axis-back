@@ -10,6 +10,8 @@ import {
   assignInputSchema,
   assignUserHandler,
   assignUserInputSchema,
+  getInboxPlaybookHandler,
+  getInboxPlaybookInputSchema,
   getThreadHandler,
   getThreadInputSchema,
   listThreadsHandler,
@@ -166,6 +168,31 @@ export function buildMcpServer(
     async (args) => {
       try {
         const result = await searchHandler(db, args);
+        return toToolResult(result);
+      } catch (err) {
+        const mapped = mapToolError(err);
+        if (mapped) return mapped;
+        throw err;
+      }
+    },
+  );
+
+  // ── messaging.get_inbox_playbook (T-06 — playbook-in-axis) ────────────────
+  // A read tool, but it needs `ctx` to enforce the D27 cross-tenant check: the
+  // calling Atlas org may only read playbooks of the axis account it is bound
+  // to via `atlas_user_links`. Missing identity headers → forbidden, same as
+  // the write tools.
+  server.registerTool(
+    'messaging.get_inbox_playbook',
+    {
+      description:
+        'Fetch the playbook configured for an inbox (axis-back is the source of truth). Returns {exists:true, content, etag, version, updatedAt} or {exists:false} when no playbook is set, the inbox is unknown, or the feature is disabled. Scoped to the caller Atlas org\'s account; reading another account\'s inbox is forbidden.',
+      inputSchema: getInboxPlaybookInputSchema.shape,
+    },
+    async (args) => {
+      try {
+        const bound = requireCtx(ctx);
+        const result = await getInboxPlaybookHandler(db, args, bound);
         return toToolResult(result);
       } catch (err) {
         const mapped = mapToolError(err);
