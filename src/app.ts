@@ -19,6 +19,7 @@ import { registerWorkers } from './queue/workers';
 import { armGmailSchedulesOnBoot } from './queue/arm-gmail-schedules';
 import { registerAutomationEventHook } from './modules/automations/event-hook';
 import { healthRoutes } from './modules/health/routes';
+import { metricsRoutes } from './modules/metrics/routes';
 import { authRoutes } from './modules/auth/routes';
 import { accountRoutes } from './modules/accounts/routes';
 import { userRoutes } from './modules/users/routes';
@@ -189,6 +190,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   await app.register(healthRoutes);
+  await app.register(metricsRoutes);
   await app.register(authRoutes);
   await app.register(accountRoutes);
   await app.register(userRoutes);

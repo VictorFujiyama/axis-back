@@ -1,6 +1,7 @@
 import { and, eq } from 'drizzle-orm';
 import { type DB, schema } from '@blossom/db';
 import { encryptJSON } from '../../crypto';
+import { activeInboxesGauge, botAutoCreatedTotal, botAutoDisabledTotal } from '../../metrics';
 
 /**
  * Auto-bot lifecycle for an inbox (D14, D15, D18-D22, D33).
@@ -158,6 +159,9 @@ export async function applyAutoBotForInbox(
         .set({ defaultBotId: created!.id, updatedAt: new Date() })
         .where(eq(schema.inboxes.id, input.inboxId));
       await writeAudit('bot.auto_created', { provider: finalProvider }, created!.id);
+      // D39: new bot transitions the inbox into the active set.
+      botAutoCreatedTotal.inc();
+      activeInboxesGauge.inc();
       return { action: 'created', botId: created!.id };
     }
 
@@ -186,6 +190,10 @@ export async function applyAutoBotForInbox(
         .set({ defaultBotId: bot.id, updatedAt: new Date() })
         .where(eq(schema.inboxes.id, input.inboxId));
       await writeAudit('bot.auto_created', { reEnabled: true }, bot.id);
+      // D39: re-enabling a disabled bot transitions the inbox back into the active
+      // set (audit action is also 'bot.auto_created', so the counter mirrors it).
+      botAutoCreatedTotal.inc();
+      activeInboxesGauge.inc();
       return { action: 'updated', botId: bot.id };
     }
 
@@ -203,6 +211,9 @@ export async function applyAutoBotForInbox(
       .set({ defaultBotId: null, updatedAt: new Date() })
       .where(eq(schema.inboxes.id, input.inboxId));
     await writeAudit('bot.auto_disabled', {}, bot.id);
+    // D39: bot leaves the active set.
+    botAutoDisabledTotal.inc();
+    activeInboxesGauge.dec();
     return { action: 'disabled', botId: bot.id };
   }
 
