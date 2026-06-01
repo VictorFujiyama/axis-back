@@ -16,6 +16,10 @@ export const inboxes = pgTable('inboxes', {
   // Default bot assigned to new conversations in this inbox.
   // FK to bots(id) added in migration SQL (circular: bots → inboxes → bots).
   defaultBotId: uuid('default_bot_id'),
+  // LLM API key for auto-created builtin bot, encrypted via AES-256-GCM (encryptJSON({apiKey, provider})).
+  botLlmApiKeyEnc: text('bot_llm_api_key_enc'),
+  // Provider for the builtin bot LLM: 'anthropic' | 'openai' (app-level enum validation).
+  botLlmProvider: text('bot_llm_provider'),
   enabled: boolean('enabled').notNull().default(true),
   deletedAt: timestamp('deleted_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
