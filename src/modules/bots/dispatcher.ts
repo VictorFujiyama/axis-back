@@ -11,6 +11,8 @@ export interface DispatchInput {
   newMessageId: string;
   botId: string;
   accountId: string;
+  /** Playbook version snapshotted at enqueue time (D11 stale detection). */
+  expectedPlaybookVersion?: number;
 }
 
 interface DispatchDeps {

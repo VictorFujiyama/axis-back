@@ -92,6 +92,12 @@ interface BuildDbOpts {
   history?: unknown[];
   /** When set, the FIRST insert whose values.event matches this string rejects. */
   rejectInsertForEvent?: string;
+  /**
+   * When defined, an extra `inbox_playbooks` SELECT (.limit(1)) is wired between
+   * the bot and history selects — matching the `playbookSource === 'local'`
+   * branch. Pass `[]` to simulate a missing row, or `[row]` for a present one.
+   */
+  localPlaybook?: unknown[];
 }
 
 function buildDb(opts: BuildDbOpts): DbMock {
@@ -99,12 +105,12 @@ function buildDb(opts: BuildDbOpts): DbMock {
   const history = opts.history ?? makeHistoryRow();
   const insertCalls: Array<{ table: unknown; values: unknown }> = [];
 
-  // SELECT chain — three terminal `.limit(...)` calls (conversation, bot, history).
-  const limit = vi
-    .fn()
-    .mockResolvedValueOnce([conv])
-    .mockResolvedValueOnce([opts.bot])
-    .mockResolvedValueOnce(history);
+  // SELECT chain — terminal `.limit(...)` calls, in invocation order:
+  // conversation, bot, [inbox_playbooks if local], history.
+  const limit = vi.fn();
+  limit.mockResolvedValueOnce([conv]).mockResolvedValueOnce([opts.bot]);
+  if (opts.localPlaybook !== undefined) limit.mockResolvedValueOnce(opts.localPlaybook);
+  limit.mockResolvedValueOnce(history);
   const orderBy = vi.fn().mockReturnValue({ limit });
   const where = vi.fn().mockReturnValue({ limit, orderBy });
   const from = vi.fn().mockReturnValue({ where });
@@ -298,5 +304,76 @@ describe('processBuiltinBot — playbook integration', () => {
       (c) => (c.values as Record<string, unknown>)['event'] === 'playbook_fetch',
     );
     expect(fetchInsert!.table).toBe(schema.botEvents);
+  });
+
+  it("(f) playbookSource 'local' + inbox_playbooks row exists: callLLM uses local content, payload.source='local'", async () => {
+    const { db, insertCalls } = buildDb({
+      bot: makeBotRow(makeBaseConfig({ playbookSource: 'local' })),
+      localPlaybook: [{ content: 'LOCAL playbook content', etag: 'deadbeefcafe0000', version: 3 }],
+    });
+    const app = makeApp();
+
+    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
+
+    // Local source must NOT hit the Atlas HTTP fetcher.
+    expect(mockedFetchPlaybook).not.toHaveBeenCalled();
+    expect(mockedCallLLM).toHaveBeenCalledTimes(1);
+    expect(mockedCallLLM.mock.calls[0]![0].systemPrompt).toBe('LOCAL playbook content');
+
+    const evt = findPlaybookFetchInsert(insertCalls);
+    expect(evt).toBeDefined();
+    expect(evt!['status']).toBe('success');
+    const payload = evt!['payload'] as Record<string, unknown>;
+    expect(payload['source']).toBe('local');
+    expect(payload['etag']).toBe('deadbeef');
+    expect(payload['version']).toBe(3);
+  });
+
+  it("(g) playbookSource 'local' + no inbox_playbooks row: falls back to cfg.systemPrompt, payload.reason='no-local-row'", async () => {
+    const { db, insertCalls } = buildDb({
+      bot: makeBotRow(makeBaseConfig({ playbookSource: 'local' })),
+      localPlaybook: [],
+    });
+    const app = makeApp();
+
+    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
+
+    expect(mockedFetchPlaybook).not.toHaveBeenCalled();
+    expect(mockedCallLLM).toHaveBeenCalledTimes(1);
+    expect(mockedCallLLM.mock.calls[0]![0].systemPrompt).toBe(INLINE_PROMPT);
+
+    const evt = findPlaybookFetchInsert(insertCalls);
+    expect(evt).toBeDefined();
+    expect(evt!['status']).toBe('failed');
+    const payload = evt!['payload'] as Record<string, unknown>;
+    expect(payload['fallback']).toBe(true);
+    expect(payload['reason']).toBe('no-local-row');
+  });
+
+  it("(h) playbookSource 'local' + expectedPlaybookVersion stale: aborts before LLM, logs playbook_stale_skipped", async () => {
+    const { db, insertCalls } = buildDb({
+      bot: makeBotRow(makeBaseConfig({ playbookSource: 'local' })),
+      localPlaybook: [{ content: 'LOCAL playbook content', etag: 'deadbeefcafe0000', version: 2 }],
+    });
+    const app = makeApp();
+
+    // Dispatch snapshotted version 1, but the live row is now version 2 → stale.
+    await processBuiltinBot(
+      { ...INPUT, expectedPlaybookVersion: 1 },
+      { db, log: app.log, redis: app.redis },
+    );
+
+    // Aborted before reaching the LLM.
+    expect(mockedCallLLM).not.toHaveBeenCalled();
+
+    const stale = insertCalls.find(
+      (c) => (c.values as Record<string, unknown>)['event'] === 'playbook_stale_skipped',
+    );
+    expect(stale).toBeDefined();
+    const payload = (stale!.values as Record<string, unknown>)['payload'] as Record<string, unknown>;
+    expect(payload['expected']).toBe(1);
+    expect(payload['actual']).toBe(2);
+    // No regular playbook_fetch event when stale-skipped.
+    expect(findPlaybookFetchInsert(insertCalls)).toBeUndefined();
   });
 });

@@ -49,6 +49,9 @@ export interface BotDispatchJob {
    *  without an extra DB query. */
   botId: string;
   accountId: string;
+  /** Playbook version snapshotted at enqueue time for builtin bots with a
+   *  local playbook (D11 stale detection). Absent when there's no playbook. */
+  expectedPlaybookVersion?: number;
 }
 
 export interface EmailOutboundJob {

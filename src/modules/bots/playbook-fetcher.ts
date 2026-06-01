@@ -2,7 +2,7 @@ import type { FastifyBaseLogger } from 'fastify';
 import type Redis from 'ioredis';
 import { config } from '../../config';
 
-export type PlaybookSource = 'atlas-fresh' | 'atlas-cached' | 'atlas-304';
+export type PlaybookSource = 'atlas-fresh' | 'atlas-cached' | 'atlas-304' | 'local';
 
 export interface PlaybookFetcherApp {
   redis: Redis;

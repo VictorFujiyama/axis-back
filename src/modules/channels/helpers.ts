@@ -385,6 +385,13 @@ export async function ingestIncomingMessage(
       .where(eq(schema.conversations.id, result.conversationId))
       .limit(1);
     if (convForBot?.assignedBotId && convForBot.accountId) {
+      // D11: snapshot the local playbook version so the job can detect a
+      // mid-flight PATCH bump and abort instead of replying with a stale prompt.
+      const [pbRow] = await db
+        .select({ version: schema.inboxPlaybooks.version })
+        .from(schema.inboxPlaybooks)
+        .where(eq(schema.inboxPlaybooks.inboxId, input.inboxId))
+        .limit(1);
       dispatchBot(
         {
           conversationId: result.conversationId,
@@ -393,6 +400,7 @@ export async function ingestIncomingMessage(
           newMessageId: m.id,
           botId: convForBot.assignedBotId,
           accountId: convForBot.accountId,
+          ...(pbRow ? { expectedPlaybookVersion: pbRow.version } : {}),
         },
         { db, log, queue: deps.botQueue, redis: deps.redis },
       );

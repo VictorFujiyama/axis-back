@@ -30,6 +30,13 @@ export interface ProcessInput {
   newMessageId: string;
   botId: string;
   accountId: string;
+  /**
+   * Playbook version captured at dispatch time (D11 stale detection). Only set
+   * for builtin bots with `playbookSource === 'local'`. When the live
+   * inbox_playbooks row has a different version (e.g. a PATCH bumped it while
+   * this job was queued), the job aborts rather than reply with a stale prompt.
+   */
+  expectedPlaybookVersion?: number;
 }
 
 export async function processBuiltinBot(
@@ -135,6 +142,73 @@ export async function processBuiltinBot(
                 ? { reason: 'threw', errorPreview: playbookFetchError }
                 : { reason: 'returned-null' }),
             },
+      })
+      .catch((err) => log.warn({ err }, 'bot_events insert failed (playbook_fetch)'));
+  } else if (cfg.playbookSource === 'local') {
+    // ── 2.5b. Local playbook (axis-back inbox_playbooks, D11/D24) ────
+    const [pb] = await db
+      .select()
+      .from(schema.inboxPlaybooks)
+      .where(eq(schema.inboxPlaybooks.inboxId, input.inboxId))
+      .limit(1);
+
+    // D11 stale detection: a PATCH may have bumped version while this job was
+    // queued. Abort instead of replying with a stale prompt; the dispatch that
+    // bumped version enqueues a fresh job carrying the new expected version.
+    if (
+      pb &&
+      input.expectedPlaybookVersion != null &&
+      pb.version !== input.expectedPlaybookVersion
+    ) {
+      log.warn(
+        {
+          botId: bot.id,
+          inboxId: input.inboxId,
+          expected: input.expectedPlaybookVersion,
+          actual: pb.version,
+        },
+        'builtin-bot: local playbook version stale, aborting',
+      );
+      await db
+        .insert(schema.botEvents)
+        .values({
+          botId: bot.id,
+          accountId: input.accountId,
+          conversationId: input.conversationId,
+          messageId: input.newMessageId,
+          event: 'playbook_stale_skipped',
+          direction: 'outbound',
+          status: 'failed',
+          latencyMs: Date.now() - playbookStart,
+          payload: { source: 'local', expected: input.expectedPlaybookVersion, actual: pb.version },
+        })
+        .catch((err) => log.warn({ err }, 'bot_events insert failed (playbook_stale_skipped)'));
+      return;
+    }
+
+    if (pb) {
+      effectiveSystemPrompt = pb.content;
+      playbookFetchResult = { source: 'local', etag: pb.etag };
+    } else {
+      log.warn(
+        { botId: bot.id, inboxId: input.inboxId },
+        'builtin-bot: inbox_playbooks empty for local source, falling back to inline systemPrompt',
+      );
+    }
+    await db
+      .insert(schema.botEvents)
+      .values({
+        botId: bot.id,
+        accountId: input.accountId,
+        conversationId: input.conversationId,
+        messageId: input.newMessageId,
+        event: 'playbook_fetch',
+        direction: 'outbound',
+        status: pb ? 'success' : 'failed',
+        latencyMs: Date.now() - playbookStart,
+        payload: pb
+          ? { source: 'local', etag: pb.etag.slice(0, 8), version: pb.version }
+          : { fallback: true, reason: 'no-local-row' },
       })
       .catch((err) => log.warn({ err }, 'bot_events insert failed (playbook_fetch)'));
   }
