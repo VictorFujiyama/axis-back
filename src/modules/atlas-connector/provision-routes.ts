@@ -1,6 +1,7 @@
+import { randomBytes } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { schema } from '@blossom/db';
 import { config } from '../../config';
 import {
@@ -10,6 +11,7 @@ import {
   type ConnectionStatus,
 } from '../atlas-events/connections';
 import { clearConnectorCache } from '../atlas-events/connector';
+import { hashPassword } from '../auth/password';
 import { runHandshake } from '../../scripts/atlas-handshake';
 
 /**
@@ -49,6 +51,10 @@ const registerBody = z.object({
 });
 
 const deregisterBody = z.object({
+  atlasOrgId: z.string().uuid(),
+});
+
+const ensureBotLinkBody = z.object({
   atlasOrgId: z.string().uuid(),
 });
 
@@ -162,6 +168,103 @@ export async function atlasProvisionRoutes(app: FastifyInstance): Promise<void> 
       if (existing) clearConnectorCache(existing.atlasAccountId);
 
       return reply.send({ ok: true });
+    },
+  );
+
+  /**
+   * [axis-connect-autonomy / T-00a — D14] `POST /atlas-connector/ensure-bot-link`:
+   * idempotently provision the synthetic "Atlas bot" identity an org's
+   * qualifier-agent acts under when it runs in autonomous (L3) mode.
+   *
+   * The MCP write tools (`messaging.send_message`/`messaging.tag`) gate every
+   * mutation through `atlas_user_links` (tools.ts `assertAtlasUserMapped`): a row
+   * keyed `(accountId, atlasOrgId, atlasAppUserId)` must exist or the call is
+   * `forbidden`. Human users get that row from the iframe SSO exchange, but the
+   * agent has no human session — so Atlas calls this right after `/register` to
+   * mint a bot user (`atlas_app_user_id = 'atlas-bot:<orgId>'`) and link it. The
+   * worker then enters `withAmbient({ userId: 'atlas-bot:<orgId>' })` (T-00c) and
+   * its MCP headers resolve.
+   *
+   * Same `X-API-Key == ATLAS_API_KEY` gate as register/deregister. Idempotent:
+   * an existing bot link short-circuits and returns its axis user. The account is
+   * resolved from the connection `/register` already created (`getConnectionByOrg`);
+   * if there is no connection yet we answer 409 — Atlas registers first, then
+   * ensures the bot link (best-effort, re-tryable). The user + membership + link
+   * are written in one transaction so a partial bot identity never persists.
+   */
+  app.post(
+    '/atlas-connector/ensure-bot-link',
+    { preHandler: app.requireAtlasApiKey },
+    async (req, reply) => {
+      const parsed = ensureBotLinkBody.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ ok: false, error: 'invalid body' });
+      }
+      const { atlasOrgId } = parsed.data;
+
+      // The bot binds to the same axis account the org's connector binds to.
+      // No connection → register hasn't run yet; nothing to bind the bot to.
+      const connection = await getConnectionByOrg(app.db, atlasOrgId);
+      if (!connection) {
+        return reply
+          .code(409)
+          .send({ ok: false, error: 'no connection for org; register first' });
+      }
+      const accountId = connection.atlasAccountId;
+      const botAppUserId = `atlas-bot:${atlasOrgId}`;
+
+      // Idempotent: the bot link already exists → return its axis user, no writes.
+      const [existing] = await app.db
+        .select({ axisUserId: schema.atlasUserLinks.axisUserId })
+        .from(schema.atlasUserLinks)
+        .where(
+          and(
+            eq(schema.atlasUserLinks.accountId, accountId),
+            eq(schema.atlasUserLinks.atlasOrgId, atlasOrgId),
+            eq(schema.atlasUserLinks.atlasAppUserId, botAppUserId),
+          ),
+        )
+        .limit(1);
+      if (existing) {
+        return reply.send({ ok: true, axisUserId: existing.axisUserId });
+      }
+
+      // Mint the bot user (flagged `is_atlas_bot`), add it to the account, and
+      // record the link — all-or-nothing so a half-built identity never leaks.
+      // The password is random throwaway: the bot never authenticates as a human.
+      const botEmail = `bot+${atlasOrgId}@atlas-system.local`;
+      const passwordHash = await hashPassword(randomBytes(32).toString('hex'));
+      const axisUserId = await app.db.transaction(async (tx) => {
+        // Re-use the bot user if it survived a prior disconnect (which drops the
+        // link but may leave the user) — `users.email` is unique.
+        let [user] = await tx
+          .select({ id: schema.users.id })
+          .from(schema.users)
+          .where(eq(schema.users.email, botEmail))
+          .limit(1);
+        if (!user) {
+          [user] = await tx
+            .insert(schema.users)
+            .values({
+              email: botEmail,
+              name: `Atlas Bot — ${atlasOrgId}`,
+              passwordHash,
+              isAtlasBot: true,
+            })
+            .returning({ id: schema.users.id });
+        }
+        await tx
+          .insert(schema.accountUsers)
+          .values({ accountId, userId: user!.id })
+          .onConflictDoNothing();
+        await tx
+          .insert(schema.atlasUserLinks)
+          .values({ accountId, axisUserId: user!.id, atlasAppUserId: botAppUserId, atlasOrgId })
+          .onConflictDoNothing();
+        return user!.id;
+      });
+
+      return reply.send({ ok: true, axisUserId });
     },
   );
 

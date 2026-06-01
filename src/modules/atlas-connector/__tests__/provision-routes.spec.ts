@@ -36,6 +36,11 @@ vi.mock('../../atlas-events/connector', () => connectorMock);
 const handshakeMock = vi.hoisted(() => ({ runHandshake: vi.fn() }));
 vi.mock('../../../scripts/atlas-handshake', () => handshakeMock);
 
+// T-00a: stub argon2 hashing — the bot password is random throwaway, so the
+// real (intentionally slow) hash buys the test nothing.
+const passwordMock = vi.hoisted(() => ({ hashPassword: vi.fn() }));
+vi.mock('../../auth/password', () => passwordMock);
+
 type StubRow = { accountId: string; name?: string; role?: string };
 
 /**
@@ -131,6 +136,8 @@ beforeEach(() => {
   connectorMock.clearConnectorCache.mockReset();
   handshakeMock.runHandshake.mockReset();
   handshakeMock.runHandshake.mockResolvedValue(null); // success by default
+  passwordMock.hashPassword.mockReset();
+  passwordMock.hashPassword.mockResolvedValue('hashed-bot-pw');
 });
 
 afterEach(() => {
@@ -468,6 +475,148 @@ describe('GET /atlas-connector/user-accounts — listing (T-09)', () => {
       const res = await userAccounts(app, { axisUserId: USER_ID });
       expect(res.statusCode).toBe(200);
       expect(res.json()).toEqual({ ok: true, accounts: [] });
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+// ---- POST /atlas-connector/ensure-bot-link (T-00a, D14) ----
+// The bot identity provisioning endpoint: mints a synthetic `atlas-bot:<orgId>`
+// user + `atlas_user_links` row so the qualifier-agent's MCP write tools resolve
+// instead of returning `forbidden`. A richer db stub is needed than the register
+// suite's (idempotency select with `.limit`, plus a `transaction`), so these
+// cases build the app with a bespoke db. `connections`/`password` are mocked at
+// module scope above; the account comes from `getConnectionByOrg`.
+
+const BOT_AXIS_USER_ID = 'cccccccc-dddd-4eee-8fff-000000000000';
+
+function makeBotDb(opts: { existingLink?: { axisUserId: string }; existingUser?: { id: string } } = {}): {
+  db: FastifyInstance['db'];
+  transaction: ReturnType<typeof vi.fn>;
+  insertValues: ReturnType<typeof vi.fn>;
+} {
+  // Outer idempotency lookup on atlas_user_links.
+  const linkLimit = vi.fn().mockResolvedValue(opts.existingLink ? [opts.existingLink] : []);
+  const outerSelect = vi.fn(() => ({ from: () => ({ where: () => ({ limit: linkLimit }) }) }));
+
+  // Inside the tx: select the bot user by email, then insert user/membership/link.
+  const userLimit = vi.fn().mockResolvedValue(opts.existingUser ? [opts.existingUser] : []);
+  const txSelect = vi.fn(() => ({ from: () => ({ where: () => ({ limit: userLimit }) }) }));
+  const insertValues = vi.fn(() => ({
+    returning: vi.fn().mockResolvedValue([{ id: BOT_AXIS_USER_ID }]),
+    onConflictDoNothing: vi.fn().mockResolvedValue(undefined),
+  }));
+  const txInsert = vi.fn(() => ({ values: insertValues }));
+  const tx = { select: txSelect, insert: txInsert };
+
+  const transaction = vi.fn(async (cb: (t: typeof tx) => unknown) => cb(tx));
+  const db = { select: outerSelect, transaction } as unknown as FastifyInstance['db'];
+  return { db, transaction, insertValues };
+}
+
+async function buildBotApp(db: FastifyInstance['db']): Promise<FastifyInstance> {
+  vi.resetModules();
+  const Fastify = (await import('fastify')).default;
+  const sensible = (await import('@fastify/sensible')).default;
+  const { default: atlasAuthPlugin } = await import('../../../plugins/atlas-auth.js');
+  const { atlasProvisionRoutes } = await import('../provision-routes.js');
+
+  const app = Fastify({ logger: false });
+  await app.register(sensible);
+  app.decorate('db', db);
+  await app.register(atlasAuthPlugin);
+  await app.register(atlasProvisionRoutes);
+  await app.ready();
+  return app;
+}
+
+function ensureBotLink(
+  app: FastifyInstance,
+  payload: Record<string, unknown>,
+  headers: Record<string, string> = { 'x-api-key': API_KEY },
+) {
+  return app.inject({
+    method: 'POST',
+    url: '/atlas-connector/ensure-bot-link',
+    headers: { 'content-type': 'application/json', ...headers },
+    payload,
+  });
+}
+
+describe('POST /atlas-connector/ensure-bot-link (T-00a, D14)', () => {
+  it('rejects a missing X-API-Key with 401, never touches the connection', async () => {
+    const { db, transaction } = makeBotDb();
+    const app = await buildBotApp(db);
+    try {
+      const res = await ensureBotLink(app, { atlasOrgId: ATLAS_ORG_ID }, {});
+      expect(res.statusCode).toBe(401);
+      expect(connectionsMock.getConnectionByOrg).not.toHaveBeenCalled();
+      expect(transaction).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects a non-uuid org id with 400', async () => {
+    const { db, transaction } = makeBotDb();
+    const app = await buildBotApp(db);
+    try {
+      const res = await ensureBotLink(app, { atlasOrgId: 'not-a-uuid' });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ ok: false });
+      expect(connectionsMock.getConnectionByOrg).not.toHaveBeenCalled();
+      expect(transaction).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('no connection for the org → 409, no user created', async () => {
+    connectionsMock.getConnectionByOrg.mockResolvedValueOnce(null);
+    const { db, transaction } = makeBotDb();
+    const app = await buildBotApp(db);
+    try {
+      const res = await ensureBotLink(app, { atlasOrgId: ATLAS_ORG_ID });
+      expect(res.statusCode).toBe(409);
+      expect(res.json()).toMatchObject({ ok: false });
+      expect(transaction).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('idempotent: an existing bot link returns its axis user, no writes', async () => {
+    const { db, transaction } = makeBotDb({ existingLink: { axisUserId: USER_ID } });
+    const app = await buildBotApp(db);
+    try {
+      const res = await ensureBotLink(app, { atlasOrgId: ATLAS_ORG_ID });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ ok: true, axisUserId: USER_ID });
+      expect(transaction).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('no existing link → mints bot user + link in one tx, returns the axis user', async () => {
+    const { db, transaction, insertValues } = makeBotDb();
+    const app = await buildBotApp(db);
+    try {
+      const res = await ensureBotLink(app, { atlasOrgId: ATLAS_ORG_ID });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ ok: true, axisUserId: BOT_AXIS_USER_ID });
+      expect(transaction).toHaveBeenCalledTimes(1);
+      // The link row must carry the synthetic bot app-user id the worker rides
+      // under (`atlas-bot:<orgId>`) so the MCP gate resolves it.
+      const insertedLink = insertValues.mock.calls
+        .map((c) => c[0] as Record<string, unknown>)
+        .find((v) => 'atlasAppUserId' in v);
+      expect(insertedLink).toMatchObject({
+        atlasAppUserId: `atlas-bot:${ATLAS_ORG_ID}`,
+        atlasOrgId: ATLAS_ORG_ID,
+        accountId: ACCOUNT_A,
+      });
     } finally {
       await app.close();
     }
