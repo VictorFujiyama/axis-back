@@ -454,11 +454,26 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
     { preHandler: app.requireRole('admin') },
     async (req, reply) => {
       const { id } = idParams.parse(req.params);
-      const [inbox] = await app.db
-        .update(schema.inboxes)
-        .set({ deletedAt: new Date() })
-        .where(and(eq(schema.inboxes.id, id), eq(schema.inboxes.accountId, req.user.accountId), isNull(schema.inboxes.deletedAt)))
-        .returning();
+      let inbox: typeof schema.inboxes.$inferSelect | undefined;
+      await app.db.transaction(async (tx) => {
+        const [updated] = await tx
+          .update(schema.inboxes)
+          .set({ deletedAt: new Date() })
+          .where(and(eq(schema.inboxes.id, id), eq(schema.inboxes.accountId, req.user.accountId), isNull(schema.inboxes.deletedAt)))
+          .returning();
+        if (!updated) return; // inbox missing/already deleted — handled after tx.
+        inbox = updated;
+
+        // Soft-delete doesn't fire the CASCADE FK, so disable the auto-bot and
+        // clear defaultBotId application-side (D33). The auto-bot reads the now
+        // deleted inbox within this tx → active=false → disable.
+        await applyAutoBotForInbox(tx, {
+          inboxId: id,
+          accountId: req.user.accountId,
+          actorUserId: req.user.sub,
+          reason: 'inbox-deleted',
+        });
+      });
       if (!inbox) return reply.notFound();
 
       // Unregister the Telegram webhook so the bot stops posting to our
