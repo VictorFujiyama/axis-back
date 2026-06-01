@@ -661,6 +661,9 @@ describe('tagHandler', () => {
 
 const OTHER_ACCOUNT_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const OTHER_BOT_USER_ID = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+// Gap 3 / T-16': the Atlas bot for an inbox is a real `bots` row id
+// (inbox.defaultBotId), in a disjoint id-space from BOT_USER_ID (a users.id).
+const ATLAS_BOTS_ROW_ID = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
 
 describe('unassignBotHandler', () => {
   let emitSpy: ReturnType<typeof vi.spyOn>;
@@ -681,8 +684,9 @@ describe('unassignBotHandler', () => {
     };
     const { db } = makeWriteDb({
       selectLimits: [
-        [{ ...CONV_SCOPE_ROW, assignedBotId: BOT_USER_ID }], // loadConversationScope
-        [{ axisUserId: BOT_USER_ID }],                       // resolveAtlasUserLink → bot link
+        [{ ...CONV_SCOPE_ROW, assignedBotId: ATLAS_BOTS_ROW_ID }], // loadConversationScope
+        [{ id: 'link-1' }],                                        // requireAtlasUserLink → linked
+        [{ defaultBotId: ATLAS_BOTS_ROW_ID }],                     // resolveAtlasManagedBotId → inbox bot
       ],
       updateReturnings: [[updatedConv]],
     });
@@ -729,8 +733,8 @@ describe('unassignBotHandler', () => {
   it('throws MessagingToolError("forbidden") cross-tenant: bot not linked to the conversation account', async () => {
     const { db } = makeWriteDb({
       selectLimits: [
-        [{ ...CONV_SCOPE_ROW, accountId: OTHER_ACCOUNT_ID, assignedBotId: BOT_USER_ID }], // scope (other account)
-        [],                                                                               // resolveAtlasUserLink → no link for that account
+        [{ ...CONV_SCOPE_ROW, accountId: OTHER_ACCOUNT_ID, assignedBotId: ATLAS_BOTS_ROW_ID }], // scope (other account)
+        [],                                                                                     // requireAtlasUserLink → no link for that account
       ],
     });
 
@@ -745,7 +749,24 @@ describe('unassignBotHandler', () => {
     const { db } = makeWriteDb({
       selectLimits: [
         [{ ...CONV_SCOPE_ROW, assignedBotId: OTHER_BOT_USER_ID }], // scope: a different bot owns it
-        [{ axisUserId: BOT_USER_ID }],                            // resolveAtlasUserLink → our bot
+        [{ id: 'link-1' }],                                        // requireAtlasUserLink → linked
+        [{ defaultBotId: ATLAS_BOTS_ROW_ID }],                     // resolveAtlasManagedBotId → inbox bot
+      ],
+    });
+
+    const promise = unassignBotHandler(db, appStub, { conversationId: CONV_ID }, CTX);
+
+    await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
+    await expect(promise).rejects.toMatchObject({ code: 'conflict' });
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  it('throws MessagingToolError("conflict") when the inbox is not Atlas-managed (no defaultBotId)', async () => {
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [{ ...CONV_SCOPE_ROW, assignedBotId: ATLAS_BOTS_ROW_ID }], // scope: a bot is assigned
+        [{ id: 'link-1' }],                                        // requireAtlasUserLink → linked
+        [{ defaultBotId: null }],                                  // resolveAtlasManagedBotId → inbox unmanaged
       ],
     });
 
@@ -760,7 +781,7 @@ describe('unassignBotHandler', () => {
     const { db } = makeWriteDb({
       selectLimits: [
         [{ ...CONV_SCOPE_ROW, assignedBotId: null }], // scope: no bot assigned
-        [{ axisUserId: BOT_USER_ID }],                // resolveAtlasUserLink → our bot
+        [{ id: 'link-1' }],                           // requireAtlasUserLink → linked
       ],
     });
 

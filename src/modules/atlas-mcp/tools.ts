@@ -353,6 +353,33 @@ async function resolveAtlasUserLink(
   return { axisUserId: row.axisUserId };
 }
 
+/**
+ * Resolve the `bots.id` of the Atlas-managed bot for a conversation's inbox.
+ *
+ * Gap 3 bridge (T-19'/T-16'): `conversations.assignedBotId` carries a FK to
+ * `bots(id)`, NOT the `users.id` returned by `resolveAtlasUserLink`. The two
+ * id-spaces never match, so the bot that owns an Atlas-managed conversation
+ * cannot be identified by the bot user's `axisUserId`. Instead it is the
+ * inbox's `defaultBotId` — a real `bots` row created by
+ * `POST /atlas-connector/set-inbox-default-bot` (T-19') and copied onto new
+ * conversations by `channels/helpers`. An inbox with no `defaultBotId` is not
+ * Atlas-managed, so there is no Atlas bot to act on → `conflict`.
+ */
+async function resolveAtlasManagedBotId(db: DB, inboxId: string): Promise<string> {
+  const [row] = await db
+    .select({ defaultBotId: schema.inboxes.defaultBotId })
+    .from(schema.inboxes)
+    .where(eq(schema.inboxes.id, inboxId))
+    .limit(1);
+  if (!row || row.defaultBotId === null) {
+    throw new MessagingToolError(
+      'conflict',
+      'conversation inbox is not Atlas-managed',
+    );
+  }
+  return row.defaultBotId;
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // messaging.send_message
 // ──────────────────────────────────────────────────────────────────────────────
@@ -758,12 +785,15 @@ export interface UnassignBotResult {
  * Release the Atlas-bot from a conversation so it returns to the inbox's
  * general queue for a human to pick up (D29 reverse handoff bot→human).
  *
- * Gate + tenancy (D31/D32): `resolveAtlasUserLink` is scoped to the
+ * Gate + tenancy (D31/D32): `requireAtlasUserLink` is scoped to the
  * conversation's account, so only the Atlas-bot mapped to that account can
  * release it — a cross-account caller gets `forbidden`. The conversation must
- * currently be assigned to THIS bot; a different bot (or a human-managed
- * thread) is a `conflict` and is left untouched. An already-unassigned
- * conversation is an idempotent no-op (`unchanged: true`, no event).
+ * currently be assigned to THIS bot; the Atlas bot for the inbox is its
+ * `defaultBotId` (a `bots.id`), resolved via {@link resolveAtlasManagedBotId}
+ * — NOT the bot user's `axisUserId`, which lives in the disjoint `users`
+ * id-space (Gap 3 / T-16'). A different bot (or a human-managed thread) is a
+ * `conflict` and is left untouched. An already-unassigned conversation is an
+ * idempotent no-op (`unchanged: true`, no event).
  *
  * On release the conversation flips to `status='open'` and stamps
  * `waitingForAgentSince` (the same field `send_message` clears), surfacing it
@@ -776,14 +806,17 @@ export async function unassignBotHandler(
   ctx: AtlasRequestContext,
 ): Promise<UnassignBotResult> {
   const conv = await loadConversationScope(db, input.conversationId);
-  const { axisUserId: botUserId } = await resolveAtlasUserLink(db, conv.accountId, ctx);
+  // Tenancy gate (D31/D32): caller must be the Atlas-bot mapped to this account.
+  await requireAtlasUserLink(db, conv.accountId, ctx);
 
   // Idempotent: no bot to release → report ok without mutating or emitting.
   if (conv.assignedBotId === null) {
     return { ok: true, conversationId: conv.id, status: 'open', unchanged: true };
   }
-  // Only the bot that owns the conversation may release it.
-  if (conv.assignedBotId !== botUserId) {
+  // Gap 3: the Atlas bot for this conversation is the inbox's defaultBotId
+  // (a bots.id), NOT the bot user's axisUserId. Only that bot may be released.
+  const expectedBotId = await resolveAtlasManagedBotId(db, conv.inboxId);
+  if (conv.assignedBotId !== expectedBotId) {
     throw new MessagingToolError(
       'conflict',
       `conversation ${conv.id} is assigned to a different bot`,
