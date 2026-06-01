@@ -8,6 +8,8 @@ import {
   assignHandler,
   assignInputObjectSchema,
   assignInputSchema,
+  assignUserHandler,
+  assignUserInputSchema,
   getThreadHandler,
   getThreadInputSchema,
   listThreadsHandler,
@@ -277,6 +279,30 @@ export function buildMcpServer(
       try {
         const bound = requireCtx(ctx);
         const result = await unassignBotHandler(db, app, args, bound);
+        return toToolResult(result);
+      } catch (err) {
+        const mapped = mapToolError(err);
+        if (mapped) return mapped;
+        throw err;
+      }
+    },
+  );
+
+  // ── messaging.assign_user (T-17 — Fase G smart handoff) ───────────────────
+  // Hands a bot-managed conversation off to a specific human agent (D29).
+  // Scoped to the bot's account (D31); the target user must exist and belong to
+  // that same account (D32), otherwise the assignment is refused.
+  server.registerTool(
+    'messaging.assign_user',
+    {
+      description:
+        "Assign a bot-managed conversation to a specific human agent (the Atlas-bot hands off to a named user). Sets status to 'open' and clears the bot assignment. The target user must belong to the conversation's account.",
+      inputSchema: assignUserInputSchema.shape,
+    },
+    async (args) => {
+      try {
+        const bound = requireCtx(ctx);
+        const result = await assignUserHandler(db, app, args, bound);
         return toToolResult(result);
       } catch (err) {
         const mapped = mapToolError(err);

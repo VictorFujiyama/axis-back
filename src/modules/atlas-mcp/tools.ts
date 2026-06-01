@@ -821,3 +821,112 @@ export async function unassignBotHandler(
 
   return { ok: true, conversationId: updated.id, status: 'open', unchanged: false };
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// messaging.assign_user (T-17 — Fase G smart handoff: D29/D31/D32)
+// ──────────────────────────────────────────────────────────────────────────────
+
+export const assignUserInputSchema = z.object({
+  conversationId: uuid,
+  axisUserId: uuid,
+});
+export type AssignUserInput = z.infer<typeof assignUserInputSchema>;
+
+export interface AssignUserResult {
+  ok: true;
+  conversationId: string;
+  assignedUserId: string;
+  status: 'open';
+}
+
+/**
+ * Hand a conversation off from the Atlas-bot to a specific human agent (D29
+ * reverse handoff bot→specific human). Unlike {@link unassignBotHandler}, which
+ * returns the thread to the inbox's general queue, this routes it to a named
+ * `assignedUserId`.
+ *
+ * Gate + tenancy: `resolveAtlasUserLink` scopes the caller to the
+ * conversation's account, so a cross-account bot is rejected `forbidden` (D31).
+ * The target `axisUserId` must (a) exist as a live user — otherwise `not_found`
+ * — and (b) be a member of the conversation's account (`account_users`),
+ * otherwise `forbidden` (D32 cross-account assignment is refused). On success
+ * the conversation flips to `status='open'`, clears any bot assignment, stamps
+ * `waitingForAgentSince`, and emits `conversation.assigned` for realtime.
+ */
+export async function assignUserHandler(
+  db: DB,
+  _app: FastifyInstance,
+  input: AssignUserInput,
+  ctx: AtlasRequestContext,
+): Promise<AssignUserResult> {
+  const conv = await loadConversationScope(db, input.conversationId);
+  // Scopes the caller to conv.accountId — cross-tenant bot finds no link (D31).
+  await resolveAtlasUserLink(db, conv.accountId, ctx);
+
+  // Target user must exist (live) before we check membership, so a deleted /
+  // unknown user is `not_found` rather than masquerading as cross-account.
+  const [user] = await db
+    .select({ id: schema.users.id })
+    .from(schema.users)
+    .where(and(eq(schema.users.id, input.axisUserId), isNull(schema.users.deletedAt)))
+    .limit(1);
+  if (!user) {
+    throw new MessagingToolError('not_found', `user ${input.axisUserId} not found`);
+  }
+
+  // D32: the target must belong to the conversation's account. A user from
+  // another account is a cross-tenant assignment → forbidden.
+  const [member] = await db
+    .select({ userId: schema.accountUsers.userId })
+    .from(schema.accountUsers)
+    .where(
+      and(
+        eq(schema.accountUsers.accountId, conv.accountId),
+        eq(schema.accountUsers.userId, input.axisUserId),
+      ),
+    )
+    .limit(1);
+  if (!member) {
+    throw new MessagingToolError(
+      'forbidden',
+      `user ${input.axisUserId} does not belong to the conversation account`,
+    );
+  }
+
+  const now = new Date();
+  const [updated] = await db
+    .update(schema.conversations)
+    .set({
+      assignedUserId: input.axisUserId,
+      assignedBotId: null,
+      status: 'open',
+      waitingForAgentSince: now,
+      updatedAt: now,
+    })
+    .where(eq(schema.conversations.id, conv.id))
+    .returning({
+      id: schema.conversations.id,
+      inboxId: schema.conversations.inboxId,
+      assignedUserId: schema.conversations.assignedUserId,
+      assignedTeamId: schema.conversations.assignedTeamId,
+      assignedBotId: schema.conversations.assignedBotId,
+    });
+  if (!updated) throw new Error('assign_user: update returned no row');
+
+  eventBus.emitEvent({
+    type: 'conversation.assigned',
+    inboxId: updated.inboxId,
+    conversationId: updated.id,
+    assignedUserId: updated.assignedUserId,
+    assignedTeamId: updated.assignedTeamId,
+    assignedBotId: updated.assignedBotId,
+    meta: { atlasAppUserId: ctx.atlasAppUserId, atlasOrgId: ctx.atlasOrgId },
+  });
+
+  return {
+    ok: true,
+    conversationId: updated.id,
+    assignedUserId: updated.assignedUserId ?? input.axisUserId,
+    status: 'open',
+  };
+}

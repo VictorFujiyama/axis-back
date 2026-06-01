@@ -144,7 +144,7 @@ const BOT_USER_ROW = {
 };
 
 describe('buildMcpServer — InMemoryTransport pair', () => {
-  it('exposes all seven messaging.* tools via listTools() (T-015b read + T-023 write + T-15 tag)', async () => {
+  it('exposes all messaging.* tools via listTools() (T-015b read + T-023 write + T-15 tag + Fase G handoff)', async () => {
     const db = makeDb([]);
     const { client, close } = await connectPair(db, CTX);
     try {
@@ -152,6 +152,7 @@ describe('buildMcpServer — InMemoryTransport pair', () => {
       const names = result.tools.map((t) => t.name).sort();
       expect(names).toEqual([
         'messaging.assign',
+        'messaging.assign_user',
         'messaging.get_thread',
         'messaging.list_threads',
         'messaging.resolve',

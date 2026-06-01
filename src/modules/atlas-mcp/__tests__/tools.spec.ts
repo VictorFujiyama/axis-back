@@ -5,6 +5,7 @@ import type { DB } from '@blossom/db';
 import {
   MessagingToolError,
   assignHandler,
+  assignUserHandler,
   getThreadHandler,
   listThreadsHandler,
   resolveHandler,
@@ -771,6 +772,124 @@ describe('unassignBotHandler', () => {
       status: 'open',
       unchanged: true,
     });
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ─── assignUserHandler (T-17 — Fase G smart handoff) ──────────────────────────
+
+describe('assignUserHandler', () => {
+  let emitSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    emitSpy = vi.spyOn(eventBus, 'emitEvent').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    emitSpy.mockRestore();
+  });
+
+  it('assigns the conversation to the target user, clears the bot, and emits conversation.assigned', async () => {
+    const updatedConv = {
+      id: CONV_ID,
+      inboxId: INBOX_ID,
+      assignedUserId: TARGET_USER_ID,
+      assignedTeamId: null,
+      assignedBotId: null,
+    };
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [{ ...CONV_SCOPE_ROW, assignedBotId: BOT_USER_ID }], // loadConversationScope
+        [{ axisUserId: BOT_USER_ID }],                       // resolveAtlasUserLink → our bot
+        [{ id: TARGET_USER_ID }],                            // target user exists
+        [{ userId: TARGET_USER_ID }],                        // account membership
+      ],
+      updateReturnings: [[updatedConv]],
+    });
+
+    const result = await assignUserHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID, axisUserId: TARGET_USER_ID },
+      CTX,
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      conversationId: CONV_ID,
+      assignedUserId: TARGET_USER_ID,
+      status: 'open',
+    });
+    expect(emitSpy).toHaveBeenCalledTimes(1);
+    expect(emitSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'conversation.assigned',
+        conversationId: CONV_ID,
+        inboxId: INBOX_ID,
+        assignedUserId: TARGET_USER_ID,
+        assignedBotId: null,
+        meta: { atlasAppUserId: ATLAS_APP_USER_ID, atlasOrgId: ATLAS_ORG_ID },
+      }),
+    );
+  });
+
+  it('throws MessagingToolError("not_found") when the conversation does not exist', async () => {
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [], // loadConversationScope → empty
+      ],
+    });
+
+    const promise = assignUserHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID, axisUserId: TARGET_USER_ID },
+      CTX,
+    );
+
+    await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
+    await expect(promise).rejects.toMatchObject({ code: 'not_found' });
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  it('throws MessagingToolError("not_found") when the target user does not exist', async () => {
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [{ ...CONV_SCOPE_ROW, assignedBotId: BOT_USER_ID }], // loadConversationScope
+        [{ axisUserId: BOT_USER_ID }],                       // resolveAtlasUserLink → our bot
+        [],                                                  // target user lookup → empty
+      ],
+    });
+
+    const promise = assignUserHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID, axisUserId: TARGET_USER_ID },
+      CTX,
+    );
+
+    await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
+    await expect(promise).rejects.toMatchObject({ code: 'not_found' });
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  it('throws MessagingToolError("forbidden") when the target user belongs to another account', async () => {
+    const { db } = makeWriteDb({
+      selectLimits: [
+        [{ ...CONV_SCOPE_ROW, assignedBotId: BOT_USER_ID }], // loadConversationScope
+        [{ axisUserId: BOT_USER_ID }],                       // resolveAtlasUserLink → our bot
+        [{ id: TARGET_USER_ID }],                            // target user exists
+        [],                                                  // account membership → empty (cross-account)
+      ],
+    });
+
+    const promise = assignUserHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID, axisUserId: TARGET_USER_ID },
+      CTX,
+    );
+
+    await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
+    await expect(promise).rejects.toMatchObject({ code: 'forbidden' });
     expect(emitSpy).not.toHaveBeenCalled();
   });
 });
