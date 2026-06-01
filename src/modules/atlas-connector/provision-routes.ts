@@ -58,6 +58,12 @@ const ensureBotLinkBody = z.object({
   atlasOrgId: z.string().uuid(),
 });
 
+const setInboxDefaultBotBody = z.object({
+  atlasOrgId: z.string().uuid(),
+  inboxId: z.string().uuid(),
+  enabled: z.boolean(),
+});
+
 const userAccountsQuery = z.object({
   axisUserId: z.string().uuid(),
 });
@@ -265,6 +271,115 @@ export async function atlasProvisionRoutes(app: FastifyInstance): Promise<void> 
       });
 
       return reply.send({ ok: true, axisUserId });
+    },
+  );
+
+  /**
+   * [axis-connect-autonomy / Fase G — T-19', D27/D30/Gap 3] `POST
+   * /atlas-connector/set-inbox-default-bot`: turn the Atlas qualifier-agent on
+   * (or off) for one inbox by pointing `inbox.defaultBotId` at a `bots` row.
+   *
+   * Smart-handoff (D27) reuses axis's existing bot-assignment infra: a new
+   * conversation in an inbox with a `defaultBotId` is born `assignedBotId=<that
+   * bot>`, `status='pending'` — invisible to humans until the bot hands off
+   * (`channels/helpers.ts`). So "Atlas manages this inbox" == "the inbox's
+   * default bot IS the Atlas bot".
+   *
+   * Gap 3 (LESSONS) is why the default bot is a real `bots` row, NOT the synthetic
+   * `atlas-bot:<orgId>` user from `ensure-bot-link`: `conversations.assigned_bot_id`
+   * has an ENFORCED FK → `bots(id)`, and `channels/helpers.ts` copies
+   * `inbox.defaultBotId` straight into `conversations.assigned_bot_id` on create.
+   * Pointing `defaultBotId` at a `users.id` would pass here (the column has no FK)
+   * but FK-violate on the next inbound message, bricking the inbox. So on enable we
+   * get-or-create a `(accountId, inboxId)` builtin bot ('Atlas Assistant') and use
+   * its id. The MCP write identity (`atlas_user_links`/`users.id`, T-00a) is a
+   * separate concern and stays as-is.
+   *
+   * Same `X-API-Key == ATLAS_API_KEY` gate as register/deregister. The account is
+   * resolved from the org's connection (`getConnectionByOrg`); 409 with no
+   * connection. The inbox must belong to that account (404 unknown, 403
+   * cross-account — D32 defense-in-depth). Idempotent: a no-op enable/disable
+   * answers `{ ok: true, unchanged: true }` without re-pointing the inbox. On
+   * disable the `bots` row is left in place so a later re-enable reuses it.
+   */
+  app.post(
+    '/atlas-connector/set-inbox-default-bot',
+    { preHandler: app.requireAtlasApiKey },
+    async (req, reply) => {
+      const parsed = setInboxDefaultBotBody.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ ok: false, error: 'invalid body' });
+      }
+      const { atlasOrgId, inboxId, enabled } = parsed.data;
+
+      // The inbox must live under the account the org's connector binds to.
+      const connection = await getConnectionByOrg(app.db, atlasOrgId);
+      if (!connection) {
+        return reply.code(409).send({ ok: false, error: 'no connection for org; register first' });
+      }
+      const accountId = connection.atlasAccountId;
+
+      const [inbox] = await app.db
+        .select({ id: schema.inboxes.id, accountId: schema.inboxes.accountId, defaultBotId: schema.inboxes.defaultBotId })
+        .from(schema.inboxes)
+        .where(eq(schema.inboxes.id, inboxId))
+        .limit(1);
+      if (!inbox) {
+        return reply.code(404).send({ ok: false, error: 'inbox not found' });
+      }
+      // D32: never trust the body's org alone — the inbox must be the bound account's.
+      if (inbox.accountId !== accountId) {
+        return reply.code(403).send({ ok: false, error: 'inbox belongs to a different account' });
+      }
+
+      if (!enabled) {
+        // Disable: clear the pointer; leave the bots row for a future re-enable.
+        if (inbox.defaultBotId === null) {
+          return reply.send({ ok: true, inboxId, defaultBotId: null, botsRowId: null, unchanged: true });
+        }
+        await app.db
+          .update(schema.inboxes)
+          .set({ defaultBotId: null, updatedAt: new Date() })
+          .where(eq(schema.inboxes.id, inboxId));
+        return reply.send({ ok: true, inboxId, defaultBotId: null, botsRowId: null, unchanged: false });
+      }
+
+      // Enable: get-or-create the Atlas `bots` row for this (account, inbox). The
+      // secret is a random throwaway — a builtin bot never calls an external
+      // webhook, but the column is notNull.
+      const [existingBot] = await app.db
+        .select({ id: schema.bots.id })
+        .from(schema.bots)
+        .where(and(eq(schema.bots.accountId, accountId), eq(schema.bots.inboxId, inboxId)))
+        .limit(1);
+
+      let botsRowId: string;
+      if (existingBot) {
+        botsRowId = existingBot.id;
+      } else {
+        const [created] = await app.db
+          .insert(schema.bots)
+          .values({
+            accountId,
+            inboxId,
+            name: 'Atlas Assistant',
+            botType: 'builtin',
+            secret: randomBytes(32).toString('hex'),
+            enabled: true,
+          })
+          .returning({ id: schema.bots.id });
+        botsRowId = created!.id;
+      }
+
+      // Idempotent: already pointing at this bot → no write.
+      if (inbox.defaultBotId === botsRowId) {
+        return reply.send({ ok: true, inboxId, defaultBotId: botsRowId, botsRowId, unchanged: true });
+      }
+      await app.db
+        .update(schema.inboxes)
+        .set({ defaultBotId: botsRowId, updatedAt: new Date() })
+        .where(eq(schema.inboxes.id, inboxId));
+      return reply.send({ ok: true, inboxId, defaultBotId: botsRowId, botsRowId, unchanged: false });
     },
   );
 

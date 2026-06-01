@@ -622,3 +622,271 @@ describe('POST /atlas-connector/ensure-bot-link (T-00a, D14)', () => {
     }
   });
 });
+
+// ---- POST /atlas-connector/set-inbox-default-bot (T-19', D27/D30/Gap 3) ----
+// Turns the Atlas qualifier-agent on/off for one inbox by pointing
+// `inbox.defaultBotId` at a real `bots` row (Gap 3: the FK on
+// conversations.assigned_bot_id → bots.id means the default bot must be a `bots`
+// row, NOT the synthetic atlas-bot user). The account is resolved from the org's
+// connection; the inbox must belong to it (D32). On enable we get-or-create a
+// builtin 'Atlas Assistant' bot for (account, inbox); on disable we clear the
+// pointer but keep the bots row. The db stub routes the inbox select (1st) and
+// the bots select (2nd, enable only) by call order.
+
+const INBOX_ID = 'dddddddd-eeee-4fff-8aaa-bbbbbbbbbbbb';
+const EXISTING_BOT_ID = 'eeeeeeee-ffff-4aaa-8bbb-cccccccccccc';
+const NEW_BOT_ID = 'ffffffff-aaaa-4bbb-8ccc-dddddddddddd';
+
+function makeInboxDb(opts: {
+  inbox?: { accountId: string | null; defaultBotId: string | null } | null;
+  existingBot?: { id: string } | null;
+}): {
+  db: FastifyInstance['db'];
+  insert: ReturnType<typeof vi.fn>;
+  insertValues: ReturnType<typeof vi.fn>;
+  update: ReturnType<typeof vi.fn>;
+  updateSet: ReturnType<typeof vi.fn>;
+} {
+  const inboxRows =
+    opts.inbox === undefined
+      ? [{ id: INBOX_ID, accountId: ACCOUNT_A, defaultBotId: null }]
+      : opts.inbox
+        ? [{ id: INBOX_ID, ...opts.inbox }]
+        : [];
+  const botRows = opts.existingBot ? [opts.existingBot] : [];
+
+  let selectCall = 0;
+  const select = vi.fn(() => {
+    const idx = selectCall++;
+    return {
+      from: () => ({
+        where: () => ({
+          // 0 = inbox lookup, 1 = bots get-or-create lookup (enable path only).
+          limit: vi.fn().mockResolvedValue(idx === 0 ? inboxRows : botRows),
+        }),
+      }),
+    };
+  });
+
+  const returning = vi.fn().mockResolvedValue([{ id: NEW_BOT_ID }]);
+  const insertValues = vi.fn(() => ({ returning }));
+  const insert = vi.fn(() => ({ values: insertValues }));
+
+  const updateWhere = vi.fn().mockResolvedValue(undefined);
+  const updateSet = vi.fn(() => ({ where: updateWhere }));
+  const update = vi.fn(() => ({ set: updateSet }));
+
+  const db = { select, insert, update } as unknown as FastifyInstance['db'];
+  return { db, insert, insertValues, update, updateSet };
+}
+
+async function buildInboxApp(db: FastifyInstance['db']): Promise<FastifyInstance> {
+  return buildBotApp(db);
+}
+
+function setInboxDefaultBot(
+  app: FastifyInstance,
+  payload: Record<string, unknown>,
+  headers: Record<string, string> = { 'x-api-key': API_KEY },
+) {
+  return app.inject({
+    method: 'POST',
+    url: '/atlas-connector/set-inbox-default-bot',
+    headers: { 'content-type': 'application/json', ...headers },
+    payload,
+  });
+}
+
+describe('POST /atlas-connector/set-inbox-default-bot (T-19-prime, D27/D30/Gap 3)', () => {
+  it('rejects a missing X-API-Key with 401, never touches the connection', async () => {
+    const { db } = makeInboxDb({});
+    const app = await buildInboxApp(db);
+    try {
+      const res = await setInboxDefaultBot(app, { atlasOrgId: ATLAS_ORG_ID, inboxId: INBOX_ID, enabled: true }, {});
+      expect(res.statusCode).toBe(401);
+      expect(connectionsMock.getConnectionByOrg).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects a malformed body with 400', async () => {
+    const { db } = makeInboxDb({});
+    const app = await buildInboxApp(db);
+    try {
+      const res = await setInboxDefaultBot(app, { atlasOrgId: ATLAS_ORG_ID }); // missing inboxId/enabled
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({ ok: false });
+      expect(connectionsMock.getConnectionByOrg).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('no connection for the org → 409', async () => {
+    connectionsMock.getConnectionByOrg.mockResolvedValueOnce(null);
+    const { db, insert, update } = makeInboxDb({});
+    const app = await buildInboxApp(db);
+    try {
+      const res = await setInboxDefaultBot(app, { atlasOrgId: ATLAS_ORG_ID, inboxId: INBOX_ID, enabled: true });
+      expect(res.statusCode).toBe(409);
+      expect(res.json()).toMatchObject({ ok: false });
+      expect(insert).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('inbox not found → 404', async () => {
+    const { db, insert, update } = makeInboxDb({ inbox: null });
+    const app = await buildInboxApp(db);
+    try {
+      const res = await setInboxDefaultBot(app, { atlasOrgId: ATLAS_ORG_ID, inboxId: INBOX_ID, enabled: true });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toMatchObject({ ok: false });
+      expect(insert).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('inbox belongs to another account → 403, no writes (D32)', async () => {
+    const { db, insert, update } = makeInboxDb({ inbox: { accountId: OTHER_ACCOUNT, defaultBotId: null } });
+    const app = await buildInboxApp(db);
+    try {
+      const res = await setInboxDefaultBot(app, { atlasOrgId: ATLAS_ORG_ID, inboxId: INBOX_ID, enabled: true });
+      expect(res.statusCode).toBe(403);
+      expect(res.json()).toMatchObject({ ok: false });
+      expect(insert).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('enable happy: null defaultBotId, no bot → creates bots row, points inbox at it', async () => {
+    const { db, insert, insertValues, update, updateSet } = makeInboxDb({
+      inbox: { accountId: ACCOUNT_A, defaultBotId: null },
+      existingBot: null,
+    });
+    const app = await buildInboxApp(db);
+    try {
+      const res = await setInboxDefaultBot(app, { atlasOrgId: ATLAS_ORG_ID, inboxId: INBOX_ID, enabled: true });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        ok: true,
+        inboxId: INBOX_ID,
+        defaultBotId: NEW_BOT_ID,
+        botsRowId: NEW_BOT_ID,
+        unchanged: false,
+      });
+      // Gap 3: the created row is a real builtin `bots` row (FK-safe target).
+      expect(insert).toHaveBeenCalledTimes(1);
+      expect(insertValues.mock.calls[0]![0]).toMatchObject({
+        accountId: ACCOUNT_A,
+        inboxId: INBOX_ID,
+        name: 'Atlas Assistant',
+        botType: 'builtin',
+      });
+      expect(updateSet.mock.calls[0]![0]).toMatchObject({ defaultBotId: NEW_BOT_ID });
+      expect(update).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('re-enable: bots row already exists → reuses it (no insert), points inbox', async () => {
+    const { db, insert, update, updateSet } = makeInboxDb({
+      inbox: { accountId: ACCOUNT_A, defaultBotId: null },
+      existingBot: { id: EXISTING_BOT_ID },
+    });
+    const app = await buildInboxApp(db);
+    try {
+      const res = await setInboxDefaultBot(app, { atlasOrgId: ATLAS_ORG_ID, inboxId: INBOX_ID, enabled: true });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        ok: true,
+        inboxId: INBOX_ID,
+        defaultBotId: EXISTING_BOT_ID,
+        botsRowId: EXISTING_BOT_ID,
+        unchanged: false,
+      });
+      expect(insert).not.toHaveBeenCalled();
+      expect(updateSet.mock.calls[0]![0]).toMatchObject({ defaultBotId: EXISTING_BOT_ID });
+      expect(update).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('enable idempotent: inbox already points at the Atlas bot → unchanged, no writes', async () => {
+    const { db, insert, update } = makeInboxDb({
+      inbox: { accountId: ACCOUNT_A, defaultBotId: EXISTING_BOT_ID },
+      existingBot: { id: EXISTING_BOT_ID },
+    });
+    const app = await buildInboxApp(db);
+    try {
+      const res = await setInboxDefaultBot(app, { atlasOrgId: ATLAS_ORG_ID, inboxId: INBOX_ID, enabled: true });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        ok: true,
+        inboxId: INBOX_ID,
+        defaultBotId: EXISTING_BOT_ID,
+        botsRowId: EXISTING_BOT_ID,
+        unchanged: true,
+      });
+      expect(insert).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('disable happy: clears defaultBotId, leaves the bots row', async () => {
+    const { db, insert, update, updateSet } = makeInboxDb({
+      inbox: { accountId: ACCOUNT_A, defaultBotId: EXISTING_BOT_ID },
+    });
+    const app = await buildInboxApp(db);
+    try {
+      const res = await setInboxDefaultBot(app, { atlasOrgId: ATLAS_ORG_ID, inboxId: INBOX_ID, enabled: false });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        ok: true,
+        inboxId: INBOX_ID,
+        defaultBotId: null,
+        botsRowId: null,
+        unchanged: false,
+      });
+      // No DELETE of the bots row — only the inbox pointer is cleared.
+      expect(insert).not.toHaveBeenCalled();
+      expect(updateSet.mock.calls[0]![0]).toMatchObject({ defaultBotId: null });
+      expect(update).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('disable idempotent: defaultBotId already null → unchanged, no writes', async () => {
+    const { db, insert, update } = makeInboxDb({
+      inbox: { accountId: ACCOUNT_A, defaultBotId: null },
+    });
+    const app = await buildInboxApp(db);
+    try {
+      const res = await setInboxDefaultBot(app, { atlasOrgId: ATLAS_ORG_ID, inboxId: INBOX_ID, enabled: false });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        ok: true,
+        inboxId: INBOX_ID,
+        defaultBotId: null,
+        botsRowId: null,
+        unchanged: true,
+      });
+      expect(insert).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+});
