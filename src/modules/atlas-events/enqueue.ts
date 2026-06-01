@@ -112,6 +112,28 @@ export function subscribeAtlasEvents(app: FastifyInstance): void {
   const runLegacy = !!config.ATLAS_EVENTS_HMAC_SECRET && !connectorEnabled;
 
   eventBus.onEvent(async (event: RealtimeEvent) => {
+    // [autonomy-T-18] Smart-handoff gate (spec Fase G, D28): a contact's inbound
+    // turn is forwarded to Atlas ONLY while the conversation is bot-managed and
+    // no human has taken over. Once an operator is assigned (or nobody owns the
+    // conversation at all) the qualifier must not see it. Runs ahead of both
+    // delivery legs so the skip is leg-agnostic. Non-contact turns (bot/system
+    // outbound, MCP writes) are unaffected — they still need to flow for chain
+    // of custody.
+    if (event.type === 'message.created' && event.message.senderType === 'contact') {
+      let skip = false;
+      try {
+        skip = await skipContactTurnForAssignment(app.db, event.conversationId);
+      } catch (err) {
+        // Permissive on infra error: a transient read failure must not silently
+        // drop a customer turn — fall through and let the builders run/log.
+        app.log.warn(
+          { err, eventType: event.type },
+          'atlas-events: assignment gate read failed (proceeding)',
+        );
+      }
+      if (skip) return;
+    }
+
     if (connectorEnabled) {
       try {
         await emitConnectorEvent(app, event);
@@ -162,6 +184,31 @@ async function emitConnectorEvent(app: FastifyInstance, event: RealtimeEvent): P
   const built = await buildConnectorEventForEvent(app.db, event, conn.atlasOrgId);
   if (!built) return;
   await connector.emit(built);
+}
+
+/**
+ * [autonomy-T-18] Decide whether a contact's inbound `conversation_turn` must be
+ * dropped before reaching Atlas (spec Fase G, D28). The qualifier-agent only
+ * owns bot-managed conversations, so a turn is SKIPPED when either:
+ *   - a human is assigned (`assignedUserId !== null`) — the operator took over,
+ *     and this precedes any bot assignment (the "bizarre" both-set state); or
+ *   - nobody owns it (`assignedBotId === null && assignedUserId === null`) — an
+ *     unmanaged inbox with no `defaultBotId` and no manual assignment.
+ * Only `assignedBotId !== null && assignedUserId === null` proceeds. Returns
+ * false (do NOT skip) when the conversation row is missing, leaving the existing
+ * builder not-found path to handle it.
+ */
+async function skipContactTurnForAssignment(db: DB, conversationId: string): Promise<boolean> {
+  const [row] = await db
+    .select({
+      assignedBotId: schema.conversations.assignedBotId,
+      assignedUserId: schema.conversations.assignedUserId,
+    })
+    .from(schema.conversations)
+    .where(eq(schema.conversations.id, conversationId))
+    .limit(1);
+  if (!row) return false;
+  return row.assignedBotId === null || row.assignedUserId !== null;
 }
 
 /**

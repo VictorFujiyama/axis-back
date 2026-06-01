@@ -188,6 +188,13 @@ const convRow = {
 };
 const inboxRow = { id: 'inbox-1', accountId: 'account-1' };
 
+// [autonomy-T-18] The smart-handoff gate reads `(assignedBotId, assignedUserId)`
+// off the conversation BEFORE either delivery leg runs, for contact turns only.
+// This stand-in row represents a bot-managed, human-free conversation — the one
+// state where a contact turn still flows. Prepended as the first row-set in the
+// message.created cases so the gate lets them through unchanged.
+const botManagedConvRow = { assignedBotId: 'bot-1', assignedUserId: null as string | null };
+
 describe('subscribeAtlasEvents', () => {
   beforeEach(() => {
     vi.unstubAllEnvs();
@@ -242,6 +249,88 @@ describe('subscribeAtlasEvents', () => {
     expect(queues.add).not.toHaveBeenCalled();
   });
 
+  // --- [autonomy-T-18] smart-handoff assignment gate (spec Fase G, D28) ---
+  // A contact's inbound turn reaches Atlas ONLY while the conversation is
+  // bot-managed and human-free. The gate runs ahead of both delivery legs, so
+  // these exercise it through the Phase 12 envelope leg.
+  describe('contact turn assignment gate', () => {
+    const msgRow = {
+      id: 'msg-xyz',
+      conversationId: 'conv-abc',
+      senderType: 'contact',
+      senderId: 'contact-1',
+      content: 'hello world',
+      createdAt: new Date('2026-05-11T12:00:00Z'),
+    };
+
+    function emitContactTurn(eventBus: { emitEvent: (e: RealtimeEvent) => void }) {
+      eventBus.emitEvent({
+        type: 'message.created',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-abc',
+        message: makeMessage({ id: 'msg-xyz', senderType: 'contact', content: 'hello world' }),
+      });
+    }
+
+    it('dispatches when a bot is assigned and no human (assignedBotId set, assignedUserId null)', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(VALID_SECRET, 'true');
+      // gate row (bot-managed) → then envelope builders: conv, inbox, message.
+      const { app, queues } = buildAppStub([
+        [{ assignedBotId: 'bot-1', assignedUserId: null }],
+        [convRow],
+        [inboxRow],
+        [msgRow],
+      ]);
+
+      subscribeAtlasEvents(app);
+      emitContactTurn(eventBus);
+      await flushMicrotasks();
+
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      expect(queues.add.mock.calls[0]![0]).toBe('conversation_turn');
+    });
+
+    it('skips when a human is assigned (assignedBotId null, assignedUserId set)', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(VALID_SECRET, 'true');
+      // Only the gate row is consumed — the skip short-circuits before any build.
+      const { app, queues } = buildAppStub([
+        [{ assignedBotId: null, assignedUserId: 'user-9' }],
+      ]);
+
+      subscribeAtlasEvents(app);
+      emitContactTurn(eventBus);
+      await flushMicrotasks();
+
+      expect(queues.add).not.toHaveBeenCalled();
+    });
+
+    it('skips when nobody owns the conversation (assignedBotId null, assignedUserId null)', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(VALID_SECRET, 'true');
+      const { app, queues } = buildAppStub([
+        [{ assignedBotId: null, assignedUserId: null }],
+      ]);
+
+      subscribeAtlasEvents(app);
+      emitContactTurn(eventBus);
+      await flushMicrotasks();
+
+      expect(queues.add).not.toHaveBeenCalled();
+    });
+
+    it('skips when both a bot and a human are assigned — human precedes (bizarre state)', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(VALID_SECRET, 'true');
+      const { app, queues } = buildAppStub([
+        [{ assignedBotId: 'bot-1', assignedUserId: 'user-9' }],
+      ]);
+
+      subscribeAtlasEvents(app);
+      emitContactTurn(eventBus);
+      await flushMicrotasks();
+
+      expect(queues.add).not.toHaveBeenCalled();
+    });
+  });
+
   // --- envelope-shape cases ---
 
   describe('USE_PHASE_12_ENVELOPE=true', () => {
@@ -258,7 +347,12 @@ describe('subscribeAtlasEvents', () => {
         content: 'hello world',
         createdAt: new Date('2026-05-11T12:00:00Z'),
       };
-      const { app, queues } = buildAppStub([[convRow], [inboxRow], [msgRow]]);
+      const { app, queues } = buildAppStub([
+        [botManagedConvRow],
+        [convRow],
+        [inboxRow],
+        [msgRow],
+      ]);
 
       subscribeAtlasEvents(app);
 
@@ -369,7 +463,8 @@ describe('subscribeAtlasEvents', () => {
         VALID_SECRET,
         'false',
       );
-      const { app, queues } = buildAppStub();
+      // [autonomy-T-18] gate reads the conversation first; bot-managed → passes.
+      const { app, queues } = buildAppStub([[botManagedConvRow]]);
 
       subscribeAtlasEvents(app);
 
@@ -490,8 +585,9 @@ describe('subscribeAtlasEvents', () => {
       const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
         enabled: true,
       });
-      // rowSet feeds resolveEventAccountId's inbox → accountId lookup.
-      const { app, queues } = buildAppStub([[inboxAccountRow]]);
+      // [autonomy-T-18] gate row first (bot-managed → passes), then rowSet feeds
+      // resolveEventAccountId's inbox → accountId lookup.
+      const { app, queues } = buildAppStub([[botManagedConvRow], [inboxAccountRow]]);
 
       subscribeAtlasEvents(app);
       eventBus.emitEvent({
@@ -741,7 +837,8 @@ describe('subscribeAtlasEvents', () => {
       const { eventBus, subscribeAtlasEvents } = await loadFreshModules(VALID_SECRET, 'false', {
         enabled: true,
       });
-      const { app, queues } = buildAppStub([[inboxAccountRow]]);
+      // [autonomy-T-18] gate row first (bot-managed → passes).
+      const { app, queues } = buildAppStub([[botManagedConvRow], [inboxAccountRow]]);
 
       subscribeAtlasEvents(app);
       eventBus.emitEvent({
