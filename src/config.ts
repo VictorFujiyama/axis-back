@@ -157,6 +157,13 @@ const envSchema = z.object({
     .enum(['true', 'false'])
     .default('true')
     .transform((v) => v === 'true'),
+  // One-time backfill endpoint shared secret (D34). The backfill script signs
+  // each request `X-Backfill-Signature: hex(hmac-sha256(rawBody, secret))`; the
+  // POST /api/v1/internal/backfill/inbox-playbook route verifies it over the
+  // exact signed bytes (no JWT). Optional so envs that never run the one-shot
+  // atlas→axis playbook migration boot fine — the route returns 503 when unset.
+  // min(32) keeps the HMAC key from being trivially brute-forceable.
+  BACKFILL_SHARED_SECRET: z.string().min(32).optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
