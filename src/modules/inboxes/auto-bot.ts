@@ -27,6 +27,11 @@ const DEFAULT_MODELS: Record<BotProvider, string> = {
 export type BotProvider = 'anthropic' | 'openai';
 export type AutoBotReason = 'enable' | 'disable' | 'rotate-key' | 'inbox-deleted';
 
+/** Default model string per provider (D18) — also used for the validateKey smoke ping (D43). */
+export function defaultModelFor(provider: BotProvider): string {
+  return DEFAULT_MODELS[provider];
+}
+
 export interface AutoBotInput {
   inboxId: string;
   accountId: string;
