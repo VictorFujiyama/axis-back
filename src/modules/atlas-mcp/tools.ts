@@ -318,46 +318,10 @@ async function requireAtlasUserLink(
 }
 
 /**
- * Like {@link requireAtlasUserLink} but RETURNS the bound `axisUserId` instead
- * of discarding it. The Fase G handoff tools (T-16/T-17) need the linked axis
- * user to (a) prove the Atlas-bot is the assigned bot before releasing a
- * conversation, and (b) enforce D32 multi-tenancy: the lookup is scoped to the
- * conversation's `accountId`, so a bot linked to a different account finds no
- * row here and is rejected as `forbidden` (cross-tenant), exactly like the
- * existing write-tool gate. For the bot caller `ctx.atlasAppUserId` is
- * `atlas-bot:<orgId>` (T-00a/T-00c), so the resolved `axisUserId` is the bot
- * user that `inbox.defaultBotId` (T-19) stamps onto new conversations.
- */
-async function resolveAtlasUserLink(
-  db: DB,
-  accountId: string,
-  ctx: AtlasRequestContext,
-): Promise<{ axisUserId: string }> {
-  const [row] = await db
-    .select({ axisUserId: schema.atlasUserLinks.axisUserId })
-    .from(schema.atlasUserLinks)
-    .where(
-      and(
-        eq(schema.atlasUserLinks.accountId, accountId),
-        eq(schema.atlasUserLinks.atlasOrgId, ctx.atlasOrgId),
-        eq(schema.atlasUserLinks.atlasAppUserId, ctx.atlasAppUserId),
-      ),
-    )
-    .limit(1);
-  if (!row) {
-    throw new MessagingToolError(
-      'forbidden',
-      'Atlas user not linked — open /messaging in Atlas web first to activate the link, then retry.',
-    );
-  }
-  return { axisUserId: row.axisUserId };
-}
-
-/**
  * Resolve the `bots.id` of the Atlas-managed bot for a conversation's inbox.
  *
  * Gap 3 bridge (T-19'/T-16'): `conversations.assignedBotId` carries a FK to
- * `bots(id)`, NOT the `users.id` returned by `resolveAtlasUserLink`. The two
+ * `bots(id)`, NOT the bot user's `users.id` in `atlas_user_links`. The two
  * id-spaces never match, so the bot that owns an Atlas-managed conversation
  * cannot be identified by the bot user's `axisUserId`. Instead it is the
  * inbox's `defaultBotId` — a real `bots` row created by
@@ -878,8 +842,11 @@ export interface AssignUserResult {
  * returns the thread to the inbox's general queue, this routes it to a named
  * `assignedUserId`.
  *
- * Gate + tenancy: `resolveAtlasUserLink` scopes the caller to the
+ * Gate + tenancy: `requireAtlasUserLink` scopes the caller to the
  * conversation's account, so a cross-account bot is rejected `forbidden` (D31).
+ * Unlike the reverse handoff, this tool never inspects the currently assigned
+ * bot, so it is unaffected by the Gap 3 id-space split (T-16'/T-17') — the gate
+ * is purely the account-scoped link check shared with the write tools.
  * The target `axisUserId` must (a) exist as a live user — otherwise `not_found`
  * — and (b) be a member of the conversation's account (`account_users`),
  * otherwise `forbidden` (D32 cross-account assignment is refused). On success
@@ -894,7 +861,9 @@ export async function assignUserHandler(
 ): Promise<AssignUserResult> {
   const conv = await loadConversationScope(db, input.conversationId);
   // Scopes the caller to conv.accountId — cross-tenant bot finds no link (D31).
-  await resolveAtlasUserLink(db, conv.accountId, ctx);
+  // Same corrected gate as the other write tools (T-16'); the bound axisUserId
+  // is irrelevant here since this tool sets assignedUserId, not assignedBotId.
+  await requireAtlasUserLink(db, conv.accountId, ctx);
 
   // Target user must exist (live) before we check membership, so a deleted /
   // unknown user is `not_found` rather than masquerading as cross-account.

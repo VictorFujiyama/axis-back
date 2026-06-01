@@ -819,7 +819,7 @@ describe('assignUserHandler', () => {
     const { db } = makeWriteDb({
       selectLimits: [
         [{ ...CONV_SCOPE_ROW, assignedBotId: BOT_USER_ID }], // loadConversationScope
-        [{ axisUserId: BOT_USER_ID }],                       // resolveAtlasUserLink → our bot
+        [{ id: 'link-1' }],                            // requireAtlasUserLink gate → linked
         [{ id: TARGET_USER_ID }],                            // target user exists
         [{ userId: TARGET_USER_ID }],                        // account membership
       ],
@@ -875,7 +875,7 @@ describe('assignUserHandler', () => {
     const { db } = makeWriteDb({
       selectLimits: [
         [{ ...CONV_SCOPE_ROW, assignedBotId: BOT_USER_ID }], // loadConversationScope
-        [{ axisUserId: BOT_USER_ID }],                       // resolveAtlasUserLink → our bot
+        [{ id: 'link-1' }],                            // requireAtlasUserLink gate → linked
         [],                                                  // target user lookup → empty
       ],
     });
@@ -896,7 +896,7 @@ describe('assignUserHandler', () => {
     const { db } = makeWriteDb({
       selectLimits: [
         [{ ...CONV_SCOPE_ROW, assignedBotId: BOT_USER_ID }], // loadConversationScope
-        [{ axisUserId: BOT_USER_ID }],                       // resolveAtlasUserLink → our bot
+        [{ id: 'link-1' }],                            // requireAtlasUserLink gate → linked
         [{ id: TARGET_USER_ID }],                            // target user exists
         [],                                                  // account membership → empty (cross-account)
       ],
