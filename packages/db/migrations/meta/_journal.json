@@ -218,6 +218,13 @@
       "when": 1779857519042,
       "tag": "0030_icy_champions",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1780335506225,
+      "tag": "0031_red_richard_fisk",
+      "breakpoints": true
     }
   ]
 }
