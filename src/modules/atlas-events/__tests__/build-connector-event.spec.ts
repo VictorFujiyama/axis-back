@@ -9,12 +9,14 @@ import { parseConnectorEvent } from '@atlas/connectors';
 import {
   buildContactEvent,
   buildConversationSummaryEvent,
+  buildConversationTaggedEnvelope,
   buildConversationTurnEvent,
   buildHandoffEvent,
   buildLeadQualifiedEnvelope,
   resolveActorHints,
 } from '../build-connector-event';
 import { LEAD_QUALIFIED_KIND } from '../lead-qualified';
+import { CONVERSATION_TAGGED_KIND } from '../conversation-tagged';
 
 // Every builder query is select→from→where→limit(1). makeDb hands back one row
 // set per query, in call order. See build-envelope.spec.ts for the precedent.
@@ -313,6 +315,79 @@ describe('build-connector-event builders', () => {
       const taggedAtMs = Date.parse(payload['tagged_at'] as string);
       expect(taggedAtMs).toBeGreaterThanOrEqual(before);
       expect(taggedAtMs).toBeLessThanOrEqual(after);
+    });
+  });
+
+  // [6.4-T-11] conversation_tagged is the generic sibling of lead_qualified: it
+  // builds for ANY tag name with an identical envelope shape (only the dispatcher
+  // additionally fires lead_qualified for `qualified` — see enqueue.spec). The
+  // builder runs three queries in order: loadConversation, contact-participant,
+  // user-participant.
+  describe('conversation_tagged envelope (T-11)', () => {
+    const TAGGED_AT = '2026-05-29T13:00:00.000Z';
+    const TAGGED_AT_MS = Date.parse(TAGGED_AT);
+
+    it('custom tag (not qualified) — generic envelope + typed payload under metadata', async () => {
+      const db = makeDb([[convRow], [contactHints], [userHints]]);
+
+      const ev = await buildConversationTaggedEnvelope(db, {
+        conversationId: 'conv-1',
+        tagId: 'tag-vip',
+        tagName: 'vip',
+        accountId: 'account-1',
+        orgId: TEST_ORG_ID,
+        taggedAt: TAGGED_AT,
+      });
+
+      expect(parseConnectorEvent(ev).ok).toBe(true);
+      expect(ev.kind).toBe(CONVERSATION_TAGGED_KIND);
+      expect(ev.action).toBe('create');
+      // event_id keyed on (tagId, taggedAt_ms) so re-tagging yields a fresh event.
+      expect(ev.event_id).toBe(`conv_conv-1:tagged:tag-vip:${TAGGED_AT_MS}`);
+      expect(ev.source_ref).toEqual({ id: 'conv-1' });
+      expect(ev.summary).toBe('Tagged: vip');
+      // payload parked under metadata.conversation_tagged (envelope kind is open).
+      const payload = (ev.metadata as Record<string, unknown>)['conversation_tagged'] as Record<
+        string,
+        unknown
+      >;
+      expect(payload).toEqual({
+        tagName: 'vip',
+        conversationId: 'conv-1',
+        contactId: 'contact-1',
+        taggedAt: TAGGED_AT,
+        actor: null,
+      });
+      expect(ev.metadata['accountId']).toBe('account-1');
+      // participants carry contact + assigned user for Atlas-side identity federation.
+      expect(ev.participants).toHaveLength(2);
+      // no actors — the realtime event does not carry the tagging actor yet.
+      expect(ev.actors).toEqual([]);
+    });
+
+    it('qualified tag — same structure as a custom tag (parallel to lead_qualified)', async () => {
+      const db = makeDb([[convRow], [contactHints], [userHints]]);
+
+      const ev = await buildConversationTaggedEnvelope(db, {
+        conversationId: 'conv-1',
+        tagId: 'tag-q',
+        tagName: 'qualified',
+        accountId: 'account-1',
+        orgId: TEST_ORG_ID,
+        taggedAt: TAGGED_AT,
+      });
+
+      expect(parseConnectorEvent(ev).ok).toBe(true);
+      // The envelope shape does NOT change with the tag name — `qualified` only
+      // makes the dispatcher ALSO fire lead_qualified (covered in enqueue.spec).
+      expect(ev.kind).toBe(CONVERSATION_TAGGED_KIND);
+      expect(ev.event_id).toBe(`conv_conv-1:tagged:tag-q:${TAGGED_AT_MS}`);
+      const payload = (ev.metadata as Record<string, unknown>)['conversation_tagged'] as Record<
+        string,
+        unknown
+      >;
+      expect(payload['tagName']).toBe('qualified');
+      expect(payload['contactId']).toBe('contact-1');
     });
   });
 

@@ -6,6 +6,11 @@ import {
   parseLeadQualifiedPayload,
   type LeadQualifiedContact,
 } from './lead-qualified';
+import {
+  CONVERSATION_TAGGED_KIND,
+  parseConversationTaggedPayload,
+  type ConversationTaggedActor,
+} from './conversation-tagged';
 
 /**
  * Phase 12.2 Connector Bridge — `ConnectorEvent` builders (the cutover wire
@@ -342,6 +347,69 @@ export async function buildLeadQualifiedEnvelope(
     metadata: {
       accountId: input.accountId,
       lead_qualified: payloadResult.payload,
+    },
+  });
+}
+
+/** `conversation_tagged` — a tag (ANY name) was applied to a conversation. The
+ * generic sibling of `lead_qualified` (D20). Emitted for EVERY tag so Atlas-side
+ * journey triggers (Task 6.4) can match arbitrary tags; for the `qualified` tag
+ * it is emitted in PARALLEL with `lead_qualified` (which stays for the CRM
+ * handler's BC), never replacing it.
+ *
+ * `event_id=conv_<id>:tagged:<tagId>:<taggedAt_ms>` — keyed on (tag, timestamp)
+ * so re-tagging legitimately yields a new event while a replay dedupes on
+ * `(source_app, event_id)`. The typed payload (ConversationTaggedPayloadSchema)
+ * is parked under `metadata.conversation_tagged` because the envelope `kind` is
+ * an open string and `metadata` is free-form (spec §12.1.01) — the Atlas-side
+ * trigger matcher reads it from there.
+ *
+ * Participants carry the contact + assigned user (identity-federation hints) so
+ * the Atlas-side `resolve-contact` doesn't re-read the source. `actors` is empty
+ * — the realtime event does not carry the tagging actor yet (payload `actor`
+ * defaults to null). */
+export async function buildConversationTaggedEnvelope(
+  db: DB,
+  input: {
+    conversationId: string;
+    tagId: string;
+    tagName: string;
+    accountId: string;
+    orgId: string;
+    /** ISO 8601 with offset. Defaults to now; the trigger threads the tag's createdAt. */
+    taggedAt?: string;
+    /** Who applied the tag, when known (the realtime event does not carry it yet). */
+    actor?: ConversationTaggedActor | null;
+  },
+): Promise<ConnectorEvent> {
+  const taggedAt = input.taggedAt ?? new Date().toISOString();
+  const conv = await loadConversation(db, input.conversationId);
+
+  const payloadResult = parseConversationTaggedPayload({
+    tagName: input.tagName,
+    conversationId: conv.id,
+    contactId: conv.contactId,
+    taggedAt,
+    actor: input.actor ?? null,
+  });
+  if (!payloadResult.ok) {
+    throw new Error(
+      `build-connector-event: invalid conversation_tagged payload: ${JSON.stringify(payloadResult.error.issues)}`,
+    );
+  }
+
+  return validateConnectorEvent({
+    ...connectorBase(taggedAt, input.orgId),
+    event_id: `conv_${conv.id}:tagged:${input.tagId}:${Date.parse(taggedAt)}`,
+    kind: CONVERSATION_TAGGED_KIND,
+    action: 'create',
+    source_ref: { id: conv.id },
+    actors: [],
+    participants: await buildParticipants(db, conv),
+    summary: `Tagged: ${input.tagName}`.slice(0, SUMMARY_CAP),
+    metadata: {
+      accountId: input.accountId,
+      conversation_tagged: payloadResult.payload,
     },
   });
 }

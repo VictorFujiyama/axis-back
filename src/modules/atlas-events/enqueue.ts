@@ -17,6 +17,7 @@ import {
   buildHandoffEvent,
   buildContactEvent,
   buildLeadQualifiedEnvelope,
+  buildConversationTaggedEnvelope,
 } from './build-connector-event';
 import { getConnectorForAccount } from './connector';
 import { getConnection } from './connections';
@@ -181,9 +182,10 @@ async function emitConnectorEvent(app: FastifyInstance, event: RealtimeEvent): P
   const connector = await getConnectorForAccount(app, accountId);
   if (!connector) return; // defensive: connection vanished between the two reads
 
+  // A single source event can fan out into multiple connector events (D20: a
+  // `qualified` tag emits BOTH `lead_qualified` and `conversation_tagged`).
   const built = await buildConnectorEventForEvent(app.db, event, conn.atlasOrgId);
-  if (!built) return;
-  await connector.emit(built);
+  for (const ev of built) await connector.emit(ev);
 }
 
 /**
@@ -240,57 +242,80 @@ async function buildConnectorEventForEvent(
   db: DB,
   event: RealtimeEvent,
   orgId: string,
-): Promise<ConnectorEvent | null> {
+): Promise<ConnectorEvent[]> {
   if (event.type === 'message.created') {
     // Forward the MCP-write `meta` so bot/system turns carry `atlas_user_id`
     // hints (chain of custody, L-604).
-    return buildConversationTurnEvent(db, {
-      conversationId: event.conversationId,
-      messageId: event.message.id,
-      meta: event.meta,
-      orgId,
-    });
+    return [
+      await buildConversationTurnEvent(db, {
+        conversationId: event.conversationId,
+        messageId: event.message.id,
+        meta: event.meta,
+        orgId,
+      }),
+    ];
   }
 
   if (event.type === 'conversation.resolved') {
-    return buildConversationSummaryEvent(db, { conversationId: event.conversationId, orgId });
+    return [await buildConversationSummaryEvent(db, { conversationId: event.conversationId, orgId })];
   }
 
   if (event.type === 'conversation.assigned') {
-    if (event.assignedBotId !== null) return null;
-    return buildHandoffEvent(db, { conversationId: event.conversationId, orgId });
+    if (event.assignedBotId !== null) return [];
+    return [await buildHandoffEvent(db, { conversationId: event.conversationId, orgId })];
   }
 
   if (event.type === 'contact.created') {
-    return buildContactEvent(db, { contactId: event.contact.id, orgId });
+    return [await buildContactEvent(db, { contactId: event.contact.id, orgId })];
   }
 
-  // [crm-T-03] `conversation.tagged` → if the tag name is `qualified`
-  // (case-insensitive, D3) and the inbox has a resolvable account, build a
-  // `lead_qualified` envelope (T-02). Other tag names drop here — they were
-  // emitted on the bus for forward-compat but have no connector mapping.
+  // `conversation.tagged` fans out (D20). For EVERY tag with a resolvable
+  // account it emits `conversation_tagged` (generic — feeds Atlas journey
+  // triggers, Task 6.4). For the `qualified` tag (case-insensitive, D3) it
+  // ADDITIONALLY emits `lead_qualified` in parallel (the CRM handler's BC, T-02)
+  // — the two coexist, the generic one never replaces it. A vanished tag row or
+  // an unmapped inbox drops both.
   if (event.type === 'conversation.tagged') {
     const [tag] = await db
       .select({ name: schema.tags.name })
       .from(schema.tags)
       .where(eq(schema.tags.id, event.tagId))
       .limit(1);
-    if (!tag || tag.name.toLowerCase() !== 'qualified') return null;
+    if (!tag) return [];
     const [inbox] = await db
       .select({ accountId: schema.inboxes.accountId })
       .from(schema.inboxes)
       .where(eq(schema.inboxes.id, event.inboxId))
       .limit(1);
-    if (!inbox?.accountId) return null;
-    return buildLeadQualifiedEnvelope(db, {
-      conversationId: event.conversationId,
-      accountId: inbox.accountId,
-      orgId,
-      taggedAt: event.taggedAt,
-    });
+    if (!inbox?.accountId) return [];
+
+    const out: ConnectorEvent[] = [];
+    // lead_qualified (BC, CRM handler) — only the `qualified` tag (D3).
+    if (tag.name.toLowerCase() === 'qualified') {
+      out.push(
+        await buildLeadQualifiedEnvelope(db, {
+          conversationId: event.conversationId,
+          accountId: inbox.accountId,
+          orgId,
+          taggedAt: event.taggedAt,
+        }),
+      );
+    }
+    // conversation_tagged (generic, journeys) — every tag (D20), in parallel.
+    out.push(
+      await buildConversationTaggedEnvelope(db, {
+        conversationId: event.conversationId,
+        tagId: event.tagId,
+        tagName: tag.name,
+        accountId: inbox.accountId,
+        orgId,
+        taggedAt: event.taggedAt,
+      }),
+    );
+    return out;
   }
 
-  return null;
+  return [];
 }
 
 async function buildEnvelopeForEvent(

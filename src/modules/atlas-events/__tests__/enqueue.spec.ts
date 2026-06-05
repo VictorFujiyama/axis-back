@@ -18,6 +18,7 @@ const builderMocks = vi.hoisted(() => ({
   buildHandoffEvent: vi.fn(),
   buildContactEvent: vi.fn(),
   buildLeadQualifiedEnvelope: vi.fn(),
+  buildConversationTaggedEnvelope: vi.fn(),
 }));
 vi.mock('../build-connector-event', () => builderMocks);
 
@@ -573,6 +574,7 @@ describe('subscribeAtlasEvents', () => {
       builderMocks.buildHandoffEvent.mockReset();
       builderMocks.buildContactEvent.mockReset();
       builderMocks.buildLeadQualifiedEnvelope.mockReset();
+      builderMocks.buildConversationTaggedEnvelope.mockReset();
       connectionsMock.getConnection.mockReset();
       // Default: the resolved account HAS a connection. The anti-leak case below
       // overrides it to null (no connection → no emit).
@@ -707,17 +709,24 @@ describe('subscribeAtlasEvents', () => {
       expect(queues.add).toHaveBeenCalledTimes(2); // summary + handoff (bot-assigned dropped)
     });
 
-    // [crm-T-03] conversation.tagged → buildLeadQualifiedEnvelope when the tag
-    // name is `qualified` (case-insensitive, D3). Three rowSets are consumed:
+    // [6.4-T-11] conversation.tagged with tag `qualified` fans out into BOTH
+    // lead_qualified (CRM handler BC, D3) AND conversation_tagged (generic,
+    // journeys, D20) — emitted in parallel, neither replaces the other. Three
+    // rowSets are consumed (builders are mocked → no further DB reads):
     //   1) resolveEventAccountId — inbox → accountId
     //   2) buildConnectorEventForEvent — tag → name lookup
-    //   3) buildConnectorEventForEvent — inbox → accountId (re-resolved so the
-    //      builder gets the value via input.accountId, not via DB join)
-    it('routes conversation.tagged with tag name "qualified" to buildLeadQualifiedEnvelope and emits', async () => {
+    //   3) buildConnectorEventForEvent — inbox → accountId (shared by both builds)
+    it('dispatches BOTH lead_qualified and conversation_tagged when the tag is "qualified"', async () => {
       builderMocks.buildLeadQualifiedEnvelope.mockResolvedValue(
         fakeConnectorEvent({
           kind: 'lead_qualified',
           event_id: 'conv_conv-q:lead_qualified:1748520000000',
+        }),
+      );
+      builderMocks.buildConversationTaggedEnvelope.mockResolvedValue(
+        fakeConnectorEvent({
+          kind: 'conversation_tagged',
+          event_id: 'conv_conv-q:tagged:tag-q:1748520000000',
         }),
       );
       const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
@@ -746,18 +755,31 @@ describe('subscribeAtlasEvents', () => {
         orgId: ORG_ID,
         taggedAt: '2026-05-29T12:00:00.000Z',
       });
-      expect(queues.add).toHaveBeenCalledTimes(1);
-      const [name, , opts] = queues.add.mock.calls[0]!;
-      expect(name).toBe('atlas-events');
-      expect(opts).toEqual({ jobId: 'conv_conv-q:lead_qualified:1748520000000' });
+      expect(builderMocks.buildConversationTaggedEnvelope).toHaveBeenCalledTimes(1);
+      expect(builderMocks.buildConversationTaggedEnvelope).toHaveBeenCalledWith(app.db, {
+        conversationId: 'conv-q',
+        tagId: 'tag-q',
+        tagName: 'qualified',
+        accountId: SOURCE_ACCOUNT_ID,
+        orgId: ORG_ID,
+        taggedAt: '2026-05-29T12:00:00.000Z',
+      });
+      // Both legs emit → two queue jobs, distinct keyspaces.
+      expect(queues.add).toHaveBeenCalledTimes(2);
+      const jobIds = queues.add.mock.calls.map((c) => (c[2] as { jobId: string }).jobId);
+      expect(jobIds).toContain('conv_conv-q:lead_qualified:1748520000000');
+      expect(jobIds).toContain('conv_conv-q:tagged:tag-q:1748520000000');
     });
 
-    // [crm-T-03] D3 case-insensitive contract: `Qualified` (capitalized) MUST
-    // still route to the builder so a UI that title-cases tag names doesn't
-    // silently miss the qualifying signal.
-    it('routes conversation.tagged with tag name "Qualified" (mixed case) to buildLeadQualifiedEnvelope', async () => {
+    // [6.4-T-11] D3 case-insensitive contract: `Qualified` (capitalized) MUST
+    // still fan out to lead_qualified so a UI that title-cases tag names doesn't
+    // silently miss the qualifying signal — conversation_tagged fires regardless.
+    it('fans out for tag name "Qualified" (mixed case) — both legs still fire', async () => {
       builderMocks.buildLeadQualifiedEnvelope.mockResolvedValue(
         fakeConnectorEvent({ kind: 'lead_qualified', event_id: 'conv_conv-q:lead_qualified:1' }),
+      );
+      builderMocks.buildConversationTaggedEnvelope.mockResolvedValue(
+        fakeConnectorEvent({ kind: 'conversation_tagged', event_id: 'conv_conv-q:tagged:tag-q:1' }),
       );
       const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
         enabled: true,
@@ -779,19 +801,28 @@ describe('subscribeAtlasEvents', () => {
       await flushMicrotasks();
 
       expect(builderMocks.buildLeadQualifiedEnvelope).toHaveBeenCalledTimes(1);
-      expect(queues.add).toHaveBeenCalledTimes(1);
+      expect(builderMocks.buildConversationTaggedEnvelope).toHaveBeenCalledTimes(1);
+      expect(queues.add).toHaveBeenCalledTimes(2);
     });
 
-    // [crm-T-03] Non-qualifying tags emit on the bus for forward-compat
-    // (future kinds) but produce no envelope — the connector leg drops them.
-    it('drops conversation.tagged when the tag name is not "qualified"', async () => {
+    // [6.4-T-11] A non-qualifying tag emits ONLY conversation_tagged (generic,
+    // D20) — lead_qualified stays gated on `qualified` (D3). This is the path
+    // that destrava journey triggers on arbitrary tags (vip, hot-lead, …).
+    it('emits ONLY conversation_tagged when the tag is not "qualified"', async () => {
+      builderMocks.buildConversationTaggedEnvelope.mockResolvedValue(
+        fakeConnectorEvent({
+          kind: 'conversation_tagged',
+          event_id: 'conv_conv-x:tagged:tag-x:1748520000000',
+        }),
+      );
       const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
         enabled: true,
       });
-      // 2 rowSets: resolveEventAccountId + tag name lookup (early return after).
+      // 3 rowSets: resolveEventAccountId + tag name lookup + inbox accountId.
       const { app, queues } = buildAppStub([
         [inboxAccountRow],
         [{ name: 'follow-up' }],
+        [inboxAccountRow],
       ]);
 
       subscribeAtlasEvents(app);
@@ -805,7 +836,19 @@ describe('subscribeAtlasEvents', () => {
       await flushMicrotasks();
 
       expect(builderMocks.buildLeadQualifiedEnvelope).not.toHaveBeenCalled();
-      expect(queues.add).not.toHaveBeenCalled();
+      expect(builderMocks.buildConversationTaggedEnvelope).toHaveBeenCalledTimes(1);
+      expect(builderMocks.buildConversationTaggedEnvelope).toHaveBeenCalledWith(app.db, {
+        conversationId: 'conv-x',
+        tagId: 'tag-x',
+        tagName: 'follow-up',
+        accountId: SOURCE_ACCOUNT_ID,
+        orgId: ORG_ID,
+        taggedAt: '2026-05-29T12:00:00.000Z',
+      });
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [name, , opts] = queues.add.mock.calls[0]!;
+      expect(name).toBe('atlas-events');
+      expect(opts).toEqual({ jobId: 'conv_conv-x:tagged:tag-x:1748520000000' });
     });
 
     // [crm-T-03] Defensive: if the tag row vanished between insert and the
