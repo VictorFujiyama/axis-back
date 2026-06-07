@@ -1,4 +1,4 @@
-import { relations } from 'drizzle-orm';
+import { relations, sql } from 'drizzle-orm';
 import {
   boolean,
   index,
@@ -7,6 +7,7 @@ import {
   text,
   timestamp,
   unique,
+  uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
 import { accounts } from './accounts';
@@ -52,6 +53,16 @@ export const messages = pgTable(
     index('messages_inbox_created_idx').on(t.inboxId, t.createdAt),
     // Composite unique: per inbox, channel_msg_id is unique. Avoids cross-provider collisions.
     unique('messages_inbox_channel_msg_unique').on(t.inboxId, t.channelMsgId),
+    // Idempotency for Atlas journey outbound (D5): one message per (account, run, node).
+    // Partial — only constrains rows originated by a journey run. Lets BullMQ retries
+    // dedup instead of duplicating sends.
+    uniqueIndex('messages_atlas_journey_dedup_idx')
+      .on(
+        t.accountId,
+        sql`(${t.metadata}->>'atlas_journey_run_id')`,
+        sql`(${t.metadata}->>'atlas_node_id')`,
+      )
+      .where(sql`${t.metadata}->>'atlas_journey_run_id' IS NOT NULL`),
   ],
 );
 

@@ -232,6 +232,13 @@
       "when": 1780335645193,
       "tag": "0032_nosy_krista_starr",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1780876149738,
+      "tag": "0033_regular_speedball",
+      "breakpoints": true
     }
   ]
 }
