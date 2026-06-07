@@ -155,6 +155,7 @@ describe('buildMcpServer — InMemoryTransport pair', () => {
         'messaging.assign_user',
         'messaging.get_inbox_playbook',
         'messaging.get_thread',
+        'messaging.list_inboxes',
         'messaging.list_threads',
         'messaging.resolve',
         'messaging.search',

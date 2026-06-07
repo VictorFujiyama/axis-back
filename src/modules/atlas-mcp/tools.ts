@@ -2,7 +2,10 @@ import { and, asc, desc, eq, gte, isNull, like, sql, type SQL } from 'drizzle-or
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema, type DB } from '@blossom/db';
+import type { ChannelType } from '@blossom/shared-types';
 import { config } from '../../config';
+import { decryptJSON } from '../../crypto';
+import { isInboxConfigured } from '../channels/configured-check';
 import { emitConversationTagged } from '../atlas-events/tagged-trigger';
 import { eventBus } from '../../realtime/event-bus';
 import { getOrCreateAtlasBotUser } from './atlas-bot';
@@ -1037,4 +1040,187 @@ export async function getInboxPlaybookHandler(
     version: playbook.version,
     updatedAt: playbook.updatedAt,
   };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// messaging.list_inboxes (T-03 — journey-outbound-messaging D1/D2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+const channelTypeSchema = z.enum([
+  'whatsapp',
+  'email',
+  'instagram',
+  'messenger',
+  'telegram',
+  'webchat',
+  'sms',
+  'api',
+]);
+
+export const listInboxesInputSchema = z.object({
+  channelType: channelTypeSchema.optional(),
+  // Default true: the journey builder only cares about inboxes it can actually
+  // send through. Pass false to also surface disabled inboxes (e.g. a "needs
+  // setup" badge for an inbox the operator turned off).
+  enabledOnly: z.boolean().default(true),
+});
+export type ListInboxesInput = z.infer<typeof listInboxesInputSchema>;
+
+export interface InboxCapabilities {
+  /** Channel has an outbound sender implemented in axis-back. */
+  supportsOutbound: boolean;
+  /** Sending may require an approved provider template (informational). */
+  requiresTemplate: boolean;
+  /** Recipient must have initiated contact first (e.g. Telegram bot rule). */
+  requiresUserInit: boolean;
+}
+
+export interface ListInboxesItem {
+  id: string;
+  name: string;
+  channelType: ChannelType;
+  enabled: boolean;
+  /** Minimum credentials present to send (D2). Never exposes the secrets. */
+  configured: boolean;
+  capabilities: InboxCapabilities;
+  /** Human-facing send identity (phone / from-email); null when not stored. */
+  identifier: string | null;
+  updatedAt: Date;
+}
+
+export interface ListInboxesResult {
+  inboxes: ListInboxesItem[];
+}
+
+/**
+ * Static per-channel capability matrix (D2). Cravado so Atlas does not hardcode
+ * protocol rules: only channels with a real axis-back sender advertise
+ * `supportsOutbound`. Telegram carries `requiresUserInit` (the bot can only
+ * message users who started the conversation).
+ */
+export function capabilitiesForChannel(channelType: ChannelType): InboxCapabilities {
+  switch (channelType) {
+    case 'whatsapp':
+      return { supportsOutbound: true, requiresTemplate: false, requiresUserInit: false };
+    case 'email':
+      return { supportsOutbound: true, requiresTemplate: false, requiresUserInit: false };
+    case 'telegram':
+      return { supportsOutbound: true, requiresTemplate: false, requiresUserInit: true };
+    default:
+      // sms / instagram / messenger / webchat / api: no outbound sender yet.
+      return { supportsOutbound: false, requiresTemplate: false, requiresUserInit: false };
+  }
+}
+
+/**
+ * The send-identity surfaced in the journey builder dropdown (D2): WhatsApp's
+ * Twilio from-number (or messaging-service SID fallback) and the email
+ * from-address. Telegram stores no bot username in `config` (only `apiBase` /
+ * `defaultBotId`), so it returns null and Atlas shows just the inbox name.
+ * Reads only the public `config` jsonb — never `secrets`.
+ */
+export function identifierForInbox(channelType: ChannelType, config: unknown): string | null {
+  const c = config && typeof config === 'object' ? (config as Record<string, unknown>) : {};
+  const str = (v: unknown): string | null =>
+    typeof v === 'string' && v.length > 0 ? v : null;
+  switch (channelType) {
+    case 'whatsapp':
+      return str(c.fromNumber) ?? str(c.messagingServiceSid);
+    case 'email':
+      return str(c.fromEmail);
+    default:
+      return null;
+  }
+}
+
+/**
+ * Decrypt an inbox's `secrets` blob best-effort. Mirrors the defensive decrypt
+ * pattern in `src/queue/workers.ts` — a malformed / unkeyable blob is treated
+ * as "no secrets" (→ `configured: false`) rather than failing the whole list.
+ */
+function safeDecryptSecrets(secrets: string | null): unknown {
+  if (!secrets) return null;
+  try {
+    return decryptJSON(secrets);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * List the inboxes of the axis account the calling Atlas org is bound to (D1/D2).
+ *
+ * Cross-tenant gate (D27): the Atlas org maps to exactly one axis account via
+ * its provisioned `atlas-bot:<orgId>` link in `atlas_user_links`. A missing
+ * link is `forbidden` — there is no account to scope the listing to.
+ *
+ * For each inbox it computes `configured` (via {@link isInboxConfigured}, which
+ * needs the decrypted secrets), the static `capabilities` matrix, and the
+ * public `identifier`. Secrets are decrypted only to derive the boolean and are
+ * never returned.
+ */
+export async function listInboxesHandler(
+  db: DB,
+  input: ListInboxesInput,
+  ctx: AtlasRequestContext,
+): Promise<ListInboxesResult> {
+  // D27 — resolve the single axis account bound to this Atlas org.
+  const [link] = await db
+    .select({ accountId: schema.atlasUserLinks.accountId })
+    .from(schema.atlasUserLinks)
+    .where(
+      and(
+        eq(schema.atlasUserLinks.atlasOrgId, ctx.atlasOrgId),
+        like(schema.atlasUserLinks.atlasAppUserId, 'atlas-bot:%'),
+      ),
+    )
+    .limit(1);
+  if (!link || link.accountId === null) {
+    throw new MessagingToolError(
+      'forbidden',
+      'Atlas org is not linked to an axis account — connect Axis first.',
+    );
+  }
+
+  const conditions: SQL[] = [
+    eq(schema.inboxes.accountId, link.accountId),
+    isNull(schema.inboxes.deletedAt),
+  ];
+  if (input.channelType) {
+    conditions.push(eq(schema.inboxes.channelType, input.channelType));
+  }
+  if (input.enabledOnly) {
+    conditions.push(eq(schema.inboxes.enabled, true));
+  }
+
+  const rows = await db
+    .select({
+      id: schema.inboxes.id,
+      name: schema.inboxes.name,
+      channelType: schema.inboxes.channelType,
+      enabled: schema.inboxes.enabled,
+      config: schema.inboxes.config,
+      secrets: schema.inboxes.secrets,
+      updatedAt: schema.inboxes.updatedAt,
+    })
+    .from(schema.inboxes)
+    .where(and(...conditions))
+    .orderBy(asc(schema.inboxes.name));
+
+  const inboxes: ListInboxesItem[] = rows.map((row) => {
+    const channelType = row.channelType as ChannelType;
+    const decrypted = safeDecryptSecrets(row.secrets);
+    return {
+      id: row.id,
+      name: row.name,
+      channelType,
+      enabled: row.enabled,
+      configured: isInboxConfigured(channelType, row.config, decrypted),
+      capabilities: capabilitiesForChannel(channelType),
+      identifier: identifierForInbox(channelType, row.config),
+      updatedAt: row.updatedAt,
+    };
+  });
+
+  return { inboxes };
 }

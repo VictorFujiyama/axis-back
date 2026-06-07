@@ -14,6 +14,8 @@ import {
   getInboxPlaybookInputSchema,
   getThreadHandler,
   getThreadInputSchema,
+  listInboxesHandler,
+  listInboxesInputSchema,
   listThreadsHandler,
   listThreadsInputSchema,
   resolveHandler,
@@ -193,6 +195,32 @@ export function buildMcpServer(
       try {
         const bound = requireCtx(ctx);
         const result = await getInboxPlaybookHandler(db, args, bound);
+        return toToolResult(result);
+      } catch (err) {
+        const mapped = mapToolError(err);
+        if (mapped) return mapped;
+        throw err;
+      }
+    },
+  );
+
+  // ── messaging.list_inboxes (T-03 — journey-outbound-messaging) ────────────
+  // A read tool that needs `ctx` for the D27 cross-tenant gate: the calling
+  // Atlas org may only list inboxes of the axis account it is bound to via its
+  // `atlas-bot:%` link. Surfaces a `configured` boolean (computed from the
+  // decrypted secrets) and per-channel `capabilities` so the journey builder
+  // can gate / warn — without ever exposing the secrets themselves.
+  server.registerTool(
+    'messaging.list_inboxes',
+    {
+      description:
+        "List the inboxes of the caller Atlas org's axis account. Each item carries {id, name, channelType, enabled, configured, capabilities:{supportsOutbound,requiresTemplate,requiresUserInit}, identifier, updatedAt}. Filter by channelType; pass enabledOnly:false to include disabled inboxes. `configured` reflects whether minimum send credentials are present (secrets are never returned).",
+      inputSchema: listInboxesInputSchema.shape,
+    },
+    async (args) => {
+      try {
+        const bound = requireCtx(ctx);
+        const result = await listInboxesHandler(db, args, bound);
         return toToolResult(result);
       } catch (err) {
         const mapped = mapToolError(err);
