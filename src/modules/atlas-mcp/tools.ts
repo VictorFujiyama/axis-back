@@ -6,6 +6,7 @@ import { config } from '../../config';
 import { emitConversationTagged } from '../atlas-events/tagged-trigger';
 import { eventBus } from '../../realtime/event-bus';
 import { getOrCreateAtlasBotUser } from './atlas-bot';
+import type { ErrCode } from './errors';
 
 /**
  * MCP tool handlers exposed under `messaging.*`.
@@ -36,9 +37,17 @@ export type MessagingToolErrorCode =
 
 export class MessagingToolError extends Error {
   readonly code: MessagingToolErrorCode;
-  constructor(code: MessagingToolErrorCode, message: string) {
+  /**
+   * Optional domain-level structured reason (spec D14). Carries codes from
+   * {@link ErrCode} (e.g. `OUTSIDE_24H_WINDOW`) so Atlas journey handlers can
+   * apply a per-error retry policy. Left undefined by legacy callers — the
+   * two-argument constructor stays backward compatible.
+   */
+  readonly errCode?: ErrCode;
+  constructor(code: MessagingToolErrorCode, message: string, errCode?: ErrCode) {
     super(message);
     this.code = code;
+    this.errCode = errCode;
     this.name = 'MessagingToolError';
   }
 }
