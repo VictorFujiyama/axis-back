@@ -201,7 +201,7 @@ function makeWriteDb(opts: {
   selectLimits?: Array<unknown[]>;
   insertReturnings?: Array<unknown[]>;
   updateReturnings?: Array<unknown[]>;
-}): { db: DB; updateReturning: ReturnType<typeof vi.fn> } {
+}): { db: DB; updateReturning: ReturnType<typeof vi.fn>; insertValues: ReturnType<typeof vi.fn> } {
   const selectLimit = vi.fn();
   for (const rs of opts.selectLimits ?? []) selectLimit.mockResolvedValueOnce(rs);
   const orderBy = vi.fn().mockReturnValue({ limit: selectLimit });
@@ -234,6 +234,7 @@ function makeWriteDb(opts: {
   return {
     db: { select, insert: insertFn, update: updateFn } as unknown as DB,
     updateReturning,
+    insertValues,
   };
 }
 
@@ -295,6 +296,75 @@ describe('sendMessageHandler', () => {
         meta: { atlasAppUserId: ATLAS_APP_USER_ID, atlasOrgId: ATLAS_ORG_ID },
       }),
     );
+  });
+
+  it('propagates the optional `meta` onto messages.metadata (D6/D19)', async () => {
+    const insertedMsg = {
+      id: 'msg-meta',
+      conversationId: CONV_ID,
+      inboxId: INBOX_ID,
+      senderType: 'bot' as const,
+      senderId: BOT_USER_ID,
+      content: 'hi',
+      contentType: 'text',
+      mediaUrl: null,
+      mediaMimeType: null,
+      isPrivateNote: false,
+      createdAt: new Date('2026-05-12T14:00:00Z'),
+    };
+    const { db, insertValues } = makeWriteDb({
+      selectLimits: [[CONV_SCOPE_ROW], [{ id: 'link-1' }], [BOT_USER_ROW]],
+      insertReturnings: [[insertedMsg]],
+    });
+
+    await sendMessageHandler(
+      db,
+      appStub,
+      {
+        conversationId: CONV_ID,
+        content: 'hi',
+        contentType: 'text',
+        isPrivateNote: false,
+        meta: { source: 'atlas-journey', atlas_journey_run_id: 'run-1' },
+      },
+      CTX,
+    );
+
+    expect(insertValues).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: { source: 'atlas-journey', atlas_journey_run_id: 'run-1' },
+      }),
+    );
+  });
+
+  it('omits metadata when `meta` is absent (keeps column default)', async () => {
+    const insertedMsg = {
+      id: 'msg-nometa',
+      conversationId: CONV_ID,
+      inboxId: INBOX_ID,
+      senderType: 'bot' as const,
+      senderId: BOT_USER_ID,
+      content: 'hi',
+      contentType: 'text',
+      mediaUrl: null,
+      mediaMimeType: null,
+      isPrivateNote: false,
+      createdAt: new Date('2026-05-12T14:00:00Z'),
+    };
+    const { db, insertValues } = makeWriteDb({
+      selectLimits: [[CONV_SCOPE_ROW], [{ id: 'link-1' }], [BOT_USER_ROW]],
+      insertReturnings: [[insertedMsg]],
+    });
+
+    await sendMessageHandler(
+      db,
+      appStub,
+      { conversationId: CONV_ID, content: 'hi', contentType: 'text', isPrivateNote: false },
+      CTX,
+    );
+
+    expect(insertValues).toHaveBeenCalledTimes(1);
+    expect(insertValues.mock.calls[0]![0]).not.toHaveProperty('metadata');
   });
 
   it('throws MessagingToolError("forbidden") when atlas_user_link is missing for this Atlas user', async () => {

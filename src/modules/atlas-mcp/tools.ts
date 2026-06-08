@@ -368,6 +368,12 @@ export const sendMessageInputSchema = z.object({
     .enum(['text', 'image', 'audio', 'video', 'document', 'location', 'template'])
     .default('text'),
   isPrivateNote: z.boolean().default(false),
+  // Optional free-form metadata stamped onto `messages.metadata` (D6/D19). The
+  // journey path sets `source='atlas-journey'` here so the connector envelope
+  // builder carries it through for loop-prevention (T-15) and delivery ingest
+  // (T-21). Omitted → the column keeps its `{}` default. `upsert_and_send`
+  // builds its own metadata; this is the generic reply path.
+  meta: z.record(z.unknown()).optional(),
 });
 export type SendMessageInput = z.infer<typeof sendMessageInputSchema>;
 
@@ -403,6 +409,7 @@ export async function sendMessageHandler(
       content: input.content,
       contentType: input.contentType,
       isPrivateNote: input.isPrivateNote,
+      ...(input.meta ? { metadata: input.meta } : {}),
     })
     .returning();
   if (!msg) throw new Error('send_message: failed to insert message');

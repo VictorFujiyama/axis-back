@@ -178,12 +178,80 @@ async function loadMessage(db: DB, messageId: string) {
       senderId: schema.messages.senderId,
       content: schema.messages.content,
       createdAt: schema.messages.createdAt,
+      // Delivery columns + free-form metadata feed the D19 delivery_status and
+      // the D6 journey-origin pass-through on the conversation_turn envelope.
+      metadata: schema.messages.metadata,
+      deliveredAt: schema.messages.deliveredAt,
+      readAt: schema.messages.readAt,
+      failedAt: schema.messages.failedAt,
+      failureReason: schema.messages.failureReason,
     })
     .from(schema.messages)
     .where(eq(schema.messages.id, messageId))
     .limit(1);
   if (!row) throw new Error(`build-connector-event: message ${messageId} not found`);
   return row;
+}
+
+const DELIVERY_STATUSES = new Set(['sent', 'delivered', 'read', 'failed', 'bounced']);
+export type DeliveryStatus = 'sent' | 'delivered' | 'read' | 'failed' | 'bounced';
+
+interface MessageDeliveryState {
+  metadata?: unknown;
+  deliveredAt?: Date | null;
+  readAt?: Date | null;
+  failedAt?: Date | null;
+  failureReason?: string | null;
+}
+
+/**
+ * D19 — derive the `delivery_status` (+ `failure_reason`) for a conversation_turn
+ * from a message's dedicated delivery columns, with a `metadata.delivery_status`
+ * override for states that have no column of their own (notably 'bounced', which
+ * arrives via an email provider webhook). Returns `{}` when there is no delivery
+ * signal yet so the common freshly-inserted turn keeps its existing envelope
+ * metadata unchanged (backward-compatible, L-010).
+ */
+export function deriveDeliveryStatus(msg: MessageDeliveryState): {
+  delivery_status?: DeliveryStatus;
+  failure_reason?: string;
+} {
+  const meta = (msg.metadata ?? {}) as Record<string, unknown>;
+  const override = meta['delivery_status'];
+  if (typeof override === 'string' && DELIVERY_STATUSES.has(override)) {
+    const reason =
+      msg.failureReason ??
+      (typeof meta['failure_reason'] === 'string' ? (meta['failure_reason'] as string) : undefined);
+    return {
+      delivery_status: override as DeliveryStatus,
+      ...(reason ? { failure_reason: reason } : {}),
+    };
+  }
+  if (msg.failedAt) {
+    return {
+      delivery_status: 'failed',
+      ...(msg.failureReason ? { failure_reason: msg.failureReason } : {}),
+    };
+  }
+  if (msg.readAt) return { delivery_status: 'read' };
+  if (msg.deliveredAt) return { delivery_status: 'delivered' };
+  return {};
+}
+
+/**
+ * Carry the journey-origin markers a message stamps (D6 loop-prevention
+ * `source` + the run/node ids set by `upsert_and_send`) onto the conversation_turn
+ * envelope metadata, so the Atlas trigger matcher (T-15) can skip self-originated
+ * turns and the delivery ingest (T-21) can correlate to the run+node. Absent keys
+ * are dropped — a normal customer/agent turn carries none of these.
+ */
+function journeyMetaPassthrough(metadata: unknown): Record<string, string> {
+  const meta = (metadata ?? {}) as Record<string, unknown>;
+  const out: Record<string, string> = {};
+  for (const key of ['source', 'atlas_journey_run_id', 'atlas_node_id'] as const) {
+    if (typeof meta[key] === 'string') out[key] = meta[key] as string;
+  }
+  return out;
 }
 
 /** `conversation_turn` — one WhatsApp message. `event_id=msg_<id>` (L-603).
@@ -217,7 +285,15 @@ export async function buildConversationTurnEvent(
     // `inboxId` + `senderType` ride the metadata so the Atlas worker (T-16)
     // can gate `qualifier-agent` enqueue on (a) inbox has playbook, (b) the
     // turn is from the customer — without re-querying axis-back state.
-    metadata: { accountId, inboxId: conv.inboxId, senderType },
+    // The journey-origin pass-through (D6) + delivery_status (D19) ride here too
+    // when present; both are absent for ordinary turns (backward-compatible).
+    metadata: {
+      accountId,
+      inboxId: conv.inboxId,
+      senderType,
+      ...journeyMetaPassthrough(msg.metadata),
+      ...deriveDeliveryStatus(msg),
+    },
   });
 }
 

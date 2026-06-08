@@ -13,6 +13,7 @@ import {
   buildConversationTurnEvent,
   buildHandoffEvent,
   buildLeadQualifiedEnvelope,
+  deriveDeliveryStatus,
   resolveActorHints,
 } from '../build-connector-event';
 import { LEAD_QUALIFIED_KIND } from '../lead-qualified';
@@ -102,6 +103,113 @@ describe('build-connector-event builders', () => {
     expect(ev.embedding_text).toBeNull();
     // T-16: bot senderType lets the Atlas worker skip the qualifier-agent enqueue.
     expect(ev.metadata).toEqual({ accountId: 'account-1', inboxId: 'inbox-1', senderType: 'bot' });
+  });
+
+  it('conversation_turn — carries journey-origin pass-through (D6) when message is atlas-journey', async () => {
+    const msgRow = {
+      id: 'msg-j1',
+      senderType: 'bot',
+      senderId: 'bot-axis-1',
+      content: 'journey outbound',
+      createdAt: new Date('2026-05-12T12:02:00Z'),
+      metadata: {
+        source: 'atlas-journey',
+        atlas_journey_run_id: 'run-1',
+        atlas_node_id: 'node-1',
+      },
+    };
+    const db = makeDb([[convRow], [inboxRow], [msgRow], [contactHints], [userHints]]);
+
+    const ev = await buildConversationTurnEvent(db, {
+      conversationId: 'conv-1',
+      messageId: 'msg-j1',
+      orgId: TEST_ORG_ID,
+    });
+
+    expect(parseConnectorEvent(ev).ok).toBe(true);
+    // D6: source rides the envelope so the Atlas trigger matcher (T-15) skips it.
+    // T-21: run/node ids let the delivery ingest correlate to the journey run.
+    expect(ev.metadata).toEqual({
+      accountId: 'account-1',
+      inboxId: 'inbox-1',
+      senderType: 'bot',
+      source: 'atlas-journey',
+      atlas_journey_run_id: 'run-1',
+      atlas_node_id: 'node-1',
+    });
+  });
+
+  it('conversation_turn — carries D19 delivery_status + failure_reason when a send failed', async () => {
+    const msgRow = {
+      id: 'msg-f1',
+      senderType: 'bot',
+      senderId: 'bot-axis-1',
+      content: 'failed send',
+      createdAt: new Date('2026-05-12T12:03:00Z'),
+      metadata: { source: 'atlas-journey', atlas_journey_run_id: 'run-2', atlas_node_id: 'node-2' },
+      failedAt: new Date('2026-05-12T12:04:00Z'),
+      failureReason: 'Twilio 63016: outside 24h window',
+    };
+    const db = makeDb([[convRow], [inboxRow], [msgRow], [contactHints], [userHints]]);
+
+    const ev = await buildConversationTurnEvent(db, {
+      conversationId: 'conv-1',
+      messageId: 'msg-f1',
+      orgId: TEST_ORG_ID,
+    });
+
+    expect(parseConnectorEvent(ev).ok).toBe(true);
+    expect(ev.metadata).toEqual({
+      accountId: 'account-1',
+      inboxId: 'inbox-1',
+      senderType: 'bot',
+      source: 'atlas-journey',
+      atlas_journey_run_id: 'run-2',
+      atlas_node_id: 'node-2',
+      delivery_status: 'failed',
+      failure_reason: 'Twilio 63016: outside 24h window',
+    });
+  });
+
+  describe('deriveDeliveryStatus (D19)', () => {
+    it('no delivery signal → empty (backward-compatible)', () => {
+      expect(deriveDeliveryStatus({})).toEqual({});
+      expect(deriveDeliveryStatus({ metadata: { source: 'atlas-journey' } })).toEqual({});
+    });
+
+    it('deliveredAt → delivered', () => {
+      expect(deriveDeliveryStatus({ deliveredAt: new Date() })).toEqual({
+        delivery_status: 'delivered',
+      });
+    });
+
+    it('readAt takes precedence over deliveredAt → read', () => {
+      expect(deriveDeliveryStatus({ readAt: new Date(), deliveredAt: new Date() })).toEqual({
+        delivery_status: 'read',
+      });
+    });
+
+    it('failedAt → failed + failure_reason from column', () => {
+      expect(deriveDeliveryStatus({ failedAt: new Date(), failureReason: 'SMTP 550' })).toEqual({
+        delivery_status: 'failed',
+        failure_reason: 'SMTP 550',
+      });
+    });
+
+    it('metadata.delivery_status override wins (bounced has no column)', () => {
+      expect(
+        deriveDeliveryStatus({
+          metadata: { delivery_status: 'bounced', failure_reason: 'mailbox full' },
+        }),
+      ).toEqual({ delivery_status: 'bounced', failure_reason: 'mailbox full' });
+    });
+
+    it('ignores an invalid metadata.delivery_status, falls back to columns', () => {
+      expect(deriveDeliveryStatus({ metadata: { delivery_status: 'weird' } })).toEqual({});
+      expect(
+        deriveDeliveryStatus({ metadata: { delivery_status: 'weird' }, deliveredAt: new Date() }),
+      ).toEqual({ delivery_status: 'delivered' });
+    });
   });
 
   it('conversation_summary — valid envelope + resolved event_id', async () => {
