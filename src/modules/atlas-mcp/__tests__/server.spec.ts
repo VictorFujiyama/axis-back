@@ -212,6 +212,32 @@ describe('buildMcpServer — InMemoryTransport pair', () => {
     }
   });
 
+  it('serialises the structured D14 errCode on the wire (Gap 3 — upsert INBOX_NOT_FOUND)', async () => {
+    // link lookup hits, inbox lookup misses → upsert throws
+    // MessagingToolError('not_found', ..., ERR.INBOX_NOT_FOUND). toToolError must
+    // now carry both the transport kind AND the structured errCode (T-17 mapping).
+    const db = makeWriteDb({ selectLimits: [[{ id: 'link-1', accountId: ACCOUNT_ID }], []] });
+    const { client, close } = await connectPair(db, CTX);
+    try {
+      const result = await client.callTool({
+        name: 'messaging.upsert_conversation_and_send',
+        arguments: {
+          inboxId: INBOX_ID,
+          contact: { identifier: { phone: '+5511999999999' } },
+          message: { content: 'hi', contentType: 'text' },
+          metadata: { atlasJourneyRunId: 'run-1', atlasNodeId: 'node-1' },
+        },
+      });
+      expect(result.isError).toBe(true);
+      const content = result.content as Array<{ type: string; text: string }>;
+      const payload = JSON.parse(content[0]!.text) as { error: string; errCode?: string };
+      expect(payload.error).toBe('not_found');
+      expect(payload.errCode).toBe('INBOX_NOT_FOUND');
+    } finally {
+      await close();
+    }
+  });
+
   describe('write tools (T-023)', () => {
     let emitSpy: ReturnType<typeof vi.spyOn>;
     beforeEach(() => {

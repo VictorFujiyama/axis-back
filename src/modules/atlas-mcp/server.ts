@@ -79,12 +79,17 @@ function toToolResult(value: unknown): { content: Array<{ type: 'text'; text: st
   return { content: [{ type: 'text', text: JSON.stringify(value) }] };
 }
 
-function toToolError(code: string, message: string): {
+function toToolError(code: string, message: string, errCode?: string): {
   content: Array<{ type: 'text'; text: string }>;
   isError: true;
 } {
+  // `error` is the transport kind; `errCode` (D14, when present) is the structured
+  // domain reason the Atlas journey handlers map onto retry semantics (Gap 3). It
+  // is omitted from the payload when absent so existing error shapes are unchanged.
   return {
-    content: [{ type: 'text', text: JSON.stringify({ error: code, message }) }],
+    content: [
+      { type: 'text', text: JSON.stringify({ error: code, message, ...(errCode ? { errCode } : {}) }) },
+    ],
     isError: true,
   };
 }
@@ -103,7 +108,7 @@ function mapToolError(err: unknown):
   | { content: Array<{ type: 'text'; text: string }>; isError: true }
   | null {
   if (err instanceof MessagingToolError) {
-    return toToolError(err.code, err.message);
+    return toToolError(err.code, err.message, err.errCode);
   }
   if (err instanceof ZodError) {
     return toToolError(
