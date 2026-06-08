@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, isNull, like, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, isNull, like, or, sql, type SQL } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema, type DB } from '@blossom/db';
@@ -9,7 +9,7 @@ import { isInboxConfigured } from '../channels/configured-check';
 import { emitConversationTagged } from '../atlas-events/tagged-trigger';
 import { eventBus } from '../../realtime/event-bus';
 import { getOrCreateAtlasBotUser } from './atlas-bot';
-import type { ErrCode } from './errors';
+import { ERR, type ErrCode } from './errors';
 
 /**
  * MCP tool handlers exposed under `messaging.*`.
@@ -1223,4 +1223,499 @@ export async function listInboxesHandler(
   });
 
   return { inboxes };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// messaging.upsert_conversation_and_send (T-05 — journey-outbound D3/D4/D5/D6)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Channels with a real outbound sender in axis-back. Anything else (sms /
+ * instagram / messenger / webchat / api) has no sender, so a forced send is
+ * refused with `CHANNEL_NOT_IMPLEMENTED` (D20) rather than silently faking
+ * success on the Atlas side.
+ */
+const OUTBOUND_CHANNELS: readonly ChannelType[] = ['whatsapp', 'email', 'telegram'];
+
+const messageContentTypeSchema = z.enum([
+  'text',
+  'image',
+  'audio',
+  'video',
+  'document',
+  'location',
+  'template',
+]);
+
+export const upsertAndSendInputSchema = z
+  .object({
+    inboxId: uuid,
+    contact: z
+      .object({
+        // Resolution ladder (D4), most-specific first.
+        axisContactId: uuid.optional(),
+        externalContactRef: z
+          .object({ source: z.string().min(1), externalId: z.string().min(1) })
+          .strict()
+          .optional(),
+        identifier: z
+          .object({
+            phone: z.string().min(1).optional(),
+            email: z.string().min(1).optional(),
+            telegramUserId: z.string().min(1).optional(),
+          })
+          .strict()
+          .optional(),
+        // Used only when creating a brand-new contact.
+        name: z.string().optional(),
+      })
+      .strict(),
+    message: z
+      .object({
+        // Empty content is valid for a template send (the body lives in the
+        // provider template, referenced by `templateRef`).
+        content: z.string().default(''),
+        contentType: messageContentTypeSchema.default('text'),
+        // Email subject — stored on metadata (messages has no subject column).
+        subject: z.string().optional(),
+        // WhatsApp/Twilio approved-template reference (24h-window bypass, D16).
+        templateRef: z
+          .object({
+            provider: z.string().min(1),
+            sid: z.string().min(1),
+            variables: z.record(z.string()).optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict(),
+    conversationStrategy: z.enum(['reuse-open', 'always-new']).default('reuse-open'),
+    metadata: z
+      .object({
+        atlasJourneyRunId: z.string().min(1),
+        atlasNodeId: z.string().min(1),
+      })
+      .strict(),
+  })
+  .strict();
+export type UpsertAndSendInput = z.infer<typeof upsertAndSendInputSchema>;
+
+export interface UpsertAndSendResult {
+  conversationId: string;
+  messageId: string;
+  createdNewConversation: boolean;
+  createdNewContact: boolean;
+}
+
+/**
+ * Translate a provider failure (HTTP status and/or provider-specific code) into
+ * a structured {@link ErrCode} per D14 so Atlas can apply its per-error retry
+ * policy.
+ *
+ * Outbound dispatch in axis-back is asynchronous (the send happens in a BullMQ
+ * channel job, see `messages/routes.ts:dispatchOutbound`), so this handler never
+ * observes a provider error synchronously — the message is "accepted" once it is
+ * inserted and the `message.created` event is emitted (D18). This mapper is
+ * therefore exported for (a) the channel job / a future synchronous send path
+ * and (b) the delivery webhook, which both need to label a failure with the same
+ * vocabulary. Twilio 63016 (freeform outside the 24h session window) →
+ * OUTSIDE_24H_WINDOW; HTTP 429 / Twilio 63018 → rate-limited; any 5xx →
+ * transient (retriable); everything else → rejected (non-retriable).
+ */
+export function mapProviderError(args: {
+  httpStatus?: number;
+  providerCode?: number | string;
+}): ErrCode {
+  const { httpStatus } = args;
+  const code =
+    typeof args.providerCode === 'string' ? Number(args.providerCode) : args.providerCode;
+  if (code === 63016) return ERR.OUTSIDE_24H_WINDOW;
+  if (httpStatus === 429 || code === 63018) return ERR.PROVIDER_RATE_LIMITED;
+  if (httpStatus !== undefined && httpStatus >= 500) return ERR.PROVIDER_TRANSIENT;
+  return ERR.PROVIDER_REJECTED;
+}
+
+/**
+ * Composite key under which the Atlas federation reference is remembered on a
+ * resolved/created contact. axis-back has no `entity_links` table (that lives
+ * Atlas-side, Phase 12.2.18), so the "create entity_link" step of D4 is realised
+ * by stamping `contacts.custom_fields.atlasExternalRef = '<source>:<externalId>'`
+ * — a self-contained mapping the next upsert can look up directly.
+ */
+function externalRefKeyOf(
+  ref: { source: string; externalId: string } | undefined,
+): string | null {
+  return ref ? `${ref.source}:${ref.externalId}` : null;
+}
+
+/**
+ * Resolve (or create) the axis contact for an outbound journey send, following
+ * the D4 ladder: explicit axis id → remembered external ref → phone/email match
+ * → create. A phone/email match back-fills the external-ref mapping so later
+ * sends short-circuit on step 2. Throws `CONTACT_RESOLUTION_FAILED` when an
+ * explicit `axisContactId` is unknown or when there is nothing to resolve or
+ * create a contact from.
+ */
+async function resolveContactForUpsert(
+  db: DB,
+  accountId: string,
+  contact: UpsertAndSendInput['contact'],
+): Promise<{ contactId: string; createdNewContact: boolean }> {
+  // (1) explicit axis contact id.
+  if (contact.axisContactId) {
+    const [row] = await db
+      .select({ id: schema.contacts.id })
+      .from(schema.contacts)
+      .where(
+        and(
+          eq(schema.contacts.id, contact.axisContactId),
+          eq(schema.contacts.accountId, accountId),
+          isNull(schema.contacts.deletedAt),
+        ),
+      )
+      .limit(1);
+    if (!row) {
+      throw new MessagingToolError(
+        'not_found',
+        `contact ${contact.axisContactId} not found in account`,
+        ERR.CONTACT_RESOLUTION_FAILED,
+      );
+    }
+    return { contactId: row.id, createdNewContact: false };
+  }
+
+  const externalRefKey = externalRefKeyOf(contact.externalContactRef);
+
+  // (2) remembered Atlas external ref (entity-link analog on custom_fields).
+  if (externalRefKey) {
+    const [row] = await db
+      .select({ id: schema.contacts.id })
+      .from(schema.contacts)
+      .where(
+        and(
+          eq(schema.contacts.accountId, accountId),
+          isNull(schema.contacts.deletedAt),
+          sql`${schema.contacts.customFields}->>'atlasExternalRef' = ${externalRefKey}`,
+        ),
+      )
+      .limit(1);
+    if (row) return { contactId: row.id, createdNewContact: false };
+  }
+
+  // (3) phone/email identifier match.
+  const phone = contact.identifier?.phone ?? null;
+  const email = contact.identifier?.email ?? null;
+  if (phone || email) {
+    const idConds: SQL[] = [];
+    if (phone) idConds.push(eq(schema.contacts.phone, phone));
+    if (email) idConds.push(eq(schema.contacts.email, email));
+    const [row] = await db
+      .select({ id: schema.contacts.id })
+      .from(schema.contacts)
+      .where(
+        and(
+          eq(schema.contacts.accountId, accountId),
+          isNull(schema.contacts.deletedAt),
+          idConds.length === 1 ? idConds[0]! : or(...idConds)!,
+        ),
+      )
+      .limit(1);
+    if (row) {
+      // Remember the Atlas ref so future sends resolve on step 2 (D4).
+      if (externalRefKey) {
+        await db
+          .update(schema.contacts)
+          .set({
+            customFields: sql`coalesce(${schema.contacts.customFields}, '{}'::jsonb) || ${sql.raw(
+              `'${JSON.stringify({ atlasExternalRef: externalRefKey })}'::jsonb`,
+            )}`,
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.contacts.id, row.id));
+      }
+      return { contactId: row.id, createdNewContact: false };
+    }
+  }
+
+  // (4) create a fresh contact — requires at least one anchor to be useful.
+  const telegramUserId = contact.identifier?.telegramUserId ?? null;
+  if (!phone && !email && !telegramUserId && !externalRefKey) {
+    throw new MessagingToolError(
+      'bad_request',
+      'no contact identifier to resolve or create a contact',
+      ERR.CONTACT_RESOLUTION_FAILED,
+    );
+  }
+  const [created] = await db
+    .insert(schema.contacts)
+    .values({
+      accountId,
+      name: contact.name ?? null,
+      phone,
+      email,
+      customFields: externalRefKey ? { atlasExternalRef: externalRefKey } : {},
+    })
+    .returning({ id: schema.contacts.id });
+  if (!created) {
+    throw new MessagingToolError(
+      'bad_request',
+      'failed to create contact',
+      ERR.CONTACT_RESOLUTION_FAILED,
+    );
+  }
+  return { contactId: created.id, createdNewContact: true };
+}
+
+/**
+ * Resolve the conversation to send into. `reuse-open` reuses the most recently
+ * updated open conversation on the same contact+inbox; otherwise (or with
+ * `always-new`) it opens a fresh one, copying the inbox `defaultBotId` so the
+ * thread stays Atlas-managed.
+ */
+async function resolveConversationForUpsert(
+  db: DB,
+  args: {
+    accountId: string;
+    contactId: string;
+    inboxId: string;
+    defaultBotId: string | null;
+    strategy: 'reuse-open' | 'always-new';
+  },
+): Promise<{ conversationId: string; createdNewConversation: boolean }> {
+  if (args.strategy === 'reuse-open') {
+    const [existing] = await db
+      .select({ id: schema.conversations.id })
+      .from(schema.conversations)
+      .where(
+        and(
+          eq(schema.conversations.contactId, args.contactId),
+          eq(schema.conversations.inboxId, args.inboxId),
+          eq(schema.conversations.status, 'open'),
+          isNull(schema.conversations.deletedAt),
+        ),
+      )
+      .orderBy(desc(schema.conversations.updatedAt))
+      .limit(1);
+    if (existing) return { conversationId: existing.id, createdNewConversation: false };
+  }
+
+  const [created] = await db
+    .insert(schema.conversations)
+    .values({
+      accountId: args.accountId,
+      contactId: args.contactId,
+      inboxId: args.inboxId,
+      status: 'open',
+      assignedBotId: args.defaultBotId,
+    })
+    .returning({ id: schema.conversations.id });
+  if (!created) throw new Error('upsert_and_send: failed to create conversation');
+  return { conversationId: created.id, createdNewConversation: true };
+}
+
+/**
+ * Atomic "find-or-create contact + conversation, then send" entry point for the
+ * Atlas journey outbound handlers (D3). Single MCP call so Atlas never races a
+ * separate resolve + send.
+ *
+ * Order of checks (deviates slightly from the spec's numbering to honour D20):
+ * inbox existence → enabled → channel-implemented → configured. The
+ * channel-implemented gate runs BEFORE `configured` so a stub channel (sms /
+ * instagram / messenger) surfaces the actionable `CHANNEL_NOT_IMPLEMENTED`
+ * rather than a misleading "configure it" — there is no sender to configure.
+ *
+ * Idempotency (D5): a prior message carrying the same
+ * `metadata.atlas_journey_run_id` + `metadata.atlas_node_id` short-circuits and
+ * returns the existing conversation+message, so a BullMQ retry re-runs the
+ * handler without duplicating the send. The partial unique index
+ * `messages_atlas_journey_dedup_idx` (T-04) is the DB-level backstop under a
+ * concurrent double-insert.
+ *
+ * Loop prevention (D6): the inserted message stamps
+ * `metadata.source='atlas-journey'`; the Atlas connector envelope builder (T-06)
+ * carries it through so the trigger matcher (T-15) skips self-originated turns.
+ *
+ * Dispatch is asynchronous: the message is inserted and `message.created` is
+ * emitted (the existing outbound hook enqueues the channel job). Success here
+ * means "accepted for delivery" (D18) — provider failures arrive later via
+ * webhook and are mapped with {@link mapProviderError}.
+ */
+export async function upsertAndSendHandler(
+  db: DB,
+  _app: FastifyInstance,
+  input: UpsertAndSendInput,
+  ctx: AtlasRequestContext,
+): Promise<UpsertAndSendResult> {
+  // D27 — resolve the single axis account bound to this Atlas org.
+  const [link] = await db
+    .select({ accountId: schema.atlasUserLinks.accountId })
+    .from(schema.atlasUserLinks)
+    .where(
+      and(
+        eq(schema.atlasUserLinks.atlasOrgId, ctx.atlasOrgId),
+        like(schema.atlasUserLinks.atlasAppUserId, 'atlas-bot:%'),
+      ),
+    )
+    .limit(1);
+  if (!link || link.accountId === null) {
+    throw new MessagingToolError(
+      'forbidden',
+      'Atlas org is not linked to an axis account — connect Axis first.',
+    );
+  }
+  const accountId = link.accountId;
+
+  // Inbox resolution + gating.
+  const [inbox] = await db
+    .select({
+      id: schema.inboxes.id,
+      channelType: schema.inboxes.channelType,
+      enabled: schema.inboxes.enabled,
+      config: schema.inboxes.config,
+      secrets: schema.inboxes.secrets,
+      defaultBotId: schema.inboxes.defaultBotId,
+    })
+    .from(schema.inboxes)
+    .where(
+      and(
+        eq(schema.inboxes.id, input.inboxId),
+        eq(schema.inboxes.accountId, accountId),
+        isNull(schema.inboxes.deletedAt),
+      ),
+    )
+    .limit(1);
+  if (!inbox) {
+    throw new MessagingToolError(
+      'not_found',
+      `inbox ${input.inboxId} not found`,
+      ERR.INBOX_NOT_FOUND,
+    );
+  }
+  if (!inbox.enabled) {
+    throw new MessagingToolError('conflict', `inbox ${inbox.id} is disabled`, ERR.INBOX_DISABLED);
+  }
+  const channelType = inbox.channelType as ChannelType;
+  if (!OUTBOUND_CHANNELS.includes(channelType)) {
+    throw new MessagingToolError(
+      'bad_request',
+      `channel ${channelType} has no outbound sender`,
+      ERR.CHANNEL_NOT_IMPLEMENTED,
+    );
+  }
+  if (!isInboxConfigured(channelType, inbox.config, safeDecryptSecrets(inbox.secrets))) {
+    throw new MessagingToolError(
+      'conflict',
+      `inbox ${inbox.id} is not configured for sending`,
+      ERR.INBOX_NOT_CONFIGURED,
+    );
+  }
+
+  // Idempotency (D5) — a previous send for the same run+node returns as-is.
+  const [existingMsg] = await db
+    .select({
+      id: schema.messages.id,
+      conversationId: schema.messages.conversationId,
+    })
+    .from(schema.messages)
+    .where(
+      and(
+        eq(schema.messages.accountId, accountId),
+        sql`${schema.messages.metadata}->>'atlas_journey_run_id' = ${input.metadata.atlasJourneyRunId}`,
+        sql`${schema.messages.metadata}->>'atlas_node_id' = ${input.metadata.atlasNodeId}`,
+      ),
+    )
+    .limit(1);
+  if (existingMsg) {
+    return {
+      conversationId: existingMsg.conversationId,
+      messageId: existingMsg.id,
+      createdNewConversation: false,
+      createdNewContact: false,
+    };
+  }
+
+  const { contactId, createdNewContact } = await resolveContactForUpsert(
+    db,
+    accountId,
+    input.contact,
+  );
+
+  // Telegram delivery keys off a contact identity (chatId), not contacts.phone
+  // (dispatchOutbound reads contact_identities for telegram). Ensure it exists.
+  if (channelType === 'telegram' && input.contact.identifier?.telegramUserId) {
+    await db
+      .insert(schema.contactIdentities)
+      .values({
+        contactId,
+        channel: 'telegram',
+        identifier: input.contact.identifier.telegramUserId,
+      })
+      .onConflictDoNothing();
+  }
+
+  const { conversationId, createdNewConversation } = await resolveConversationForUpsert(db, {
+    accountId,
+    contactId,
+    inboxId: inbox.id,
+    defaultBotId: inbox.defaultBotId,
+    strategy: input.conversationStrategy,
+  });
+
+  const bot = await getOrCreateAtlasBotUser(db, accountId);
+
+  // metadata keys are snake_case so the partial unique index (T-04) and the
+  // connector envelope builder (T-06) read them consistently.
+  const metadata: Record<string, unknown> = {
+    source: 'atlas-journey',
+    atlas_journey_run_id: input.metadata.atlasJourneyRunId,
+    atlas_node_id: input.metadata.atlasNodeId,
+  };
+  if (input.message.subject) metadata.subject = input.message.subject;
+  if (input.message.templateRef) metadata.template = input.message.templateRef;
+
+  const now = new Date();
+  const [msg] = await db
+    .insert(schema.messages)
+    .values({
+      conversationId,
+      inboxId: inbox.id,
+      accountId,
+      senderType: 'bot',
+      senderId: bot.id,
+      content: input.message.content,
+      contentType: input.message.contentType,
+      metadata,
+    })
+    .returning();
+  if (!msg) throw new Error('upsert_and_send: failed to insert message');
+
+  await db
+    .update(schema.conversations)
+    .set({ lastMessageAt: now, updatedAt: now, waitingForAgentSince: null })
+    .where(eq(schema.conversations.id, conversationId));
+
+  // Same outbound bridge as send_message: the `message.created` subscriber
+  // (bots/outbound-hook) enqueues the channel job.
+  eventBus.emitEvent({
+    type: 'message.created',
+    inboxId: inbox.id,
+    conversationId,
+    message: {
+      id: msg.id,
+      conversationId: msg.conversationId,
+      inboxId: msg.inboxId,
+      senderType: msg.senderType,
+      senderId: msg.senderId,
+      content: msg.content,
+      contentType: msg.contentType,
+      mediaUrl: msg.mediaUrl,
+      mediaMimeType: msg.mediaMimeType,
+      isPrivateNote: msg.isPrivateNote,
+      createdAt: msg.createdAt,
+      sender: { name: bot.name, email: bot.email },
+    },
+    meta: { atlasAppUserId: ctx.atlasAppUserId, atlasOrgId: ctx.atlasOrgId },
+  });
+
+  return { conversationId, messageId: msg.id, createdNewConversation, createdNewContact };
 }

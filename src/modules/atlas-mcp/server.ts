@@ -28,6 +28,8 @@ import {
   tagInputSchema,
   unassignBotHandler,
   unassignBotInputSchema,
+  upsertAndSendHandler,
+  upsertAndSendInputSchema,
 } from './tools';
 
 /**
@@ -221,6 +223,32 @@ export function buildMcpServer(
       try {
         const bound = requireCtx(ctx);
         const result = await listInboxesHandler(db, args, bound);
+        return toToolResult(result);
+      } catch (err) {
+        const mapped = mapToolError(err);
+        if (mapped) return mapped;
+        throw err;
+      }
+    },
+  );
+
+  // ── messaging.upsert_conversation_and_send (T-05 — journey-outbound) ──────
+  // Atomic find-or-create contact + conversation, then send (D3). Write tool —
+  // needs `ctx` for the D27 cross-tenant gate and `app` for the uniform write
+  // signature. Idempotent on (run, node) metadata (D5) and stamps
+  // metadata.source='atlas-journey' for loop prevention (D6).
+  server.registerTool(
+    'messaging.upsert_conversation_and_send',
+    {
+      description:
+        "Resolve (or create) a contact + open conversation on the given inbox and send a message in one atomic call. Used by Atlas journey outbound nodes. Idempotent per (atlasJourneyRunId, atlasNodeId) — a retry returns the existing conversation+message. Returns {conversationId, messageId, createdNewConversation, createdNewContact}. Errors carry a structured code (INBOX_NOT_FOUND/DISABLED/NOT_CONFIGURED, CHANNEL_NOT_IMPLEMENTED, CONTACT_RESOLUTION_FAILED).",
+      inputSchema: upsertAndSendInputSchema.shape,
+    },
+    async (args) => {
+      try {
+        const bound = requireCtx(ctx);
+        const parsed = upsertAndSendInputSchema.parse(args);
+        const result = await upsertAndSendHandler(db, app, parsed, bound);
         return toToolResult(result);
       } catch (err) {
         const mapped = mapToolError(err);

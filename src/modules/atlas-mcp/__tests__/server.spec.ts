@@ -162,6 +162,7 @@ describe('buildMcpServer — InMemoryTransport pair', () => {
         'messaging.send_message',
         'messaging.tag',
         'messaging.unassign_bot',
+        'messaging.upsert_conversation_and_send',
       ]);
     } finally {
       await close();
