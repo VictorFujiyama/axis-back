@@ -5,6 +5,7 @@ import { schema, type DB } from '@blossom/db';
 import { eventBus } from '../../realtime/event-bus.js';
 import { parseGmailConfig } from './gmail-config.js';
 import { sendViaGmail } from './gmail-sender.js';
+import type { EmitMessageFailedParams } from '../atlas-events/enqueue';
 
 const EmailSecretsSchema = z
   .object({ serverToken: z.string().min(1).optional() })
@@ -46,6 +47,14 @@ export interface SendEmailInput {
 interface SendDeps {
   db: DB;
   log: FastifyBaseLogger;
+  /**
+   * [marketing-T-10] Notify Atlas (spec D11) when Postmark permanently rejects
+   * the send with a 4xx — the connector handler suppresses the contact's email
+   * channel (bounce/complaint, D12). Config-missing pre-flight failures (no
+   * serverToken/fromEmail) are org-level problems, not contact bounces, so they
+   * do NOT emit. Optional — only the worker wires `emitMessageFailed`.
+   */
+  onPermanentFailure?: (params: EmitMessageFailedParams) => void;
 }
 
 /**
@@ -58,7 +67,7 @@ export async function sendViaPostmark(
   config: EmailConfig,
   secrets: EmailSecrets,
   inReplyToMessageId: string | null,
-  { db, log }: SendDeps,
+  { db, log, onPermanentFailure }: SendDeps,
 ): Promise<void> {
   // Idempotency guard: if message was already delivered or marked as permanently failed,
   // skip — protects against BullMQ retry replay AND queue-replay-after-removeOnComplete.
@@ -166,13 +175,20 @@ export async function sendViaPostmark(
       { inboxId: input.inboxId, status: res.status, data },
       'email.send: postmark 4xx (permanent)',
     );
+    const failedAt = new Date();
+    const failureReason = data.Message ?? `postmark ${res.status}`;
     await db
       .update(schema.messages)
-      .set({
-        failedAt: new Date(),
-        failureReason: data.Message ?? `postmark ${res.status}`,
-      })
+      .set({ failedAt, failureReason })
       .where(eq(schema.messages.id, input.messageId));
+    onPermanentFailure?.({
+      messageId: input.messageId,
+      conversationId: input.conversationId,
+      inboxId: input.inboxId,
+      channel: 'email',
+      failureReason,
+      failedAt,
+    });
     return;
   }
   // 5xx = transient → throw so BullMQ retries.
@@ -196,6 +212,11 @@ export interface DispatchEmailDeps {
    * Redis SETNX lock and DB rotation stay encapsulated there.
    */
   getGmailAccessToken?: () => Promise<string>;
+  /**
+   * [marketing-T-10] Forwarded to the Postmark path so a 4xx bounce emits
+   * `message.failed` to Atlas (D11). Gmail path is out of this round's scope.
+   */
+  onPermanentFailure?: (params: EmitMessageFailedParams) => void;
 }
 
 function readProvider(raw: unknown): string | undefined {
@@ -239,7 +260,11 @@ export async function dispatchEmailSend(
   const config = parseEmailConfig(rawConfig);
   const secrets = parseEmailSecrets(rawSecrets);
   const send = deps.sendPostmarkImpl ?? sendViaPostmark;
-  return send(input, config, secrets, inReplyToMessageId, { db: deps.db, log: deps.log });
+  return send(input, config, secrets, inReplyToMessageId, {
+    db: deps.db,
+    log: deps.log,
+    ...(deps.onPermanentFailure ? { onPermanentFailure: deps.onPermanentFailure } : {}),
+  });
 }
 
 /**

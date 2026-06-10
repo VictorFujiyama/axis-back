@@ -412,16 +412,18 @@ function mapLegacyEvent(event: RealtimeEvent): LegacyMappedJob | null {
  * `failed` handler (the message is ALREADY marked failed; a bounce-notify miss
  * is recoverable, a thrown error in the handler is not). Logs warn and returns.
  */
+export interface EmitMessageFailedParams {
+  messageId: string;
+  conversationId: string;
+  inboxId: string;
+  channel: string;
+  failureReason: string;
+  failedAt: Date;
+}
+
 export async function emitMessageFailed(
   app: FastifyInstance,
-  params: {
-    messageId: string;
-    conversationId: string;
-    inboxId: string;
-    channel: string;
-    failureReason: string;
-    failedAt: Date;
-  },
+  params: EmitMessageFailedParams,
 ): Promise<void> {
   // ATLAS_URL is the connector master switch — without it there is no Atlas to
   // emit to (and `getConnectorForAccount` would throw). Quiet no-op when off.

@@ -3,6 +3,7 @@ import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { schema, type DB } from '@blossom/db';
 import { config as appConfig } from '../../config';
+import type { EmitMessageFailedParams } from '../atlas-events/enqueue';
 
 const WhatsAppSecretsSchema = z
   .object({ authToken: z.string().min(1).optional() })
@@ -45,6 +46,15 @@ export interface SendWhatsAppInput {
 interface SendDeps {
   db: DB;
   log: FastifyBaseLogger;
+  /**
+   * [marketing-T-10] Notify Atlas (spec D11) when the provider permanently
+   * rejects the send with a 4xx — the connector handler suppresses the contact
+   * (bounce/complaint, D12). Only the genuine provider-rejection path fires this;
+   * config-missing pre-flight failures (no authToken/accountSid/fromNumber) are
+   * org-level problems, NOT contact bounces, so they do NOT emit. Optional — unit
+   * tests and non-worker callers omit it. Production wires `emitMessageFailed`.
+   */
+  onPermanentFailure?: (params: EmitMessageFailedParams) => void;
 }
 
 /** Normalize phone into Twilio's `whatsapp:+E164` format. Accepts already-prefixed. */
@@ -68,7 +78,7 @@ export async function sendOutboundWhatsApp(
   config: WhatsAppConfig,
   secrets: WhatsAppSecrets,
   statusCallbackUrl: string | null,
-  { db, log }: SendDeps,
+  { db, log, onPermanentFailure }: SendDeps,
 ): Promise<void> {
   const [existing] = await db
     .select({
@@ -190,13 +200,20 @@ export async function sendOutboundWhatsApp(
       { inboxId: input.inboxId, status: res.status, twilioCode: data.code, twilioMessage: data.message },
       'whatsapp.send: twilio 4xx (permanent)',
     );
+    const failedAt = new Date();
+    const failureReason = data.message ?? `twilio ${res.status}`;
     await db
       .update(schema.messages)
-      .set({
-        failedAt: new Date(),
-        failureReason: data.message ?? `twilio ${res.status}`,
-      })
+      .set({ failedAt, failureReason })
       .where(eq(schema.messages.id, input.messageId));
+    onPermanentFailure?.({
+      messageId: input.messageId,
+      conversationId: input.conversationId,
+      inboxId: input.inboxId,
+      channel: 'whatsapp',
+      failureReason,
+      failedAt,
+    });
     return;
   }
   log.warn(

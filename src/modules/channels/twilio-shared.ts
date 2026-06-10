@@ -3,6 +3,7 @@ import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { schema, type DB } from '@blossom/db';
 import { config as appConfig } from '../../config';
+import type { EmitMessageFailedParams } from '../atlas-events/enqueue';
 
 /**
  * Shared Twilio send for WhatsApp/Instagram/Messenger. Twilio's REST accepts
@@ -38,6 +39,13 @@ export interface SendTwilioInput {
 interface SendDeps {
   db: DB;
   log: FastifyBaseLogger;
+  /**
+   * [marketing-T-10] Notify Atlas (spec D11) on a provider 4xx permanent reject
+   * so the connector suppresses the contact (D12). `channel` carries the Twilio
+   * `prefix` (instagram/messenger/whatsapp). Config-missing pre-flight failures
+   * do NOT emit (org-level, not a contact bounce). Optional — only worker wires.
+   */
+  onPermanentFailure?: (params: EmitMessageFailedParams) => void;
 }
 
 function toTwilioAddress(prefix: string, value: string): string {
@@ -57,7 +65,7 @@ export async function sendOutboundTwilio(
   config: TwilioConfig,
   secrets: TwilioSecrets,
   statusCallbackUrl: string | null,
-  { db, log }: SendDeps,
+  { db, log, onPermanentFailure }: SendDeps,
 ): Promise<void> {
   const [existing] = await db
     .select({
@@ -140,10 +148,20 @@ export async function sendOutboundTwilio(
       { inboxId: input.inboxId, prefix, status: res.status, twilioCode: data.code, twilioMessage: data.message },
       'twilio.send: 4xx (permanent)',
     );
+    const failedAt = new Date();
+    const failureReason = data.message ?? `twilio ${res.status}`;
     await db
       .update(schema.messages)
-      .set({ failedAt: new Date(), failureReason: data.message ?? `twilio ${res.status}` })
+      .set({ failedAt, failureReason })
       .where(eq(schema.messages.id, input.messageId));
+    onPermanentFailure?.({
+      messageId: input.messageId,
+      conversationId: input.conversationId,
+      inboxId: input.inboxId,
+      channel: prefix,
+      failureReason,
+      failedAt,
+    });
     return;
   }
   throw new Error(`twilio ${res.status}: ${data.message ?? 'server error'}`);

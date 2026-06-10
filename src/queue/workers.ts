@@ -165,6 +165,11 @@ export function registerWorkers(app: FastifyInstance): void {
           db: app.db,
           log: app.log,
           getGmailAccessToken: () => getValidAccessToken(app, inbox),
+          // [marketing-T-10] Postmark 4xx bounce → tell Atlas (D11). The sender's
+          // permanent-fail path returns normally (no throw), so the
+          // markFailedOnExhaust `failed` handler never fires for it — this is the
+          // emit site for in-sender permanent failures.
+          onPermanentFailure: (p) => void emitMessageFailed(app, p),
         },
       );
     },
@@ -208,7 +213,11 @@ export function registerWorkers(app: FastifyInstance): void {
         cfg,
         secrets,
         statusCallbackUrl,
-        { db: app.db, log: app.log },
+        {
+          db: app.db,
+          log: app.log,
+          onPermanentFailure: (p) => void emitMessageFailed(app, p),
+        },
       );
     },
     5,
@@ -295,7 +304,11 @@ export function registerWorkers(app: FastifyInstance): void {
           cfg,
           secrets,
           statusCallbackUrl,
-          { db: app.db, log: app.log },
+          {
+            db: app.db,
+            log: app.log,
+            onPermanentFailure: (p) => void emitMessageFailed(app, p),
+          },
         );
       },
       5,
