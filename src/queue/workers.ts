@@ -31,7 +31,7 @@ import {
   sendOutboundTwilio,
 } from '../modules/channels/twilio-shared';
 import { registerGmailSyncWorker } from './workers/gmail-sync';
-import { subscribeAtlasEvents } from '../modules/atlas-events/enqueue';
+import { subscribeAtlasEvents, emitMessageFailed } from '../modules/atlas-events/enqueue';
 import { registerAtlasEventsWorker } from '../modules/atlas-events/worker';
 import { registerBotOutboundHook } from '../modules/bots/outbound-hook';
 import { config as appConfig } from '../config';
@@ -75,6 +75,18 @@ function markFailedOnExhaust<T extends { messageId: string; conversationId: stri
           conversationId: job.data.conversationId,
           messageId: job.data.messageId,
           changes: { failedAt, failureReason },
+        });
+        // [marketing-T-09] Tell Atlas the send permanently failed (spec D11) so
+        // its connector handler can suppress the contact (bounce/complaint, D12).
+        // Fire-and-forget + fail-open inside emitMessageFailed — must not affect
+        // the failed-marking above.
+        void emitMessageFailed(app, {
+          messageId: job.data.messageId,
+          conversationId: job.data.conversationId,
+          inboxId: job.data.inboxId,
+          channel: label,
+          failureReason,
+          failedAt,
         });
       })
       .catch((e) => {

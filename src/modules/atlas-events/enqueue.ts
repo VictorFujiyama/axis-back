@@ -18,6 +18,7 @@ import {
   buildContactEvent,
   buildLeadQualifiedEnvelope,
   buildConversationTaggedEnvelope,
+  buildMessageFailedEnvelope,
 } from './build-connector-event';
 import { getConnectorForAccount } from './connector';
 import { getConnection } from './connections';
@@ -395,4 +396,80 @@ function mapLegacyEvent(event: RealtimeEvent): LegacyMappedJob | null {
   }
 
   return null;
+}
+
+/**
+ * [marketing-T-09] Emit a `message.failed` connector event when an outbound send
+ * permanently fails (spec D11). Unlike the five eventBus-driven envelopes, this
+ * one is emitted imperatively from the failure site (worker `failed` handler in
+ * T-09, sender permanent-fail paths in T-10) — there is no RealtimeEvent for a
+ * send failure. It still rides the SAME per-account connector pipeline as the
+ * others (resolve account → connection → connector → `.emit()`), so anti-leak
+ * (only accounts WITH a connection emit) and idempotency (`event_id`) hold.
+ *
+ * Fail-open: the whole body is wrapped — a missing connection, an unset
+ * `ATLAS_URL`, or an emit error must never bubble back into the worker's
+ * `failed` handler (the message is ALREADY marked failed; a bounce-notify miss
+ * is recoverable, a thrown error in the handler is not). Logs warn and returns.
+ */
+export async function emitMessageFailed(
+  app: FastifyInstance,
+  params: {
+    messageId: string;
+    conversationId: string;
+    inboxId: string;
+    channel: string;
+    failureReason: string;
+    failedAt: Date;
+  },
+): Promise<void> {
+  // ATLAS_URL is the connector master switch — without it there is no Atlas to
+  // emit to (and `getConnectorForAccount` would throw). Quiet no-op when off.
+  if (!config.ATLAS_URL) return;
+
+  try {
+    const [inbox] = await app.db
+      .select({ accountId: schema.inboxes.accountId })
+      .from(schema.inboxes)
+      .where(eq(schema.inboxes.id, params.inboxId))
+      .limit(1);
+    const accountId = inbox?.accountId;
+    if (!accountId) return;
+
+    const conn = await getConnection(app.db, accountId);
+    if (!conn) return; // no connection for this account → never emit (anti-leak)
+
+    const connector = await getConnectorForAccount(app, accountId);
+    if (!connector) return; // defensive: connection vanished between the two reads
+
+    // Carry the Atlas journey-run origin (D13) when the message was sent by a
+    // journey — `upsert_and_send` stamps `atlas_journey_run_id` on the metadata.
+    const [msg] = await app.db
+      .select({ metadata: schema.messages.metadata })
+      .from(schema.messages)
+      .where(eq(schema.messages.id, params.messageId))
+      .limit(1);
+    const meta = (msg?.metadata ?? {}) as Record<string, unknown>;
+    const sentByJourneyRunId =
+      typeof meta['atlas_journey_run_id'] === 'string'
+        ? (meta['atlas_journey_run_id'] as string)
+        : undefined;
+
+    const envelope = buildMessageFailedEnvelope({
+      orgId: conn.atlasOrgId,
+      accountId,
+      conversationId: params.conversationId,
+      messageId: params.messageId,
+      channel: params.channel,
+      failureReason: params.failureReason,
+      failedAt: params.failedAt,
+      ...(sentByJourneyRunId ? { sentByJourneyRunId } : {}),
+    });
+    await connector.emit(envelope);
+  } catch (err) {
+    app.log.warn(
+      { err, messageId: params.messageId },
+      'atlas-events: message.failed emit failed',
+    );
+  }
 }

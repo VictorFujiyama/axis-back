@@ -11,6 +11,10 @@ import {
   parseConversationTaggedPayload,
   type ConversationTaggedActor,
 } from './conversation-tagged';
+import {
+  MESSAGE_FAILED_KIND,
+  parseMessageFailedPayload,
+} from './message-failed';
 
 /**
  * Phase 12.2 Connector Bridge — `ConnectorEvent` builders (the cutover wire
@@ -528,5 +532,65 @@ export async function buildContactEvent(
     participants: [],
     summary: c.name ?? c.phone ?? c.email ?? 'Unnamed contact',
     metadata: { accountId: c.accountId },
+  });
+}
+
+/** `message.failed` — an outbound send permanently failed (4xx) or exhausted its
+ * retries (5xx). Built from the worker `failed` handler / sender permanent-fail
+ * paths (spec D11) — a PURE builder (no DB reads): every field the Atlas-side
+ * handler needs is already in hand at the failure site (job data + the failure),
+ * so there is nothing to load.
+ *
+ * The typed payload (MessageFailedPayloadSchema) is parked under
+ * `metadata.message_failed`, mirroring `lead_qualified` / `conversation_tagged`
+ * (the envelope `kind` is an open string, `metadata` is free-form — spec §12.1.01).
+ *
+ * `event_id=msg_<id>:failed` — keyed on the message id so a re-emit (retry,
+ * dual-run) dedupes on `(source_app, event_id)`; one message fails at most once.
+ * `occurred_at == failedAt` (NOT the emit time) so Atlas-side telemetry (D13)
+ * timestamps the actual failure, not when this envelope happened to be built. */
+export function buildMessageFailedEnvelope(input: {
+  orgId: string;
+  /** axis account the message belongs to — rides the metadata for parity with siblings. */
+  accountId?: string;
+  conversationId: string;
+  messageId: string;
+  channel: string;
+  failureReason: string;
+  /** When the failure was marked — Date or ISO 8601 with offset. */
+  failedAt: Date | string;
+  /** Present when the send originated from an Atlas journey (D13). */
+  sentByJourneyRunId?: string;
+}): ConnectorEvent {
+  const failedAtIso =
+    input.failedAt instanceof Date ? input.failedAt.toISOString() : input.failedAt;
+
+  const payloadResult = parseMessageFailedPayload({
+    messageId: input.messageId,
+    conversationId: input.conversationId,
+    channel: input.channel,
+    failureReason: input.failureReason,
+    failedAt: failedAtIso,
+    ...(input.sentByJourneyRunId ? { sentByJourneyRunId: input.sentByJourneyRunId } : {}),
+  });
+  if (!payloadResult.ok) {
+    throw new Error(
+      `build-connector-event: invalid message_failed payload: ${JSON.stringify(payloadResult.error.issues)}`,
+    );
+  }
+
+  return validateConnectorEvent({
+    ...connectorBase(failedAtIso, input.orgId),
+    event_id: `msg_${input.messageId}:failed`,
+    kind: MESSAGE_FAILED_KIND,
+    action: 'update',
+    source_ref: { id: input.messageId, parent_id: input.conversationId },
+    actors: [],
+    participants: [],
+    summary: `Message failed (${input.channel}): ${input.failureReason}`.slice(0, SUMMARY_CAP),
+    metadata: {
+      ...(input.accountId ? { accountId: input.accountId } : {}),
+      message_failed: payloadResult.payload,
+    },
   });
 }
