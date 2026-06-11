@@ -231,7 +231,7 @@ describe('GET /api/v1/oauth/google/callback — state validation (T-17)', () => 
       expect(typeof location).toBe('string');
       const url = new URL(location as string);
       expect(`${url.origin}${url.pathname}`).toBe(
-        'https://axis.example.com/settings/inboxes/oauth/callback',
+        'https://axis.example.com/oauth/callback',
       );
       expect(url.searchParams.get('error')).toBe('access_denied');
     } finally {
@@ -904,7 +904,7 @@ describe('GET /api/v1/oauth/google/callback — front success redirect (T-21)', 
       expect(typeof location).toBe('string');
       const url = new URL(location as string);
       expect(`${url.origin}${url.pathname}`).toBe(
-        'https://axis.example.com/settings/inboxes/oauth/callback',
+        'https://axis.example.com/oauth/callback',
       );
       expect(url.searchParams.get('ok')).toBe('1');
       expect(url.searchParams.get('inboxId')).toBe(insertedRow.id);
@@ -950,7 +950,7 @@ describe('GET /api/v1/oauth/google/callback — front success redirect (T-21)', 
       expect(res.statusCode).toBe(302);
       const url = new URL(res.headers.location as string);
       expect(`${url.origin}${url.pathname}`).toBe(
-        'https://axis.example.com/settings/inboxes/oauth/callback',
+        'https://axis.example.com/oauth/callback',
       );
       expect(url.searchParams.get('ok')).toBe('1');
       expect(url.searchParams.get('inboxId')).toBe(stateInboxId);
@@ -982,10 +982,10 @@ describe('GET /api/v1/oauth/google/callback — front success redirect (T-21)', 
       });
       expect(res.statusCode).toBe(302);
       const location = res.headers.location as string;
-      // Must not produce `//settings` even when FRONT_URL has a trailing path.
-      expect(location).not.toContain('//settings');
+      // Must not produce `//oauth` even when FRONT_URL has a trailing path.
+      expect(location).not.toContain('//oauth');
       expect(location).toContain(
-        'https://axis.example.com/app/settings/inboxes/oauth/callback',
+        'https://axis.example.com/app/oauth/callback',
       );
     } finally {
       await app.close();

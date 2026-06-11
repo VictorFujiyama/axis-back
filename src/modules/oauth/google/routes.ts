@@ -150,7 +150,7 @@ export async function googleOAuthRoutes(
     if (error) {
       const params = new URLSearchParams({ error });
       return reply.redirect(
-        `${config.FRONT_URL}/settings/inboxes/oauth/callback?${params.toString()}`,
+        `${config.FRONT_URL}/oauth/callback?${params.toString()}`,
         302,
       );
     }
@@ -343,7 +343,9 @@ function buildSuccessRedirect(inboxId: string): string {
   // like `https://app.example.com/` doesn't produce a double slash.
   const base = config.FRONT_URL!.replace(/\/$/, '');
   const params = new URLSearchParams({ ok: '1', inboxId });
-  return `${base}/settings/inboxes/oauth/callback?${params.toString()}`;
+  // Rota standalone fora de (dashboard) — AuthProvider não trava o render
+  // na popup top-level (storage particionado faz user=null infinito senão).
+  return `${base}/oauth/callback?${params.toString()}`;
 }
 
 async function scheduleGmailSync(
