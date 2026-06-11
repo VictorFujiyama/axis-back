@@ -1004,7 +1004,7 @@ describe('GET /api/v1/oauth/google/callback — schedule gmail-sync (T-41)', () 
     vi.resetModules();
   });
 
-  it('create branch: upserts a 60s repeating gmail-sync job keyed by gmail-sync:<inboxId>', async () => {
+  it('create branch: upserts a 10min repeating gmail-sync job keyed by gmail-sync:<inboxId>__v2', async () => {
     const exchangeCodeImpl = vi.fn<ExchangeCodeImpl>().mockResolvedValue({
       refreshToken: '1//rt',
       accessToken: 'ya29.at',
@@ -1031,12 +1031,14 @@ describe('GET /api/v1/oauth/google/callback — schedule gmail-sync (T-41)', () 
       expect(queues.getQueue).toHaveBeenCalledTimes(1);
       expect(queues.getQueue).toHaveBeenCalledWith('gmail-sync');
 
-      // Scheduler keyed per inbox, repeats every 60s, carries inboxId payload.
+      // Scheduler keyed per inbox, repeats every 10min, carries inboxId payload.
+      // Push notifications via Pub/Sub é o caminho rápido; polling de 10min
+      // é safety net pra push perdido.
       expect(queues.add).toHaveBeenCalledTimes(1);
       expect(queues.add).toHaveBeenCalledWith(
         'sync',
         { inboxId: insertedRow.id },
-        { repeat: { every: 60_000, key: `gmail-sync__${insertedRow.id}` } },
+        { repeat: { every: 600_000, key: `gmail-sync__${insertedRow.id}__v2` } },
       );
     } finally {
       await app.close();
@@ -1087,7 +1089,7 @@ describe('GET /api/v1/oauth/google/callback — schedule gmail-sync (T-41)', () 
       expect(queues.add).toHaveBeenCalledWith(
         'sync',
         { inboxId: stateInboxId },
-        { repeat: { every: 60_000, key: `gmail-sync__${stateInboxId}` } },
+        { repeat: { every: 600_000, key: `gmail-sync__${stateInboxId}__v2` } },
       );
     } finally {
       await app.close();

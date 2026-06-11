@@ -228,6 +228,7 @@ export async function googleOAuthRoutes(
         .where(eq(schema.inboxes.id, payload.inboxId));
 
       await scheduleGmailSync(app, payload.inboxId);
+      await trySetupGmailWatch(app, payload.inboxId);
       return reply.redirect(buildSuccessRedirect(payload.inboxId), 302);
     }
 
@@ -254,6 +255,7 @@ export async function googleOAuthRoutes(
     }
 
     await scheduleGmailSync(app, created.id);
+    await trySetupGmailWatch(app, created.id);
     return reply.redirect(buildSuccessRedirect(created.id), 302);
   });
 
@@ -348,22 +350,57 @@ function buildSuccessRedirect(inboxId: string): string {
   return `${base}/oauth/callback?${params.toString()}`;
 }
 
+/**
+ * Best-effort: registra `users.watch()` na Gmail API pra que o Gmail publique
+ * push notifications no nosso Pub/Sub topic. Falha (sem env, sem topic, HTTP
+ * error) é loggada como warn mas NÃO bloqueia o OAuth flow — polling de 10min
+ * cobre.
+ */
+async function trySetupGmailWatch(
+  app: FastifyInstance,
+  inboxId: string,
+): Promise<void> {
+  if (!config.GMAIL_PUBSUB_TOPIC) return; // push não configurado, skip silent
+  try {
+    const [row] = await app.db
+      .select()
+      .from(schema.inboxes)
+      .where(eq(schema.inboxes.id, inboxId))
+      .limit(1);
+    if (!row) return;
+    const { setupGmailWatch } = await import('../../channels/gmail-watch.js');
+    await setupGmailWatch(app, row);
+  } catch (err) {
+    app.log.warn(
+      { inboxId, err: (err as Error).message },
+      'gmail-push: setupGmailWatch failed, polling continues',
+    );
+  }
+}
+
 async function scheduleGmailSync(
   app: FastifyInstance,
   inboxId: string,
 ): Promise<void> {
-  // Legacy repeatable-jobs API (queue.add with `repeat`). Switched away from
-  // upsertJobScheduler after observing it silently fail to persist on Render
-  // Key Value (jobs never fired for newly-created inboxes). The `key` is the
-  // dedup hash — calling this on create + reauth for the same inbox is a
-  // no-op the second time. Repeats every 60s per spec § "Sync worker".
+  // Polling fallback. Quando Pub/Sub Push está configurado (GMAIL_PUBSUB_TOPIC
+  // setado + setupGmailWatch OK), o caminho rápido é a notification — esse
+  // repeatable só pega push perdido (Pub/Sub é at-least-once, mas perde em
+  // edge cases tipo subscription expirada antes da renovação). Roda 10min.
+  //
+  // Sem push configurado, é o único caminho — ainda 10min pra evitar quota
+  // Gmail API alta (250 quota/seg conta normal, mas messages.list = 5 quotas
+  // × cada inbox × cada tick). Em uso real, 10min é confortável.
+  //
   // BullMQ rejects ":" in repeat.key (treated as a custom id, which uses
   // ":" as a Redis key separator internally). Use "__" as the separator.
+  // Versionamos o key (`v2`) pra forçar re-add quando mudamos periodicidade —
+  // o velho `gmail-sync__<id>` (60s) continua existindo até alguém remove.
+  // Cleanup automático: gmail-sync worker pula se inbox.deletedAt set.
   await app.queues.getQueue<GmailSyncJob>(QUEUE_NAMES.GMAIL_SYNC).add(
     'sync',
     { inboxId },
     {
-      repeat: { every: 60_000, key: `gmail-sync__${inboxId}` },
+      repeat: { every: 600_000, key: `gmail-sync__${inboxId}__v2` },
     },
   );
 }

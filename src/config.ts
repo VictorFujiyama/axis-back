@@ -54,6 +54,19 @@ const envSchema = z.object({
   GOOGLE_OAUTH_CLIENT_ID: z.string().optional(),
   GOOGLE_OAUTH_CLIENT_SECRET: z.string().optional(),
   GOOGLE_OAUTH_REDIRECT_URI: z.string().url().optional(),
+  // Gmail Push Notifications via Cloud Pub/Sub. When set, OAuth callback
+  // chama `users.watch({topicName})` registrando push pra esta inbox; o
+  // endpoint POST /api/v1/webhooks/gmail-push valida o JWT OIDC enviado
+  // pelo Pub/Sub e enfileira gmail-sync imediato. Sem essas vars, push
+  // não ativa e polling de 60s continua sendo o único caminho.
+  // - GCP_PROJECT_ID: project que hospeda o topic (mesmo do OAuth)
+  // - GMAIL_PUBSUB_TOPIC: full path `projects/<id>/topics/<name>`
+  // - GMAIL_PUBSUB_AUDIENCE: URL exata do endpoint webhook (audience
+  //   claim do JWT enviado pelo Pub/Sub). Tem que bater EXATAMENTE com
+  //   o que está configurado na subscription Push do lado GCP.
+  GCP_PROJECT_ID: z.string().optional(),
+  GMAIL_PUBSUB_TOPIC: z.string().optional(),
+  GMAIL_PUBSUB_AUDIENCE: z.string().url().optional(),
   // Public base URL of the frontend — used by the OAuth callback to redirect
   // the user back into the app after Google consent. Required for /oauth/google/*.
   FRONT_URL: z.string().url().optional(),

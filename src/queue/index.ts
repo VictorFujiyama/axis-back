@@ -35,6 +35,7 @@ export const QUEUE_NAMES = {
   CAMPAIGN_SEND: 'campaign-send',
   MEDIA_MIRROR: 'media-mirror',
   GMAIL_SYNC: 'gmail-sync',
+  GMAIL_WATCH_RENEW: 'gmail-watch-renew',
   ATLAS_EVENTS: 'atlas-events',
 } as const;
 

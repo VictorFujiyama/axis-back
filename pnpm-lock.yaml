@@ -83,6 +83,9 @@ importers:
       ioredis:
         specifier: ^5.4.1
         version: 5.10.1
+      jose:
+        specifier: ^6.2.3
+        version: 6.2.3
       nodemailer:
         specifier: ^8.0.5
         version: 8.0.5

@@ -31,6 +31,7 @@ import {
   sendOutboundTwilio,
 } from '../modules/channels/twilio-shared';
 import { registerGmailSyncWorker } from './workers/gmail-sync';
+import { registerGmailWatchRenewWorker } from './workers/gmail-watch-renew-register';
 import { subscribeAtlasEvents, emitMessageFailed } from '../modules/atlas-events/enqueue';
 import { registerAtlasEventsWorker } from '../modules/atlas-events/worker';
 import { registerBotOutboundHook } from '../modules/bots/outbound-hook';
@@ -416,6 +417,7 @@ export function registerWorkers(app: FastifyInstance): void {
   registerWebhookWorker(app);
   registerCampaignWorkers(app);
   registerGmailSyncWorker(app);
+  registerGmailWatchRenewWorker(app);
   subscribeAtlasEvents(app);
   registerAtlasEventsWorker(app);
   registerBotOutboundHook(app);
