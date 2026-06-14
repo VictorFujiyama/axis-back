@@ -242,6 +242,10 @@ export async function googleOAuthRoutes(
           gmailEmail: userInfo.email,
           gmailHistoryId: null,
           needsReauth: false,
+          // Phase 13 — new Gmail inboxes start with the safe defaults so the
+          // worker enforces the cap immediately. UI lets the user retune.
+          dailySendCap: 50,
+          timezone: 'America/Sao_Paulo',
         },
         secrets,
       })

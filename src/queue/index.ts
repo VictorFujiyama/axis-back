@@ -62,6 +62,11 @@ export interface EmailOutboundJob {
   subject: string;
   text: string;
   inReplyToMessageId: string | null;
+  /** 'atlas-journey' | 'manual' — manual blocks on over-cap, journey delays. */
+  source?: 'atlas-journey' | 'manual';
+  /** UTC ms of the moment cap was first reserved. releaseForInbox needs the
+   *  ORIGINAL day's counter (cross-day reserve→release would leak otherwise). */
+  reservedAtMs?: number;
 }
 
 export interface WebhookDeliveryJob {

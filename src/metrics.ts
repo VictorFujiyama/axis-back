@@ -81,10 +81,38 @@ export const botAutoDisabledTotal = new Counter(
   'Total builtin bots auto-disabled by applyAutoBotForInbox.',
 );
 
+// --- Phase 13 daily-send-cap (R1.5) ---
+
+export const inboxSendCountTotal = new Counter(
+  'inbox_send_count_total',
+  'Total Gmail sends accounted for the daily-cap counter (across all inboxes).',
+);
+export const inboxOvercapTotal = new Counter(
+  'inbox_overcap_total',
+  'Total Gmail send attempts blocked or delayed by the daily cap.',
+);
+export const inboxPausedTotal = new Counter(
+  'inbox_paused_total',
+  'Total times an inbox transitioned to paused (cap=0 / needs-reauth / manual).',
+);
+export const inboxReleaseTotal = new Counter(
+  'inbox_release_total',
+  'Total slot releases on Gmail inbox-level errors (401/403/429) or cancel.',
+);
+export const inboxPromoteTotal = new Counter(
+  'inbox_promote_total',
+  'Total backlog jobs promoted on cap-up or reauth.',
+);
+
 const registry: Array<Counter | Gauge> = [
   activeInboxesGauge,
   botAutoCreatedTotal,
   botAutoDisabledTotal,
+  inboxSendCountTotal,
+  inboxOvercapTotal,
+  inboxPausedTotal,
+  inboxReleaseTotal,
+  inboxPromoteTotal,
 ];
 
 /** Render all registered metrics in Prometheus text exposition format. */

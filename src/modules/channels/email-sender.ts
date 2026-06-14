@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { schema, type DB } from '@blossom/db';
 import { eventBus } from '../../realtime/event-bus.js';
 import { parseGmailConfig } from './gmail-config.js';
-import { sendViaGmail } from './gmail-sender.js';
+import { sendViaGmail, type GmailSendOutcome } from './gmail-sender.js';
 import type { EmitMessageFailedParams } from '../atlas-events/enqueue';
 
 const EmailSecretsSchema = z
@@ -217,6 +217,11 @@ export interface DispatchEmailDeps {
    * `message.failed` to Atlas (D11). Gmail path is out of this round's scope.
    */
   onPermanentFailure?: (params: EmitMessageFailedParams) => void;
+  /**
+   * Gmail-only: classifies the terminal Gmail HTTP outcome so the worker
+   * can release / pause the per-inbox daily-cap counter.
+   */
+  onGmailSendResult?: (outcome: GmailSendOutcome) => Promise<void> | void;
 }
 
 function readProvider(raw: unknown): string | undefined {
@@ -254,6 +259,7 @@ export async function dispatchEmailSend(
       db: deps.db,
       log: deps.log,
       getAccessToken: deps.getGmailAccessToken,
+      ...(deps.onGmailSendResult ? { onSendResult: deps.onGmailSendResult } : {}),
     });
   }
 

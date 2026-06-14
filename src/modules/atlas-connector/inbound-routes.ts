@@ -3,6 +3,7 @@ import { AtlasSubscriber, type ConnectorEvent } from '@atlas/connectors';
 import { schema } from '@blossom/db';
 import { config } from '../../config';
 import { getConnectionByOrg } from '../atlas-events/connections';
+import { handleJourneyCancelled, JOURNEY_CANCELLED_KIND } from './cancel-backlog';
 
 /**
  * Phase 12.2 — inbound push route (`POST /atlas-events`, Berg doc Phase 4d).
@@ -65,7 +66,10 @@ export async function atlasInboundRoutes(app: FastifyInstance): Promise<void> {
 
   // Shared dispatch hook — persists one activity row per verified event. The
   // org context comes off the (verified) envelope, so the same closure serves
-  // every org's subscriber.
+  // every org's subscriber. Phase 13 also routes `journey_cancelled` to the
+  // backlog-cancel handler so a paused/archived/deleted journey drops its
+  // daily-cap delayed jobs at axis-back. Activity row is persisted regardless,
+  // for traceability — handler errors are LOGGED and swallowed.
   const onAtlasActivity = async (event: ConnectorEvent): Promise<void> => {
     await app.db
       .insert(schema.atlasActivity)
@@ -77,6 +81,17 @@ export async function atlasInboundRoutes(app: FastifyInstance): Promise<void> {
         envelope: event as unknown as Record<string, unknown>,
       })
       .onConflictDoNothing({ target: schema.atlasActivity.eventId });
+
+    if (event.kind === JOURNEY_CANCELLED_KIND) {
+      try {
+        await handleJourneyCancelled(app, event);
+      } catch (err) {
+        app.log.warn(
+          { err, eventId: event.event_id },
+          'atlas-events: journey_cancelled handler failed',
+        );
+      }
+    }
   };
 
   // Plugin-scoped raw-body capture (see header comment): stash the signed

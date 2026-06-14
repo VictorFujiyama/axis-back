@@ -6,6 +6,16 @@ import type { ChannelType } from '@blossom/shared-types';
 import { config } from '../../config';
 import { decryptJSON } from '../../crypto';
 import { isInboxConfigured } from '../channels/configured-check';
+import {
+  effectiveDailySendCap,
+  effectiveTimezone,
+  parseGmailConfig,
+} from '../channels/gmail-config';
+import {
+  currentSendCount,
+  computeDelayMs,
+} from '../channels/inbox-send-cap';
+import type Redis from 'ioredis';
 import { emitConversationTagged } from '../atlas-events/tagged-trigger';
 import { eventBus } from '../../realtime/event-bus';
 import { getOrCreateAtlasBotUser } from './atlas-bot';
@@ -1301,6 +1311,11 @@ export const upsertAndSendInputSchema = z
       .object({
         atlasJourneyRunId: z.string().min(1),
         atlasNodeId: z.string().min(1),
+        /** PK of the journey_node_runs row Atlas inserted before dispatching
+         *  this handler call. The `message.sent`/`message.failed` events the
+         *  worker emits carry this back so the Atlas listener can resolve the
+         *  node_run via primary key — no JSON-output match against the run. */
+        atlasNodeRunId: z.string().min(1).optional(),
       })
       .strict(),
   })
@@ -1312,6 +1327,13 @@ export interface UpsertAndSendResult {
   messageId: string;
   createdNewConversation: boolean;
   createdNewContact: boolean;
+  /** When the per-inbox daily-cap pre-check shows the slot would be over-cap,
+   *  the message is still INSERT'd (the worker will move the job to delayed),
+   *  and this flag tells Atlas to park the msg-email node in `waiting` with
+   *  the projected next-midnight `resumeAt`. Best-effort: the cap counter is
+   *  authoritative at worker time, not here. */
+  delayed?: boolean;
+  resumeAt?: string;
 }
 
 /**
@@ -1549,7 +1571,7 @@ async function resolveConversationForUpsert(
  */
 export async function upsertAndSendHandler(
   db: DB,
-  _app: FastifyInstance,
+  app: FastifyInstance,
   input: UpsertAndSendInput,
   ctx: AtlasRequestContext,
 ): Promise<UpsertAndSendResult> {
@@ -1677,6 +1699,9 @@ export async function upsertAndSendHandler(
     atlas_journey_run_id: input.metadata.atlasJourneyRunId,
     atlas_node_id: input.metadata.atlasNodeId,
   };
+  if (input.metadata.atlasNodeRunId) {
+    metadata.atlas_node_run_id = input.metadata.atlasNodeRunId;
+  }
   if (input.message.subject) metadata.subject = input.message.subject;
   if (input.message.templateRef) metadata.template = input.message.templateRef;
 
@@ -1724,5 +1749,32 @@ export async function upsertAndSendHandler(
     meta: { atlasAppUserId: ctx.atlasAppUserId, atlasOrgId: ctx.atlasOrgId },
   });
 
-  return { conversationId, messageId: msg.id, createdNewConversation, createdNewContact };
+  // Cap pre-check (R0.1 / step 6). Best-effort hint to Atlas: when the
+  // per-inbox counter already shows over-cap, the worker WILL move the job to
+  // delayed. We surface that intent synchronously so the msg-email node parks
+  // in `waiting` with an estimated resumeAt instead of waiting for the
+  // message.sent event. The reserve itself is authoritative at worker time
+  // (atomic Lua) — this is purely informational.
+  const gmailConfig = parseGmailConfig(inbox.config);
+  const cap = gmailConfig.provider === 'gmail' ? effectiveDailySendCap(gmailConfig) : null;
+  let delayedHint = false;
+  let resumeAtIso: string | undefined;
+  if (gmailConfig.provider === 'gmail' && cap != null) {
+    const timezone = effectiveTimezone(gmailConfig);
+    const nowMs = Date.now();
+    const sent = await currentSendCount(app.redis as Redis, inbox.id, timezone, nowMs);
+    if (sent >= cap) {
+      delayedHint = true;
+      resumeAtIso = new Date(nowMs + computeDelayMs(timezone, nowMs)).toISOString();
+    }
+  }
+
+  return {
+    conversationId,
+    messageId: msg.id,
+    createdNewConversation,
+    createdNewContact,
+    ...(delayedHint ? { delayed: true } : {}),
+    ...(resumeAtIso ? { resumeAt: resumeAtIso } : {}),
+  };
 }

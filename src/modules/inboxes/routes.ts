@@ -15,6 +15,22 @@ import {
   telegramWebhookUrl,
 } from '../channels/telegram-setup';
 import { setTwilioWebhook, twilioWebhookUrl } from '../channels/twilio-setup';
+import {
+  effectiveDailySendCap,
+  effectiveTimezone,
+  parseGmailConfig,
+} from '../channels/gmail-config';
+import {
+  backlogDepth,
+  currentSendCount,
+  getPauseReason,
+  isInboxPaused,
+  promoteBacklog,
+  resumeInbox,
+} from '../channels/inbox-send-cap';
+import { nextMidnightMs } from '../channels/inbox-cap-time';
+import { inboxPromoteTotal } from '../../metrics';
+import { QUEUE_NAMES, type EmailOutboundJob } from '../../queue';
 
 const channelTypes = [
   'whatsapp',
@@ -578,6 +594,87 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
         { db: app.db, log: app.log },
       );
       return reply.code(204).send();
+    },
+  );
+
+  // Phase 13 — daily-send-cap live status. Used by the inbox settings UI to
+  // show progress, banner state, and backlog depth without reloading config.
+  app.get(
+    '/api/v1/inboxes/:id/today-send-count',
+    { preHandler: app.requireAuth },
+    async (req, reply) => {
+      const { id } = idParams.parse(req.params);
+      const [inbox] = await app.db
+        .select({ id: schema.inboxes.id, config: schema.inboxes.config })
+        .from(schema.inboxes)
+        .where(
+          and(
+            eq(schema.inboxes.id, id),
+            eq(schema.inboxes.accountId, req.user.accountId),
+            isNull(schema.inboxes.deletedAt),
+          ),
+        )
+        .limit(1);
+      if (!inbox) return reply.notFound();
+
+      const cfg = parseGmailConfig(inbox.config);
+      const cap = cfg.provider === 'gmail' ? effectiveDailySendCap(cfg) : null;
+      const tz = effectiveTimezone(cfg);
+      const nowMs = Date.now();
+      const [sent, paused, reason, depth] = await Promise.all([
+        currentSendCount(app.redis, inbox.id, tz, nowMs),
+        isInboxPaused(app.redis, inbox.id),
+        getPauseReason(app.redis, inbox.id),
+        backlogDepth(app.redis, inbox.id),
+      ]);
+      return {
+        sent,
+        cap,
+        timezone: tz,
+        paused,
+        pauseReason: reason,
+        backlogDepth: depth,
+        nextResetAt: cap == null ? null : new Date(nextMidnightMs(tz, nowMs)).toISOString(),
+      };
+    },
+  );
+
+  // Phase 13 — UI signals that cap/tz changed. Lifts paused if cap > 0 and
+  // promotes the backlog with fresh jitter so delayed jobs fire immediately.
+  // Idempotent: re-calling after the backlog drains is a no-op.
+  app.post(
+    '/api/v1/inboxes/:id/cap-changed',
+    { preHandler: app.requireAuth },
+    async (req, reply) => {
+      const { id } = idParams.parse(req.params);
+      const [inbox] = await app.db
+        .select({ id: schema.inboxes.id, config: schema.inboxes.config })
+        .from(schema.inboxes)
+        .where(
+          and(
+            eq(schema.inboxes.id, id),
+            eq(schema.inboxes.accountId, req.user.accountId),
+            isNull(schema.inboxes.deletedAt),
+          ),
+        )
+        .limit(1);
+      if (!inbox) return reply.notFound();
+      const cfg = parseGmailConfig(inbox.config);
+      const cap = cfg.provider === 'gmail' ? effectiveDailySendCap(cfg) : null;
+      if (cap != null && cap > 0) {
+        // Only clear paused when the pause came from cap=0 (or wasn't set).
+        // needs-reauth and manual pauses are NOT lifted by a cap bump — those
+        // require their own action (reauth Gmail; explicit unpause).
+        const reason = await getPauseReason(app.redis, inbox.id);
+        if (reason === null || reason === 'cap-zero') {
+          await resumeInbox(app.redis, inbox.id);
+        }
+        const queue = app.queues.getQueue<EmailOutboundJob>(QUEUE_NAMES.EMAIL_OUTBOUND);
+        const result = await promoteBacklog(app.redis, queue, inbox.id);
+        if (result.promoted > 0) inboxPromoteTotal.inc(result.promoted);
+        return result;
+      }
+      return { promoted: 0, skipped: 0, removed: 0 };
     },
   );
 }

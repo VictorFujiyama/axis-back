@@ -61,6 +61,13 @@ export function composeMimeRfc5322(opts: ComposeMimeOptions): string {
 const GMAIL_SEND_URL = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
 const FETCH_TIMEOUT_MS = 15_000;
 
+export type GmailSendOutcome =
+  | { kind: 'delivered'; httpStatus: 200 }
+  | { kind: 'reauth-required'; httpStatus: 401 }
+  | { kind: 'recipient-rejected'; httpStatus: number; reason: string }
+  | { kind: 'inbox-throttled'; httpStatus: 403 | 429; reason: string }
+  | { kind: 'transient'; httpStatus: number; reason: string };
+
 export interface SendGmailDeps {
   db: DB;
   log: FastifyBaseLogger;
@@ -72,6 +79,13 @@ export interface SendGmailDeps {
   getAccessToken: () => Promise<string>;
   /** Override `fetch` for testing. Defaults to global `fetch`. */
   fetchImpl?: typeof fetch;
+  /**
+   * Called once per terminal Gmail send result so the worker can update Redis
+   * cap state (release / pause / track success). Best-effort: invoked AFTER
+   * DB writes have settled but before the function returns. The 5xx path
+   * throws before invoking (no result to classify yet).
+   */
+  onSendResult?: (outcome: GmailSendOutcome) => Promise<void> | void;
 }
 
 /**
@@ -170,6 +184,7 @@ export async function sendViaGmail(
       messageId: input.messageId,
       changes: { deliveredAt },
     });
+    await deps.onSendResult?.({ kind: 'delivered', httpStatus: 200 });
     return;
   }
 
@@ -195,6 +210,7 @@ export async function sendViaGmail(
       { inboxId: input.inboxId, status: 401 },
       'gmail.send: 401 — needsReauth set, message marked failed',
     );
+    await deps.onSendResult?.({ kind: 'reauth-required', httpStatus: 401 });
     return;
   }
 
@@ -212,6 +228,25 @@ export async function sendViaGmail(
       { inboxId: input.inboxId, status: res.status, data },
       'gmail.send: 4xx (permanent)',
     );
+    // 403 (forbidden — typically inbox-level: scope revoked, quota policy)
+    // and 429 (rate-limited at the project or inbox) consume capacity that
+    // should be returned to the day's bucket — the slot wasn't a real send.
+    // Everything else (400 invalid recipient, 404, …) is a recipient/payload
+    // problem and the slot is consumed legitimately.
+    const isInboxLevel = res.status === 403 || res.status === 429;
+    if (isInboxLevel) {
+      await deps.onSendResult?.({
+        kind: 'inbox-throttled',
+        httpStatus: res.status as 403 | 429,
+        reason,
+      });
+    } else {
+      await deps.onSendResult?.({
+        kind: 'recipient-rejected',
+        httpStatus: res.status,
+        reason,
+      });
+    }
     return;
   }
 

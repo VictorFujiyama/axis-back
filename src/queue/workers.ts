@@ -14,6 +14,23 @@ import { registerCampaignWorkers } from '../modules/campaigns/runner';
 import { deliverBotWebhook } from '../modules/bots/dispatcher-fn';
 import { handleBotFallback } from '../modules/bots/fallback';
 import { dispatchEmailSend } from '../modules/channels/email-sender';
+import {
+  effectiveDailySendCap,
+  effectiveTimezone,
+  parseGmailConfig,
+} from '../modules/channels/gmail-config';
+import {
+  BacklogFullError,
+  computeDelayMs,
+  enforceHardLimitAtWorker,
+  enforceHardLimitForEnqueue,
+  isInboxPaused,
+  pauseInbox,
+  releaseForInbox,
+  reserveForInbox,
+  trackBacklogJob,
+  untrackBacklogJob,
+} from '../modules/channels/inbox-send-cap';
 import { getValidAccessToken } from '../modules/oauth/google/tokens';
 import {
   parseWhatsAppConfig,
@@ -31,7 +48,17 @@ import {
   sendOutboundTwilio,
 } from '../modules/channels/twilio-shared';
 import { registerGmailSyncWorker } from './workers/gmail-sync';
-import { subscribeAtlasEvents, emitMessageFailed } from '../modules/atlas-events/enqueue';
+import {
+  subscribeAtlasEvents,
+  emitMessageFailed,
+  emitMessageSent,
+} from '../modules/atlas-events/enqueue';
+import {
+  inboxOvercapTotal,
+  inboxPausedTotal,
+  inboxReleaseTotal,
+  inboxSendCountTotal,
+} from '../metrics';
 import { registerAtlasEventsWorker } from '../modules/atlas-events/worker';
 import { registerBotOutboundHook } from '../modules/bots/outbound-hook';
 import { config as appConfig } from '../config';
@@ -149,6 +176,115 @@ export function registerWorkers(app: FastifyInstance): void {
           throw err;
         }
       }
+
+      const gmailConfig = parseGmailConfig(inbox.config);
+      const cap = gmailConfig.provider === 'gmail' ? effectiveDailySendCap(gmailConfig) : null;
+      const timezone = effectiveTimezone(gmailConfig);
+      const source = data.source ?? 'manual';
+      const nowMs = Date.now();
+
+      // Cap path only applies to Gmail inboxes with a configured cap. Postmark
+      // and Gmail-without-cap fall straight through to dispatchEmailSend.
+      if (gmailConfig.provider === 'gmail' && cap != null) {
+        // Hard limit (Check 2 of R0.4) — `messages.createdAt` is DB-time.
+        const [msg] = await app.db
+          .select({ createdAt: schema.messages.createdAt })
+          .from(schema.messages)
+          .where(eq(schema.messages.id, data.messageId))
+          .limit(1);
+        if (msg) {
+          try {
+            enforceHardLimitAtWorker(msg.createdAt.getTime(), nowMs);
+          } catch (err) {
+            if (err instanceof BacklogFullError) {
+              const failedAt = new Date();
+              const failureReason = 'backlog hard limit (14d) exceeded';
+              await app.db
+                .update(schema.messages)
+                .set({ failedAt, failureReason })
+                .where(eq(schema.messages.id, data.messageId));
+              await untrackBacklogJob(app.redis, data.inboxId, job.id ?? '');
+              void emitMessageFailed(app, {
+                messageId: data.messageId,
+                conversationId: data.conversationId,
+                inboxId: data.inboxId,
+                channel: 'email',
+                failureReason,
+                failedAt,
+              });
+              return;
+            }
+            throw err;
+          }
+        }
+
+        // Pause check before reserve — paused inbox should never burn slots.
+        // Worker enters with this check on retries too, so a cap-to-0 mid-flight
+        // still parks the in-flight job rather than firing.
+        if (await isInboxPaused(app.redis, data.inboxId)) {
+          // Park indefinitely until resume runs promoteBacklog.
+          await job.moveToDelayed(nowMs + 24 * 60 * 60 * 1000);
+          if (job.id) await trackBacklogJob(app.redis, data.inboxId, job.id);
+          return;
+        }
+
+        const outcome = await reserveForInbox(app.redis, {
+          inboxId: data.inboxId,
+          messageId: data.messageId,
+          cap,
+          timezone,
+          nowMs,
+        });
+        if (outcome === 'paused') {
+          await job.moveToDelayed(nowMs + 24 * 60 * 60 * 1000);
+          if (job.id) await trackBacklogJob(app.redis, data.inboxId, job.id);
+          return;
+        }
+        if (outcome === 'over-cap') {
+          inboxOvercapTotal.inc();
+          if (source === 'manual') {
+            const failedAt = new Date();
+            const failureReason = 'daily cap reached';
+            await app.db
+              .update(schema.messages)
+              .set({ failedAt, failureReason })
+              .where(eq(schema.messages.id, data.messageId));
+            return;
+          }
+          // atlas-journey: park until next local midnight + jitter.
+          const delay = computeDelayMs(timezone, nowMs);
+          // Re-run Check 1 against the projected fire moment.
+          if (msg) {
+            try {
+              enforceHardLimitForEnqueue(msg.createdAt.getTime(), nowMs, delay);
+            } catch (err) {
+              if (err instanceof BacklogFullError) {
+                const failedAt = new Date();
+                const failureReason = 'backlog hard limit (14d) exceeded';
+                await app.db
+                  .update(schema.messages)
+                  .set({ failedAt, failureReason })
+                  .where(eq(schema.messages.id, data.messageId));
+                void emitMessageFailed(app, {
+                  messageId: data.messageId,
+                  conversationId: data.conversationId,
+                  inboxId: data.inboxId,
+                  channel: 'email',
+                  failureReason,
+                  failedAt,
+                });
+                return;
+              }
+              throw err;
+            }
+          }
+          await job.moveToDelayed(nowMs + delay);
+          if (job.id) await trackBacklogJob(app.redis, data.inboxId, job.id);
+          return;
+        }
+        // 'ok' or 'reserved-already' — fall through to send.
+      }
+
       await dispatchEmailSend(
         {
           messageId: data.messageId,
@@ -170,6 +306,71 @@ export function registerWorkers(app: FastifyInstance): void {
           // markFailedOnExhaust `failed` handler never fires for it — this is the
           // emit site for in-sender permanent failures.
           onPermanentFailure: (p) => void emitMessageFailed(app, p),
+          onGmailSendResult: async (outcome) => {
+            // Slot accounting (Gmail with cap only):
+            //  delivered          → keep slot (legit send), untrack from backlog, emit message.sent
+            //  reauth-required    → release slot + pause inbox; backlog stays; emit message.failed
+            //  inbox-throttled    → release slot (not a real send); emit message.failed
+            //  recipient-rejected → keep slot (bad lead consumed the quota); emit message.failed
+            //  transient (5xx)    → not invoked here (throws to BullMQ retry)
+            const capActive = cap != null;
+            const releaseInput = {
+              inboxId: data.inboxId,
+              messageId: data.messageId,
+              timezone,
+              reservedAtMs: nowMs,
+            };
+            if (outcome.kind === 'delivered') {
+              if (capActive) inboxSendCountTotal.inc();
+              if (capActive && job.id) {
+                await untrackBacklogJob(app.redis, data.inboxId, job.id);
+              }
+              void emitMessageSent(app, {
+                messageId: data.messageId,
+                conversationId: data.conversationId,
+                inboxId: data.inboxId,
+                channel: 'email',
+                deliveredAt: new Date(),
+              });
+            } else if (outcome.kind === 'reauth-required') {
+              if (capActive) {
+                await releaseForInbox(app.redis, releaseInput);
+                await pauseInbox(app.redis, data.inboxId, 'needs-reauth');
+                inboxReleaseTotal.inc();
+                inboxPausedTotal.inc();
+              }
+              void emitMessageFailed(app, {
+                messageId: data.messageId,
+                conversationId: data.conversationId,
+                inboxId: data.inboxId,
+                channel: 'email',
+                failureReason: 'gmail oauth expired — reauthorize',
+                failedAt: new Date(),
+              });
+            } else if (outcome.kind === 'inbox-throttled') {
+              if (capActive) {
+                await releaseForInbox(app.redis, releaseInput);
+                inboxReleaseTotal.inc();
+              }
+              void emitMessageFailed(app, {
+                messageId: data.messageId,
+                conversationId: data.conversationId,
+                inboxId: data.inboxId,
+                channel: 'email',
+                failureReason: outcome.reason,
+                failedAt: new Date(),
+              });
+            } else if (outcome.kind === 'recipient-rejected') {
+              void emitMessageFailed(app, {
+                messageId: data.messageId,
+                conversationId: data.conversationId,
+                inboxId: data.inboxId,
+                channel: 'email',
+                failureReason: outcome.reason,
+                failedAt: new Date(),
+              });
+            }
+          },
         },
       );
     },

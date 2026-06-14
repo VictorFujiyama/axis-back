@@ -19,6 +19,7 @@ import {
   buildLeadQualifiedEnvelope,
   buildConversationTaggedEnvelope,
   buildMessageFailedEnvelope,
+  buildMessageSentEnvelope,
 } from './build-connector-event';
 import { getConnectorForAccount } from './connector';
 import { getConnection } from './connections';
@@ -472,6 +473,81 @@ export async function emitMessageFailed(
     app.log.warn(
       { err, messageId: params.messageId },
       'atlas-events: message.failed emit failed',
+    );
+  }
+}
+
+export interface EmitMessageSentParams {
+  messageId: string;
+  conversationId: string;
+  inboxId: string;
+  channel: string;
+  channelMsgId?: string;
+  deliveredAt: Date;
+}
+
+/**
+ * Phase 13 (step 7) — emit `message.sent` to Atlas so the connector handler
+ * can resume a journey node that was parked in `waiting` after a daily-cap
+ * over-cap. Carries `sentByJourneyRunId` + `sentByNodeRunId` from the message
+ * metadata so the Atlas listener resolves `journey_node_runs` via primary key.
+ *
+ * Fail-open like its sibling: a missing connector, an unset `ATLAS_URL`, or a
+ * thrown emit must NEVER bubble back into the worker (the message is already
+ * marked delivered; a missed cue can be reconciled later).
+ */
+export async function emitMessageSent(
+  app: FastifyInstance,
+  params: EmitMessageSentParams,
+): Promise<void> {
+  if (!config.ATLAS_URL) return;
+
+  try {
+    const [inbox] = await app.db
+      .select({ accountId: schema.inboxes.accountId })
+      .from(schema.inboxes)
+      .where(eq(schema.inboxes.id, params.inboxId))
+      .limit(1);
+    const accountId = inbox?.accountId;
+    if (!accountId) return;
+
+    const conn = await getConnection(app.db, accountId);
+    if (!conn) return;
+
+    const connector = await getConnectorForAccount(app, accountId);
+    if (!connector) return;
+
+    const [msg] = await app.db
+      .select({ metadata: schema.messages.metadata })
+      .from(schema.messages)
+      .where(eq(schema.messages.id, params.messageId))
+      .limit(1);
+    const meta = (msg?.metadata ?? {}) as Record<string, unknown>;
+    const sentByJourneyRunId =
+      typeof meta['atlas_journey_run_id'] === 'string'
+        ? (meta['atlas_journey_run_id'] as string)
+        : undefined;
+    const sentByNodeRunId =
+      typeof meta['atlas_node_run_id'] === 'string'
+        ? (meta['atlas_node_run_id'] as string)
+        : undefined;
+
+    const envelope = buildMessageSentEnvelope({
+      orgId: conn.atlasOrgId,
+      accountId,
+      conversationId: params.conversationId,
+      messageId: params.messageId,
+      channel: params.channel,
+      deliveredAt: params.deliveredAt,
+      ...(params.channelMsgId ? { channelMsgId: params.channelMsgId } : {}),
+      ...(sentByJourneyRunId ? { sentByJourneyRunId } : {}),
+      ...(sentByNodeRunId ? { sentByNodeRunId } : {}),
+    });
+    await connector.emit(envelope);
+  } catch (err) {
+    app.log.warn(
+      { err, messageId: params.messageId },
+      'atlas-events: message.sent emit failed',
     );
   }
 }

@@ -678,6 +678,9 @@ export async function dispatchOutbound(
 
     // Enqueue — worker (queue/workers.ts) reads inbox config/secrets and calls Postmark.
     // BullMQ handles retries with exponential backoff and persists across restarts.
+    const meta = (msg.metadata as Record<string, unknown> | null) ?? {};
+    const source: 'atlas-journey' | 'manual' =
+      meta['source'] === 'atlas-journey' ? 'atlas-journey' : 'manual';
     await app.queues
       .getQueue<EmailOutboundJob>(QUEUE_NAMES.EMAIL_OUTBOUND)
       .add(
@@ -690,6 +693,8 @@ export async function dispatchOutbound(
           subject: `Re: ${inbox.name}`,
           text: msg.content ?? '',
           inReplyToMessageId: inReplyTo,
+          source,
+          reservedAtMs: Date.now(),
         },
         { jobId: messageId },
       );

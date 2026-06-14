@@ -15,6 +15,7 @@ import {
   MESSAGE_FAILED_KIND,
   parseMessageFailedPayload,
 } from './message-failed';
+import { MESSAGE_SENT_KIND, parseMessageSentPayload } from './message-sent';
 
 /**
  * Phase 12.2 Connector Bridge — `ConnectorEvent` builders (the cutover wire
@@ -591,6 +592,61 @@ export function buildMessageFailedEnvelope(input: {
     metadata: {
       ...(input.accountId ? { accountId: input.accountId } : {}),
       message_failed: payloadResult.payload,
+    },
+  });
+}
+
+/**
+ * Phase 13 (daily-send-cap step 7) — `message.sent` envelope. Mirrors
+ * `buildMessageFailedEnvelope` shape; emit site is the EmailOutbound worker
+ * after the Gmail 200 + `messages.deliveredAt` UPDATE. The Atlas-side listener
+ * resolves `journey_node_runs` via `sentByNodeRunId` (PK) so a node parked in
+ * `waiting` resumes the journey.
+ *
+ * `event_id=msg_<id>:sent` — paired with `:failed` so a message has at most
+ * one terminal connector event identifier per outcome.
+ */
+export function buildMessageSentEnvelope(input: {
+  orgId: string;
+  accountId?: string;
+  conversationId: string;
+  messageId: string;
+  channel: string;
+  channelMsgId?: string;
+  deliveredAt: Date | string;
+  sentByJourneyRunId?: string;
+  sentByNodeRunId?: string;
+}): ConnectorEvent {
+  const deliveredAtIso =
+    input.deliveredAt instanceof Date ? input.deliveredAt.toISOString() : input.deliveredAt;
+
+  const payloadResult = parseMessageSentPayload({
+    messageId: input.messageId,
+    conversationId: input.conversationId,
+    channel: input.channel,
+    deliveredAt: deliveredAtIso,
+    ...(input.channelMsgId ? { channelMsgId: input.channelMsgId } : {}),
+    ...(input.sentByJourneyRunId ? { sentByJourneyRunId: input.sentByJourneyRunId } : {}),
+    ...(input.sentByNodeRunId ? { sentByNodeRunId: input.sentByNodeRunId } : {}),
+  });
+  if (!payloadResult.ok) {
+    throw new Error(
+      `build-connector-event: invalid message_sent payload: ${JSON.stringify(payloadResult.error.issues)}`,
+    );
+  }
+
+  return validateConnectorEvent({
+    ...connectorBase(deliveredAtIso, input.orgId),
+    event_id: `msg_${input.messageId}:sent`,
+    kind: MESSAGE_SENT_KIND,
+    action: 'update',
+    source_ref: { id: input.messageId, parent_id: input.conversationId },
+    actors: [],
+    participants: [],
+    summary: `Message sent (${input.channel})`.slice(0, SUMMARY_CAP),
+    metadata: {
+      ...(input.accountId ? { accountId: input.accountId } : {}),
+      message_sent: payloadResult.payload,
     },
   });
 }
