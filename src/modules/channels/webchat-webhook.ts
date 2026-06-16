@@ -48,10 +48,10 @@ function generateVisitorId(): string {
 }
 
 /**
- * Origin check for /session — sensitive (returns JWT). Allowlisted via inbox.config.allowedOrigins.
- * In dev (no list configured) we accept anything but log a warning.
- * For /webhooks/webchat/* (read-only POST that mints no token) we keep CORS open: false-positive
- * cost low and visitor sites can be on any domain.
+ * Origin check shared by /session and /webhooks/webchat. When the inbox has
+ * config.allowedOrigins set, only those origins pass; an empty/absent list means
+ * universal (the widgetToken stays the primary gate — see spec D3). Requests with
+ * no Origin header (server-to-server / curl) are always allowed.
  */
 function originAllowed(req: FastifyRequest, allowed: string[] | undefined): boolean {
   const origin = req.headers.origin;
@@ -245,6 +245,13 @@ export async function webchatChannelRoutes(app: FastifyInstance): Promise<void> 
       const config = readWidgetConfig(inbox.config);
       if (!config.widgetToken || config.widgetToken !== body.widgetToken) {
         return reply.unauthorized('invalid widget token');
+      }
+      if (!originAllowed(req, config.allowedOrigins)) {
+        app.log.warn(
+          { inboxId, origin: req.headers.origin },
+          'webchat webhook: origin not allowed',
+        );
+        return reply.forbidden('origin not allowed');
       }
 
       // Defensive: visitor must already exist (issued via /session). Random visitorIds
