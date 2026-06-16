@@ -1,8 +1,9 @@
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { and, eq, isNull } from 'drizzle-orm';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
+import { decryptJSON } from '../../crypto';
 import { ingestWithHooks } from './post-ingest';
 import { publicWidgetSettings, webchatConfig } from './webchat-config';
 
@@ -20,6 +21,10 @@ const sessionBody = z.object({
     .object({
       name: z.string().max(120).optional(),
       email: z.string().email().optional(),
+      // Identity verification (spec D5): the customer site hashes a stable
+      // identifier with the inbox hmacToken and passes both. Validated below.
+      identifier: z.string().min(1).max(255).optional(),
+      identifierHash: z.string().min(1).max(128).optional(),
     })
     .optional(),
 });
@@ -33,6 +38,33 @@ const sendBody = z.object({
 
 function generateVisitorId(): string {
   return `vis_${randomBytes(16).toString('hex')}`;
+}
+
+function hexEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a, 'hex');
+  const bb = Buffer.from(b, 'hex');
+  if (ab.length === 0 || ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+/**
+ * Validates an identifier hash (spec D5). Returns true only when the inbox holds
+ * an hmacToken secret and HMAC_SHA256(hmacToken, identifier) === identifierHash.
+ */
+function identifierHashValid(
+  secrets: string | null,
+  identifier: string | undefined,
+  identifierHash: string | undefined,
+): boolean {
+  if (!secrets || !identifier || !identifierHash) return false;
+  try {
+    const { hmacToken } = decryptJSON<{ hmacToken?: unknown }>(secrets);
+    if (typeof hmacToken !== 'string' || hmacToken.length === 0) return false;
+    const expected = createHmac('sha256', hmacToken).update(identifier).digest('hex');
+    return hexEqual(expected, identifierHash);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -110,6 +142,21 @@ export async function webchatChannelRoutes(app: FastifyInstance): Promise<void> 
           'webchat session: origin not allowed',
         );
         return reply.forbidden('origin not allowed');
+      }
+
+      // Identity verification (spec D5). Only enforced when hmac is enabled and the
+      // visitor attempts to identify. mandatory=true rejects any identify whose hash
+      // doesn't check out; without hmac the identify proceeds anonymously as before.
+      if (config.hmac.enabled && body.identify) {
+        const verified = identifierHashValid(
+          inbox.secrets,
+          body.identify.identifier,
+          body.identify.identifierHash,
+        );
+        if (!verified && config.hmac.mandatory) {
+          app.log.warn({ inboxId }, 'webchat session: identity verification required');
+          return reply.unauthorized('identity verification required');
+        }
       }
 
       // Server-issued visitorId if client didn't provide one (first-time visitor).
