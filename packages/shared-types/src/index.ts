@@ -25,6 +25,36 @@ export type MessageContentType =
   | 'location'
   | 'template';
 
+export type WebchatLocale = 'pt-BR' | 'en';
+
+export interface WebchatPreChatField {
+  enabled: boolean;
+  required: boolean;
+}
+
+/** Stored shape of a webchat inbox's `config` (spec §3). Fields are optional as
+ * persisted; defaults are applied server-side. Secrets live in `inbox.secrets`. */
+export interface WebchatConfig {
+  widgetToken?: string;
+  primaryColor?: string;
+  greeting?: string;
+  tagline?: string;
+  greetingEnabled?: boolean;
+  locale?: WebchatLocale;
+  allowedOrigins?: string[];
+  hmac?: { enabled?: boolean; mandatory?: boolean };
+  preChat?: {
+    enabled?: boolean;
+    message?: string;
+    fields?: { name?: WebchatPreChatField; email?: WebchatPreChatField };
+  };
+  availability?: { showStatus?: boolean; awayMessage?: string };
+  csat?: { enabled?: boolean };
+  attachments?: { enabled?: boolean; maxSizeMb?: number; allowedTypes?: string[] };
+  continuityViaEmail?: boolean;
+  branding?: { showPoweredBy?: boolean };
+}
+
 export interface HealthResponse {
   status: 'ok' | 'degraded' | 'down';
   version: string;
