@@ -222,6 +222,13 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
+      // Webchat inboxes get a server-issued hmacToken so the customer can sign
+      // visitor identities (identifier_hash). It lives in secrets like other
+      // channel credentials; the caller never supplies it.
+      if (body.channelType === 'webchat' && typeof secrets.hmacToken !== 'string') {
+        secrets.hmacToken = randomBytes(32).toString('hex');
+      }
+
       let [inbox] = await app.db
         .insert(schema.inboxes)
         .values({
