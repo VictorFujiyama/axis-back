@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
@@ -68,6 +69,14 @@ const updateBody = z.object({
 const patchQuery = z.object({ validateKey: z.enum(['true', 'false']).optional() });
 
 const idParams = z.object({ id: z.string().uuid() });
+
+const rotateTokenBody = z.object({ rotateHmac: z.boolean().optional() });
+
+// Public widget token embedded in the install snippet: `wt_<48 hex>`. Matches
+// the format the website wizard generates client-side.
+function generateWidgetToken(): string {
+  return `wt_${randomBytes(24).toString('hex')}`;
+}
 
 const memberBody = z.object({
   userIds: z.array(z.string().uuid()).min(1),
@@ -517,6 +526,82 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
         { db: app.db, log: app.log },
       );
       return reply.code(204).send();
+    },
+  );
+
+  // Rotate the webchat widget token (D14). Regenerates `config.widgetToken` and,
+  // when `{ rotateHmac: true }`, the `hmacToken` secret. Rotation breaks active
+  // installs — the UI confirms before calling. Scoped to inbox members.
+  app.post(
+    '/api/v1/inboxes/:id/webchat/rotate-token',
+    { preHandler: app.requireAuth },
+    async (req, reply) => {
+      const { id } = idParams.parse(req.params);
+      const parsed = rotateTokenBody.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        return reply.badRequest(parsed.error.issues.map((i) => i.message).join('; '));
+      }
+      const { rotateHmac } = parsed.data;
+
+      const [inbox] = await app.db
+        .select()
+        .from(schema.inboxes)
+        .where(
+          and(
+            eq(schema.inboxes.id, id),
+            eq(schema.inboxes.accountId, req.user.accountId),
+            isNull(schema.inboxes.deletedAt),
+          ),
+        )
+        .limit(1);
+      if (!inbox) return reply.notFound();
+      if (inbox.channelType !== 'webchat') {
+        return reply.badRequest('not a webchat inbox');
+      }
+      if (req.user.role !== 'admin' && req.user.role !== 'supervisor') {
+        const allowed = await inboxIdsForUser(app, req.user.sub, req.user.accountId);
+        if (!allowed.includes(inbox.id)) return reply.forbidden('Not a member of this inbox');
+      }
+
+      const widgetToken = generateWidgetToken();
+      const nextConfig = {
+        ...((inbox.config ?? {}) as Record<string, unknown>),
+        widgetToken,
+      };
+
+      let nextSecrets = inbox.secrets;
+      if (rotateHmac) {
+        const current = inbox.secrets
+          ? (decryptJSON(inbox.secrets) as Record<string, unknown>)
+          : {};
+        nextSecrets = encryptJSON({ ...current, hmacToken: randomBytes(32).toString('hex') });
+      }
+
+      const [updated] = await app.db
+        .update(schema.inboxes)
+        .set({ config: nextConfig, secrets: nextSecrets, updatedAt: new Date() })
+        .where(
+          and(
+            eq(schema.inboxes.id, id),
+            eq(schema.inboxes.accountId, req.user.accountId),
+            isNull(schema.inboxes.deletedAt),
+          ),
+        )
+        .returning();
+      if (!updated) return reply.notFound();
+
+      void writeAudit(
+        req,
+        {
+          action: 'inbox.webchat_token_rotated',
+          entityType: 'inbox',
+          entityId: id,
+          changes: { rotatedHmac: rotateHmac === true },
+        },
+        { db: app.db, log: app.log },
+      );
+
+      return reply.send({ widgetToken, rotatedHmac: rotateHmac === true });
     },
   );
 
