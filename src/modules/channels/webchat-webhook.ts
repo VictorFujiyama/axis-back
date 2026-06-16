@@ -30,17 +30,74 @@ const sendBody = z.object({
   channelMsgId: z.string().min(1).max(255),
 });
 
+interface PreChatField {
+  enabled: boolean;
+  required: boolean;
+}
+
 interface WidgetConfig {
   widgetToken?: string;
   primaryColor?: string;
   greeting?: string;
+  tagline?: string;
+  greetingEnabled?: boolean;
+  locale?: 'pt-BR' | 'en';
   /** Allowlist of origins permitted to call the /session endpoint (Origin header). */
   allowedOrigins?: string[];
+  hmac?: { enabled?: boolean; mandatory?: boolean };
+  preChat?: {
+    enabled?: boolean;
+    message?: string;
+    fields?: { name?: PreChatField; email?: PreChatField };
+  };
+  availability?: { showStatus?: boolean; awayMessage?: string };
+  csat?: { enabled?: boolean };
+  attachments?: { enabled?: boolean; maxSizeMb?: number; allowedTypes?: string[] };
+  continuityViaEmail?: boolean;
+  branding?: { showPoweredBy?: boolean };
 }
+
+const DEFAULT_PRIMARY_COLOR = '#7b3fa9';
+const DEFAULT_GREETING = 'Olá! Como podemos ajudar?';
+const DEFAULT_TAGLINE = 'Resposta em alguns minutos';
+const DEFAULT_LOCALE: 'pt-BR' | 'en' = 'pt-BR';
+const DEFAULT_AWAY_MESSAGE = 'Estamos ausentes no momento';
+const DEFAULT_PRECHAT_MESSAGE = 'Antes de começar, conte um pouco sobre você';
 
 function readWidgetConfig(raw: unknown): WidgetConfig {
   if (!raw || typeof raw !== 'object') return {};
   return raw as WidgetConfig;
+}
+
+/**
+ * Public widget settings returned by /session, with spec §3 defaults applied.
+ * Secrets (widgetToken, hmacToken) and allowlist internals stay server-side.
+ */
+function publicWidgetSettings(config: WidgetConfig) {
+  const name = config.preChat?.fields?.name;
+  const email = config.preChat?.fields?.email;
+  return {
+    primaryColor: config.primaryColor ?? DEFAULT_PRIMARY_COLOR,
+    greeting: config.greeting ?? DEFAULT_GREETING,
+    tagline: config.tagline ?? DEFAULT_TAGLINE,
+    greetingEnabled: config.greetingEnabled ?? true,
+    locale: config.locale ?? DEFAULT_LOCALE,
+    availability: {
+      showStatus: config.availability?.showStatus ?? true,
+      awayMessage: config.availability?.awayMessage ?? DEFAULT_AWAY_MESSAGE,
+    },
+    preChat: {
+      enabled: config.preChat?.enabled ?? false,
+      message: config.preChat?.message ?? DEFAULT_PRECHAT_MESSAGE,
+      fields: {
+        name: { enabled: name?.enabled ?? true, required: name?.required ?? true },
+        email: { enabled: email?.enabled ?? true, required: email?.required ?? false },
+      },
+    },
+    attachments: { enabled: config.attachments?.enabled ?? true },
+    csat: { enabled: config.csat?.enabled ?? false },
+    branding: { showPoweredBy: config.branding?.showPoweredBy ?? true },
+  };
 }
 
 function generateVisitorId(): string {
@@ -205,8 +262,7 @@ export async function webchatChannelRoutes(app: FastifyInstance): Promise<void> 
         visitorId,
         contactId,
         widgetUrl: `${process.env.WIDGET_PUBLIC_URL ?? ''}/widget/${inboxId}`,
-        primaryColor: config.primaryColor ?? '#7b3fa9',
-        greeting: config.greeting ?? null,
+        ...publicWidgetSettings(config),
       });
     },
   );
