@@ -24,6 +24,9 @@ const sessionBody = z.object({
   // Optional: client may pass a previously-server-issued ID. If absent or invalid,
   // server issues a fresh one. This blocks visitor enumeration / hijack.
   visitorId: z.string().regex(VISITOR_ID_RE).optional(),
+  // Cross-device resume token (spec D11): server-signed link minted in the WS
+  // hello. When valid, restores this visitor's existing session/contact.
+  resume: z.string().min(1).max(800).optional(),
   identify: z
     .object({
       name: z.string().max(120).optional(),
@@ -79,6 +82,26 @@ function identifierHashValid(
     return hexEqual(expected, identifierHash);
   } catch {
     return false;
+  }
+}
+
+/**
+ * Decodes a resume token (spec D11) and returns the trusted visitorId it carries,
+ * or null when invalid / minted for another inbox. The token is server-signed in
+ * the WS hello only for visitors who left an email on a continuity-enabled inbox.
+ */
+function resumeVisitorId(app: FastifyInstance, inboxId: string, token: string): string | null {
+  try {
+    const p = app.jwt.verify(token) as unknown as {
+      aud?: string;
+      inboxId?: string;
+      visitorId?: string;
+    };
+    if (p.aud !== 'widget-resume' || p.inboxId !== inboxId) return null;
+    if (typeof p.visitorId !== 'string' || !VISITOR_ID_RE.test(p.visitorId)) return null;
+    return p.visitorId;
+  } catch {
+    return null;
   }
 }
 
@@ -188,10 +211,14 @@ export async function webchatChannelRoutes(app: FastifyInstance): Promise<void> 
         }
       }
 
+      // A valid resume token carries a server-signed visitorId we fully trust —
+      // it lets a fresh device (no localStorage) re-open this visitor's session.
+      const resumed = body.resume ? resumeVisitorId(app, inboxId, body.resume) : null;
+
       // Server-issued visitorId if client didn't provide one (first-time visitor).
       // If client provides one that exists in DB: trust + reuse. If provides new ID
       // that doesn't exist: ALSO issue a new one (anti-enumeration); ignore client value.
-      let visitorId = body.visitorId ?? generateVisitorId();
+      let visitorId = resumed ?? body.visitorId ?? generateVisitorId();
 
       const [identity] = await app.db
         .select()
@@ -231,8 +258,8 @@ export async function webchatChannelRoutes(app: FastifyInstance): Promise<void> 
           // No-op (we already used the original); kept for clarity.
         }
         // Re-roll visitorId server-side to defeat enumeration: we do NOT trust client-supplied
-        // IDs that don't already correspond to a contact.
-        if (body.visitorId) visitorId = generateVisitorId();
+        // IDs that don't already correspond to a contact. A resumed (server-signed) ID is trusted.
+        if (!resumed && body.visitorId) visitorId = generateVisitorId();
         const [contact] = await app.db
           .insert(schema.contacts)
           .values({

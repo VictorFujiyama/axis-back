@@ -102,7 +102,7 @@ export async function widgetWsRoutes(app: FastifyInstance): Promise<void> {
     // Display name for typing events. Anonymous widget visitors fall back to
     // "Visitante" so agents still get a meaningful "X está digitando…" label.
     const [contactRow] = await app.db
-      .select({ name: schema.contacts.name })
+      .select({ name: schema.contacts.name, email: schema.contacts.email })
       .from(schema.contacts)
       .where(eq(schema.contacts.id, ctx.contactId))
       .limit(1);
@@ -118,7 +118,8 @@ export async function widgetWsRoutes(app: FastifyInstance): Promise<void> {
       .from(schema.inboxes)
       .where(eq(schema.inboxes.id, ctx.inboxId))
       .limit(1);
-    const showStatus = webchatConfig(inboxRow?.config).availability.showStatus;
+    const cfg = webchatConfig(inboxRow?.config);
+    const showStatus = cfg.availability.showStatus;
     const accountId = inboxRow?.accountId ?? null;
     let memberIds = new Set<string>();
     let availability: WidgetAvailability = 'away';
@@ -134,12 +135,31 @@ export async function widgetWsRoutes(app: FastifyInstance): Promise<void> {
       availability = availabilityFrom(users, memberIds);
     }
 
+    // Cross-device continuity (D11): when the visitor left an email and the inbox
+    // opts in, mint a long-lived resume link surfaced in the hello so the host can
+    // email it. The token only re-establishes this visitor's own session (/session).
+    let resumeUrl: string | undefined;
+    if (cfg.continuityViaEmail && cfg.widgetToken && contactRow?.email) {
+      const resumeToken = app.jwt.sign(
+        { aud: 'widget-resume', inboxId: ctx.inboxId, visitorId: ctx.visitorId } as unknown as {
+          sub: string;
+          email: string;
+          role: 'agent';
+          accountId: string;
+        },
+        { expiresIn: '30d' },
+      );
+      const base = process.env.WIDGET_PUBLIC_URL ?? '';
+      resumeUrl = `${base}/widget/${ctx.inboxId}?token=${encodeURIComponent(cfg.widgetToken)}&resume=${resumeToken}`;
+    }
+
     send({
       type: 'hello',
       contactId: ctx.contactId,
       conversationId: latestConv?.id ?? null,
       conversationStatus: latestConv?.status ?? null,
       ...(showStatus ? { availability } : {}),
+      ...(resumeUrl ? { resumeUrl } : {}),
     });
 
     // Single listener: learns new convs from visitor's own messages AND forwards replies.
