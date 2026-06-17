@@ -127,5 +127,15 @@ export function publicWidgetSettings(config: ResolvedWebchatConfig) {
     attachments: { enabled: config.attachments.enabled },
     csat: { enabled: config.csat.enabled },
     branding: { showPoweredBy: config.branding.showPoweredBy },
+    backgroundColor: config.backgroundColor,
+    agentBubbleColor: config.agentBubbleColor,
+    themeMode: config.themeMode,
+    bubbleColor: config.bubbleColor,
+    bubblePosition: config.bubblePosition,
+    launcherLabel: config.launcherLabel,
+    headerTitle: config.headerTitle,
+    headerSubtitle: config.headerSubtitle,
+    showAvatar: config.showAvatar,
+    avatarUrl: config.avatarUrl,
   };
 }
