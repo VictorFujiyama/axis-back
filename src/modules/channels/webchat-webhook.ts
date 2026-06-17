@@ -36,6 +36,14 @@ const sendBody = z.object({
   channelMsgId: z.string().min(1).max(255),
 });
 
+const csatBody = z.object({
+  widgetToken: z.string().min(1).max(200),
+  visitorId: z.string().regex(VISITOR_ID_RE),
+  conversationId: z.string().uuid(),
+  score: z.number().int().min(1).max(5),
+  comment: z.string().max(2000).optional(),
+});
+
 function generateVisitorId(): string {
   return `vis_${randomBytes(16).toString('hex')}`;
 }
@@ -103,6 +111,9 @@ export async function webchatChannelRoutes(app: FastifyInstance): Promise<void> 
     reply.code(204).send(),
   );
   app.options('/api/v1/widget/:inboxId/session', async (_req: FastifyRequest, reply: FastifyReply) =>
+    reply.code(204).send(),
+  );
+  app.options('/webhooks/webchat/:inboxId/csat', async (_req: FastifyRequest, reply: FastifyReply) =>
     reply.code(204).send(),
   );
 
@@ -328,6 +339,97 @@ export async function webchatChannelRoutes(app: FastifyInstance): Promise<void> 
         messageId: result.messageId,
         deduped: result.deduped,
       });
+    },
+  );
+
+  /**
+   * Visitor CSAT submission (spec D8). Auth is widgetToken + visitorId, and the
+   * rating is only accepted for a resolved conversation the visitor owns. Score
+   * is 1-5 (CSAT); writes to the shared csat module via csatResponses.
+   */
+  app.post(
+    '/webhooks/webchat/:inboxId/csat',
+    {
+      config: {
+        rateLimit: {
+          max: 10,
+          timeWindow: '1 minute',
+          keyGenerator: (req: FastifyRequest) => {
+            const params = req.params as { inboxId?: string };
+            const body = req.body as { visitorId?: string } | null;
+            return `webchat-csat:${params.inboxId ?? 'x'}:${body?.visitorId ?? req.ip}`;
+          },
+        },
+      },
+    },
+    async (req, reply) => {
+      const { inboxId } = inboxParam.parse(req.params);
+      const body = csatBody.parse(req.body);
+
+      const [inbox] = await app.db
+        .select()
+        .from(schema.inboxes)
+        .where(and(eq(schema.inboxes.id, inboxId), isNull(schema.inboxes.deletedAt)))
+        .limit(1);
+      if (!inbox || !inbox.enabled || inbox.channelType !== 'webchat') {
+        return reply.notFound('inbox not found or not webchat');
+      }
+      const config = webchatConfig(inbox.config);
+      if (!config.widgetToken || config.widgetToken !== body.widgetToken) {
+        return reply.unauthorized('invalid widget token');
+      }
+      if (!originAllowed(req, config.allowedOrigins)) {
+        app.log.warn({ inboxId, origin: req.headers.origin }, 'webchat csat: origin not allowed');
+        return reply.forbidden('origin not allowed');
+      }
+      if (!config.csat.enabled) {
+        return reply.forbidden('csat not enabled');
+      }
+
+      const [identity] = await app.db
+        .select({ contactId: schema.contactIdentities.contactId })
+        .from(schema.contactIdentities)
+        .where(
+          and(
+            eq(schema.contactIdentities.channel, 'webchat'),
+            eq(schema.contactIdentities.identifier, body.visitorId),
+          ),
+        )
+        .limit(1);
+      if (!identity) {
+        return reply.unauthorized('visitor not registered (call /session first)');
+      }
+
+      // Ownership + state: the conversation must belong to this inbox and this
+      // visitor's contact, and be resolved before a rating is accepted.
+      const [conv] = await app.db
+        .select({
+          contactId: schema.conversations.contactId,
+          inboxId: schema.conversations.inboxId,
+          status: schema.conversations.status,
+        })
+        .from(schema.conversations)
+        .where(eq(schema.conversations.id, body.conversationId))
+        .limit(1);
+      if (!conv || conv.inboxId !== inboxId || conv.contactId !== identity.contactId) {
+        return reply.notFound('conversation not found');
+      }
+      if (conv.status !== 'resolved') {
+        return reply.conflict('conversation not resolved');
+      }
+
+      const [row] = await app.db
+        .insert(schema.csatResponses)
+        .values({
+          conversationId: body.conversationId,
+          contactId: identity.contactId,
+          score: body.score,
+          kind: 'csat',
+          comment: body.comment,
+        })
+        .returning({ id: schema.csatResponses.id });
+
+      return reply.code(201).send({ id: row?.id });
     },
   );
 }
