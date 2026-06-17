@@ -53,7 +53,20 @@ export interface WebchatConfig {
   attachments?: { enabled?: boolean; maxSizeMb?: number; allowedTypes?: string[] };
   continuityViaEmail?: boolean;
   branding?: { showPoweredBy?: boolean };
+  backgroundColor?: string | null;
+  agentBubbleColor?: string | null;
+  themeMode?: WebchatThemeMode;
+  bubbleColor?: string | null;
+  bubblePosition?: WebchatBubblePosition;
+  launcherLabel?: string;
+  headerTitle?: string | null;
+  headerSubtitle?: string | null;
+  showAvatar?: boolean;
+  avatarUrl?: string;
 }
+
+export type WebchatThemeMode = 'light' | 'dark';
+export type WebchatBubblePosition = 'right' | 'left';
 
 export interface HealthResponse {
   status: 'ok' | 'degraded' | 'down';

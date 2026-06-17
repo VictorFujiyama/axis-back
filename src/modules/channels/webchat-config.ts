@@ -1,7 +1,9 @@
 import type {
+  WebchatBubblePosition,
   WebchatConfig,
   WebchatLocale,
   WebchatPreChatField,
+  WebchatThemeMode,
 } from '@blossom/shared-types';
 
 export const DEFAULT_PRIMARY_COLOR = '#7b3fa9';
@@ -38,6 +40,16 @@ export interface ResolvedWebchatConfig {
   attachments: { enabled: boolean; maxSizeMb: number; allowedTypes: string[] };
   continuityViaEmail: boolean;
   branding: { showPoweredBy: boolean };
+  backgroundColor: string | null;
+  agentBubbleColor: string | null;
+  themeMode: WebchatThemeMode;
+  bubbleColor: string | null;
+  bubblePosition: WebchatBubblePosition;
+  launcherLabel: string;
+  headerTitle: string | null;
+  headerSubtitle: string | null;
+  showAvatar: boolean;
+  avatarUrl: string;
 }
 
 /**
@@ -83,6 +95,16 @@ export function webchatConfig(raw: unknown): ResolvedWebchatConfig {
     },
     continuityViaEmail: c.continuityViaEmail ?? false,
     branding: { showPoweredBy: c.branding?.showPoweredBy ?? true },
+    backgroundColor: c.backgroundColor ?? null,
+    agentBubbleColor: c.agentBubbleColor ?? null,
+    themeMode: c.themeMode === 'dark' ? 'dark' : 'light',
+    bubbleColor: c.bubbleColor ?? null,
+    bubblePosition: c.bubblePosition === 'left' ? 'left' : 'right',
+    launcherLabel: c.launcherLabel ?? '',
+    headerTitle: c.headerTitle ?? null,
+    headerSubtitle: c.headerSubtitle ?? null,
+    showAvatar: c.showAvatar ?? false,
+    avatarUrl: c.avatarUrl ?? '',
   };
 }
 
