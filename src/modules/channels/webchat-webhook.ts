@@ -54,6 +54,8 @@ const csatBody = z.object({
   comment: z.string().max(2000).optional(),
 });
 
+const previewQuery = z.object({ widgetToken: z.string().min(1).max(200) });
+
 function generateVisitorId(): string {
   return `vis_${randomBytes(16).toString('hex')}`;
 }
@@ -300,6 +302,32 @@ export async function webchatChannelRoutes(app: FastifyInstance): Promise<void> 
       });
     },
   );
+
+  /**
+   * Read-only display settings for the dashboard appearance preview. Returns the
+   * same public payload as /session but creates no contact/session and mints no
+   * JWT — the appearance tab loads it in a same-origin iframe (?preview=1). Guarded
+   * by the widgetToken, so it exposes nothing the public snippet doesn't already
+   * carry; no Origin check since it runs from the dashboard, not the customer site.
+   */
+  app.get('/api/v1/widget/:inboxId/preview', async (req, reply) => {
+    const { inboxId } = inboxParam.parse(req.params);
+    const { widgetToken } = previewQuery.parse(req.query);
+
+    const [inbox] = await app.db
+      .select()
+      .from(schema.inboxes)
+      .where(and(eq(schema.inboxes.id, inboxId), isNull(schema.inboxes.deletedAt)))
+      .limit(1);
+    if (!inbox || inbox.channelType !== 'webchat') {
+      return reply.notFound('inbox not found or not webchat');
+    }
+    const config = webchatConfig(inbox.config);
+    if (!config.widgetToken || config.widgetToken !== widgetToken) {
+      return reply.unauthorized('invalid widget token');
+    }
+    return reply.send(publicWidgetSettings(config));
+  });
 
   /**
    * Inbound widget message — visitor sends a chat line.
