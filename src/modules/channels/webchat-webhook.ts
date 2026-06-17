@@ -329,6 +329,29 @@ export async function webchatChannelRoutes(app: FastifyInstance): Promise<void> 
     return reply.send(publicWidgetSettings(config));
   });
 
+  // Public launcher appearance — the embed loader (widget.js) reads the bubble's
+  // color/position/label here BEFORE any session, so a config change in the
+  // dashboard updates the bubble without the customer touching their snippet.
+  // Only visual data (already visible on the customer's site), no auth, cacheable.
+  app.get('/api/v1/widget/:inboxId/launcher', async (req, reply) => {
+    const { inboxId } = inboxParam.parse(req.params);
+    const [inbox] = await app.db
+      .select()
+      .from(schema.inboxes)
+      .where(and(eq(schema.inboxes.id, inboxId), isNull(schema.inboxes.deletedAt)))
+      .limit(1);
+    if (!inbox || !inbox.enabled || inbox.channelType !== 'webchat') {
+      return reply.notFound('inbox not found or not webchat');
+    }
+    const config = webchatConfig(inbox.config);
+    reply.header('Cache-Control', 'public, max-age=300');
+    return reply.send({
+      color: config.bubbleColor ?? config.primaryColor,
+      position: config.bubblePosition,
+      label: config.launcherLabel,
+    });
+  });
+
   /**
    * Inbound widget message — visitor sends a chat line.
    * Rate limit per (inbox, visitorId) instead of per-IP (NAT-friendly).
