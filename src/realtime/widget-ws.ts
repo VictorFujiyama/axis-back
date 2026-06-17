@@ -2,7 +2,22 @@ import { and, desc, eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
+import { webchatConfig } from '../modules/channels/webchat-config';
 import { eventBus, type RealtimeEvent } from './event-bus';
+
+type WidgetAvailability = 'online' | 'away';
+
+// Team is "online" when at least one of the inbox's members is available
+// (chosen status 'online'). Inboxes with no explicit members fall back to any
+// available account user so the widget doesn't read as permanently away.
+function availabilityFrom(
+  users: Record<string, 'online' | 'busy' | 'offline'>,
+  memberIds: Set<string>,
+): WidgetAvailability {
+  const online = Object.keys(users).filter((id) => users[id] === 'online');
+  const relevant = memberIds.size > 0 ? online.filter((id) => memberIds.has(id)) : online;
+  return relevant.length > 0 ? 'online' : 'away';
+}
 
 const widgetTypingMsg = z.object({
   type: z.literal('typing'),
@@ -96,17 +111,50 @@ export async function widgetWsRoutes(app: FastifyInstance): Promise<void> {
         ? contactRow.name
         : 'Visitante';
 
+    // Team availability (D7). Resolve the inbox's account + members once, then
+    // recompute on every presence.update for that account.
+    const [inboxRow] = await app.db
+      .select({ accountId: schema.inboxes.accountId, config: schema.inboxes.config })
+      .from(schema.inboxes)
+      .where(eq(schema.inboxes.id, ctx.inboxId))
+      .limit(1);
+    const showStatus = webchatConfig(inboxRow?.config).availability.showStatus;
+    const accountId = inboxRow?.accountId ?? null;
+    let memberIds = new Set<string>();
+    let availability: WidgetAvailability = 'away';
+    if (showStatus && accountId) {
+      const [memberRows, users] = await Promise.all([
+        app.db
+          .select({ userId: schema.inboxMembers.userId })
+          .from(schema.inboxMembers)
+          .where(eq(schema.inboxMembers.inboxId, ctx.inboxId)),
+        app.presence.getAvailableUsers(accountId),
+      ]);
+      memberIds = new Set(memberRows.map((r) => r.userId));
+      availability = availabilityFrom(users, memberIds);
+    }
+
     send({
       type: 'hello',
       contactId: ctx.contactId,
       conversationId: latestConv?.id ?? null,
       conversationStatus: latestConv?.status ?? null,
+      ...(showStatus ? { availability } : {}),
     });
 
     // Single listener: learns new convs from visitor's own messages AND forwards replies.
     ctx.unsubscribe = eventBus.onEvent((event: RealtimeEvent) => {
-      // Presence events are agent-only; never leak to widget sockets.
-      if (event.type === 'presence.update') return;
+      // Presence drives the widget's team-availability badge (D7); the raw
+      // agent/contact rosters never reach the socket — only the derived state.
+      if (event.type === 'presence.update') {
+        if (!showStatus || !accountId || event.accountId !== accountId) return;
+        const next = availabilityFrom(event.users, memberIds);
+        if (next !== availability) {
+          availability = next;
+          setImmediate(() => send({ type: 'availability.update', availability: next }));
+        }
+        return;
+      }
       // contact.created is account-scoped (no inboxId) and agent/atlas-only —
       // never forward CRM contact records to widget visitors.
       if (event.type === 'contact.created') return;
