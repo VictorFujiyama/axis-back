@@ -1,13 +1,20 @@
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { extname } from 'node:path';
+import multipart from '@fastify/multipart';
 import { and, eq, isNull } from 'drizzle-orm';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { decryptJSON } from '../../crypto';
+import { reserveWriteSlot, StorageQuotaExceeded, uploadFile } from '../../lib/storage';
 import { ingestWithHooks } from './post-ingest';
 import { publicWidgetSettings, webchatConfig } from './webchat-config';
 
 const inboxParam = z.object({ inboxId: z.string().uuid() });
+
+// Hard ceiling on a visitor upload regardless of the per-inbox maxSizeMb — the
+// inbox config can lower it but never exceed this. Keeps R2 footprint bounded.
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
 /** Visitor IDs MUST follow `vis_<32+ hex chars>` — server-issued or rejected. */
 const VISITOR_ID_RE = /^vis_[a-f0-9]{32,}$/;
@@ -89,6 +96,13 @@ function originAllowed(req: FastifyRequest, allowed: string[] | undefined): bool
 }
 
 export async function webchatChannelRoutes(app: FastifyInstance): Promise<void> {
+  // Multipart parser for visitor attachment uploads. Scoped to this plugin.
+  if (!app.hasContentTypeParser('multipart/form-data')) {
+    await app.register(multipart, {
+      limits: { fileSize: MAX_ATTACHMENT_BYTES, files: 1 },
+    });
+  }
+
   // Per-route CORS: open by default for widget paths so visitor sites can call us.
   // /session response is JWT-bearing → also enforce Origin allowlist below.
   app.addHook('onSend', async (req, reply, payload) => {
@@ -115,6 +129,10 @@ export async function webchatChannelRoutes(app: FastifyInstance): Promise<void> 
   );
   app.options('/webhooks/webchat/:inboxId/csat', async (_req: FastifyRequest, reply: FastifyReply) =>
     reply.code(204).send(),
+  );
+  app.options(
+    '/webhooks/webchat/:inboxId/attachment',
+    async (_req: FastifyRequest, reply: FastifyReply) => reply.code(204).send(),
   );
 
   /**
@@ -430,6 +448,155 @@ export async function webchatChannelRoutes(app: FastifyInstance): Promise<void> 
         .returning({ id: schema.csatResponses.id });
 
       return reply.code(201).send({ id: row?.id });
+    },
+  );
+
+  /**
+   * Visitor attachment upload (spec D9). Multipart; auth is widgetToken + visitorId
+   * carried as form fields (sent before the file part). Validates type/size against
+   * the inbox's attachments config, stores in R2, then ingests a contact message
+   * with mediaUrl/mediaMimeType. The agent sees it in the inbox like any media.
+   */
+  app.post(
+    '/webhooks/webchat/:inboxId/attachment',
+    {
+      config: {
+        rateLimit: {
+          max: 20,
+          timeWindow: '1 minute',
+          keyGenerator: (req: FastifyRequest) => {
+            const params = req.params as { inboxId?: string };
+            return `webchat-attach:${params.inboxId ?? 'x'}:${req.ip}`;
+          },
+        },
+      },
+    },
+    async (req, reply) => {
+      const { inboxId } = inboxParam.parse(req.params);
+
+      const r = req as unknown as {
+        isMultipart?: () => boolean;
+        file?: () => Promise<
+          | {
+              filename: string;
+              mimetype: string;
+              toBuffer: () => Promise<Buffer>;
+              fields: Record<string, { value?: unknown } | undefined>;
+            }
+          | undefined
+        >;
+      };
+      if (typeof r.file !== 'function' || (r.isMultipart && !r.isMultipart())) {
+        return reply.badRequest('multipart/form-data required');
+      }
+
+      const uploaded = await r.file();
+      if (!uploaded) {
+        return reply.badRequest('missing file field');
+      }
+
+      const fields = uploaded.fields ?? {};
+      const widgetToken = typeof fields.widgetToken?.value === 'string' ? fields.widgetToken.value : '';
+      const visitorId = typeof fields.visitorId?.value === 'string' ? fields.visitorId.value : '';
+      const channelMsgId =
+        typeof fields.channelMsgId?.value === 'string' ? fields.channelMsgId.value : randomUUID();
+      if (!VISITOR_ID_RE.test(visitorId)) {
+        return reply.unauthorized('visitor not registered (call /session first)');
+      }
+
+      const [inbox] = await app.db
+        .select()
+        .from(schema.inboxes)
+        .where(and(eq(schema.inboxes.id, inboxId), isNull(schema.inboxes.deletedAt)))
+        .limit(1);
+      if (!inbox || !inbox.enabled || inbox.channelType !== 'webchat') {
+        return reply.notFound('inbox not found or not webchat');
+      }
+      const config = webchatConfig(inbox.config);
+      if (!config.widgetToken || config.widgetToken !== widgetToken) {
+        return reply.unauthorized('invalid widget token');
+      }
+      if (!originAllowed(req, config.allowedOrigins)) {
+        app.log.warn(
+          { inboxId, origin: req.headers.origin },
+          'webchat attachment: origin not allowed',
+        );
+        return reply.forbidden('origin not allowed');
+      }
+      if (!config.attachments.enabled) {
+        return reply.forbidden('attachments not enabled');
+      }
+      if (!config.attachments.allowedTypes.includes(uploaded.mimetype)) {
+        return reply.code(415).send({ error: `file type "${uploaded.mimetype}" not allowed` });
+      }
+
+      const [identity] = await app.db
+        .select({ id: schema.contactIdentities.id })
+        .from(schema.contactIdentities)
+        .where(
+          and(
+            eq(schema.contactIdentities.channel, 'webchat'),
+            eq(schema.contactIdentities.identifier, visitorId),
+          ),
+        )
+        .limit(1);
+      if (!identity) {
+        return reply.unauthorized('visitor not registered (call /session first)');
+      }
+
+      let buf: Buffer;
+      try {
+        buf = await uploaded.toBuffer();
+      } catch {
+        return reply.code(413).send({ error: 'file too large' });
+      }
+      const maxBytes = config.attachments.maxSizeMb * 1024 * 1024;
+      if (buf.length > maxBytes) {
+        return reply.code(413).send({ error: `file exceeds ${config.attachments.maxSizeMb} MB` });
+      }
+
+      try {
+        await reserveWriteSlot(app.redis);
+      } catch (err) {
+        if (err instanceof StorageQuotaExceeded) {
+          app.log.warn({ used: err.used, limit: err.limit }, 'webchat attachment: write budget exhausted');
+          return reply.code(503).send({ error: 'upload limit reached, try again later' });
+        }
+        throw err;
+      }
+
+      const ext = extname(uploaded.filename).toLowerCase();
+      const key = `${inbox.accountId}/${randomUUID()}${ext}`;
+      const stored = await uploadFile(buf, key, uploaded.mimetype);
+
+      const contentType = uploaded.mimetype.startsWith('image/') ? 'image' : 'document';
+      const result = await ingestWithHooks(
+        app,
+        {
+          inboxId,
+          channel: 'webchat',
+          from: {
+            identifier: visitorId,
+            metadata: { userAgent: req.headers['user-agent'] ?? null },
+          },
+          content: uploaded.filename || 'attachment',
+          contentType,
+          mediaUrl: stored.url,
+          mediaMimeType: uploaded.mimetype,
+          channelMsgId,
+        },
+        inbox.config,
+        inbox.defaultBotId,
+      );
+
+      if (result.blocked) return reply.code(200).send({ accepted: false, reason: 'blocked' });
+      return reply.code(result.deduped ? 200 : 201).send({
+        contactId: result.contactId,
+        conversationId: result.conversationId,
+        messageId: result.messageId,
+        mediaUrl: stored.url,
+        deduped: result.deduped,
+      });
     },
   );
 }
