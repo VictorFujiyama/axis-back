@@ -7,6 +7,7 @@ import {
   assignHandler,
   assignUserHandler,
   getInboxPlaybookHandler,
+  getRecentOutboundHandler,
   getThreadHandler,
   listThreadsHandler,
   resolveHandler,
@@ -152,6 +153,53 @@ describe('searchHandler', () => {
     const result = await searchHandler(db, { query: 'nothingmatches', limit: 20 });
 
     expect(result.hits).toEqual([]);
+  });
+});
+
+describe('getRecentOutboundHandler (Task 1.2 — reply-correlator)', () => {
+  it('returns runId/nodeId when the outbound turn was sent by an Atlas journey', async () => {
+    const row = {
+      id: 'msg-out-1',
+      senderType: 'bot' as const,
+      metadata: { source: 'atlas-journey', atlas_journey_run_id: 'run-1', atlas_node_id: 'node-7' },
+      createdAt: new Date('2026-07-13T12:00:00Z'),
+    };
+    const { db } = makeDb([[row]]);
+
+    const result = await getRecentOutboundHandler(db, { conversationId: 'conv-1', limit: 1 });
+
+    expect(result.turns).toHaveLength(1);
+    expect(result.turns[0]).toMatchObject({
+      messageId: 'msg-out-1',
+      senderType: 'bot',
+      runId: 'run-1',
+      nodeId: 'node-7',
+    });
+  });
+
+  it('omits runId/nodeId for a manual (non-journey) outbound turn', async () => {
+    const row = {
+      id: 'msg-out-2',
+      senderType: 'user' as const,
+      metadata: {},
+      createdAt: new Date('2026-07-13T12:00:00Z'),
+    };
+    const { db } = makeDb([[row]]);
+
+    const result = await getRecentOutboundHandler(db, { conversationId: 'conv-1', limit: 1 });
+
+    expect(result.turns).toHaveLength(1);
+    expect(result.turns[0]).toMatchObject({ messageId: 'msg-out-2', senderType: 'user' });
+    expect(result.turns[0]).not.toHaveProperty('runId');
+    expect(result.turns[0]).not.toHaveProperty('nodeId');
+  });
+
+  it('returns an empty array when the conversation has no outbound turns', async () => {
+    const { db } = makeDb([[]]);
+
+    const result = await getRecentOutboundHandler(db, { conversationId: 'conv-empty', limit: 1 });
+
+    expect(result.turns).toEqual([]);
   });
 });
 

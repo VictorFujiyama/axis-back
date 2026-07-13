@@ -261,6 +261,84 @@ export async function searchHandler(db: DB, input: SearchInput): Promise<SearchR
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// messaging.get_recent_outbound (Task 1.2 — Journey-Builder-Parity reply-correlator)
+// ──────────────────────────────────────────────────────────────────────────────
+
+export const getRecentOutboundInputSchema = z.object({
+  conversationId: uuid,
+  limit: z.coerce.number().int().min(1).max(20).default(1),
+});
+export type GetRecentOutboundInput = z.infer<typeof getRecentOutboundInputSchema>;
+
+export interface RecentOutboundTurn {
+  messageId: string;
+  senderType: 'user' | 'bot' | 'system';
+  createdAt: Date;
+  /** Present only when this turn was sent by an Atlas journey
+   *  (`upsert_and_send` stamps `metadata.atlas_journey_run_id`). */
+  runId?: string;
+  /** Present only alongside `runId` (`metadata.atlas_node_id`). */
+  nodeId?: string;
+}
+
+export interface GetRecentOutboundResult {
+  turns: RecentOutboundTurn[];
+}
+
+/**
+ * Return the most recent OUTBOUND turns (`senderType <> 'contact'`) on a
+ * conversation, most-recent-first (Task 1.2 — Journey-Builder-Parity reply
+ * correlator, design.md §1.2). The Atlas worker calls this for every inbound
+ * `conversation_turn` it receives to test whether the reply follows a
+ * journey-originated send: `upsert_and_send` (T-05) stamps
+ * `metadata.atlas_journey_run_id`/`atlas_node_id` on the outbound message row
+ * it inserts, surfaced here as `runId`/`nodeId` when present.
+ *
+ * Not account-scoped (mirrors `get_thread`/`list_threads`/`search`, L-408):
+ * the caller already has legitimate visibility into this conversation — it is
+ * reacting to a `conversation_turn` connector envelope Atlas just received for
+ * this same conversation, gated upstream by `viewable_by` (L-405).
+ */
+export async function getRecentOutboundHandler(
+  db: DB,
+  input: GetRecentOutboundInput,
+): Promise<GetRecentOutboundResult> {
+  const rows = await db
+    .select({
+      id: schema.messages.id,
+      senderType: schema.messages.senderType,
+      metadata: schema.messages.metadata,
+      createdAt: schema.messages.createdAt,
+    })
+    .from(schema.messages)
+    .where(
+      and(
+        eq(schema.messages.conversationId, input.conversationId),
+        sql`${schema.messages.senderType} <> 'contact'`,
+      ),
+    )
+    .orderBy(desc(schema.messages.createdAt))
+    .limit(input.limit);
+
+  const turns: RecentOutboundTurn[] = rows.map((row) => {
+    const meta = (row.metadata ?? {}) as Record<string, unknown>;
+    const runId = typeof meta['atlas_journey_run_id'] === 'string'
+      ? meta['atlas_journey_run_id']
+      : undefined;
+    const nodeId = typeof meta['atlas_node_id'] === 'string' ? meta['atlas_node_id'] : undefined;
+    return {
+      messageId: row.id,
+      senderType: row.senderType as 'user' | 'bot' | 'system',
+      createdAt: row.createdAt,
+      ...(runId ? { runId } : {}),
+      ...(nodeId ? { nodeId } : {}),
+    };
+  });
+
+  return { turns };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Write-tool shared helpers (T-021)
 // ──────────────────────────────────────────────────────────────────────────────
 

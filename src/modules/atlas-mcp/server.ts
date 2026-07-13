@@ -12,6 +12,8 @@ import {
   assignUserInputSchema,
   getInboxPlaybookHandler,
   getInboxPlaybookInputSchema,
+  getRecentOutboundHandler,
+  getRecentOutboundInputSchema,
   getThreadHandler,
   getThreadInputSchema,
   listInboxesHandler,
@@ -177,6 +179,29 @@ export function buildMcpServer(
     async (args) => {
       try {
         const result = await searchHandler(db, args);
+        return toToolResult(result);
+      } catch (err) {
+        const mapped = mapToolError(err);
+        if (mapped) return mapped;
+        throw err;
+      }
+    },
+  );
+
+  // ── messaging.get_recent_outbound (Task 1.2 — reply-correlator) ───────────
+  // Not ctx-scoped, same reasoning as get_thread/list_threads/search above —
+  // the caller is reacting to a conversation_turn envelope for this exact
+  // conversation, already gated upstream by viewable_by (L-405/L-408).
+  server.registerTool(
+    'messaging.get_recent_outbound',
+    {
+      description:
+        "Return the most recent OUTBOUND turns (senderType != 'contact') on a conversation, most-recent-first. Each item carries {messageId, senderType, createdAt, runId?, nodeId?} — runId/nodeId are present when the turn was sent by an Atlas journey (upsert_conversation_and_send). Used by the Atlas reply-correlator to detect when an inbound reply follows a journey send.",
+      inputSchema: getRecentOutboundInputSchema.shape,
+    },
+    async (args) => {
+      try {
+        const result = await getRecentOutboundHandler(db, args);
         return toToolResult(result);
       } catch (err) {
         const mapped = mapToolError(err);
