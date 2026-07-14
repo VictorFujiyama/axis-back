@@ -246,7 +246,7 @@ export function buildMcpServer(
     'messaging.list_inboxes',
     {
       description:
-        "List the inboxes of the caller Atlas org's axis account. Each item carries {id, name, channelType, enabled, configured, capabilities:{supportsOutbound,requiresTemplate,requiresUserInit}, identifier, updatedAt}. Filter by channelType; pass enabledOnly:false to include disabled inboxes. `configured` reflects whether minimum send credentials are present (secrets are never returned).",
+        "List the inboxes of the caller Atlas org's axis account. Each item carries {id, name, channelType, enabled, configured, capabilities:{supportsOutbound,requiresTemplate,requiresUserInit}, identifier, updatedAt, hasBot}. Filter by channelType; pass enabledOnly:false to include disabled inboxes. `configured` reflects whether minimum send credentials are present (secrets are never returned). `hasBot=true` when the inbox has a `default_bot_id` assigned — used by the Journey Builder to warn on msg-email nodes that replies won't branch without a bot.",
       inputSchema: listInboxesInputSchema.shape,
     },
     async (args) => {
