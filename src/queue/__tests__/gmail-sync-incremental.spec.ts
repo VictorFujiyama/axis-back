@@ -754,6 +754,57 @@ describe('processGmailSyncJob — incremental path', () => {
     const payload = ingest.mock.calls[0]![1] as { threadHints: string[] };
     expect(payload.threadHints).toContain(outboundMsgId);
   });
+
+  it('skips messages where From matches the inbox sender identity (self-loopback guard)', async () => {
+    // Reproduces the Yuji-182 loop: axis-back sends outbound as
+    // victoryuji182@gmail.com to victoryuji182@gmail.com (dev/test setup with
+    // sender=receiver). Gmail delivers the mail back into the same inbox; the
+    // sync worker must NOT ingest it as a "contact reply" — otherwise the
+    // assigned bot responds and an infinite ping-pong starts. This case is NOT
+    // covered by the RFC 3834 auto-responder guard (no Auto-Submitted header).
+    const senderEmail = 'victoryuji182@gmail.com';
+    const inbox = buildHealthyInbox({
+      config: { provider: 'gmail', gmailEmail: senderEmail, gmailHistoryId: 'h-start' },
+    });
+    const { app, log } = buildApp([inbox]);
+    const echo = buildFullGmailMessage('echo-1', {
+      threadId: 'thr-1',
+      headers: [
+        { name: 'From', value: `"Yuji Bot" <${senderEmail}>` },
+        { name: 'To', value: senderEmail },
+        { name: 'Subject', value: 'Re: Yuji 182' },
+        { name: 'Message-ID', value: '<echo-mid@axisbrasil.ai>' },
+      ],
+      bodyText: 'Olá! Como posso ajudar você hoje?',
+    });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [
+            { id: 'r-1', messagesAdded: [{ message: { id: 'echo-1', threadId: 'thr-1' } }] },
+          ],
+          historyId: 'h-end',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(echo));
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn();
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    // Ingest MUST NOT be called for the self-loopback message.
+    expect(ingest).not.toHaveBeenCalled();
+    // Observable log at info-level with the self-loopback reason.
+    expect(log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ skipReason: 'self-loopback' }),
+      expect.stringMatching(/self-loopback/i),
+    );
+  });
 });
 
 describe('processGmailSyncJob — incremental path → mark-read (T-39)', () => {

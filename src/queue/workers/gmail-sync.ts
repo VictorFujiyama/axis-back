@@ -243,14 +243,37 @@ async function listHistoryEvents(
  * prefers the RFC `Message-ID` header (matches Postmark dedup) and falls back
  * to Gmail's opaque message id, which is always present.
  */
+/**
+ * Result union for `buildIngestPayload`. Success carries the parsed payload +
+ * attachments; skips carry a reason so the caller can log at the right level
+ * (self-loopback is expected in dev/test setups where sender=receiver — info,
+ * not warn).
+ */
+type BuildIngestResult =
+  | { payload: IncomingMessage; attachments: ParsedGmailAttachment[] }
+  | { skipReason: 'no-from' | 'self-loopback' };
+
 function buildIngestPayload(
   inboxId: string,
   raw: GmailMessage,
-): { payload: IncomingMessage; attachments: ParsedGmailAttachment[] } | null {
+  inboxSenderEmail?: string | null,
+): BuildIngestResult {
   const parsed = parseGmailMessage(raw);
-  if (!parsed.from) return null;
+  if (!parsed.from) return { skipReason: 'no-from' };
 
   const email = parsed.from.email.toLowerCase();
+
+  // Self-loopback guard: when From matches this inbox's own sender identity,
+  // the outbound we just sent is being re-ingested (happens when From/To are
+  // the same Gmail account — dev/test setups, or Gmail forwarding-to-self
+  // rules). Without this guard the sync worker converts every outbound into
+  // a "contact reply", the assigned bot responds, and an infinite ping-pong
+  // starts. RFC 3834 headers do NOT cover this — the auto-responder isn't a
+  // vacation responder, it's the mailbox echoing the sender's own mail.
+  if (inboxSenderEmail && email === inboxSenderEmail.toLowerCase()) {
+    return { skipReason: 'self-loopback' };
+  }
+
   const name = parsed.from.name?.trim() || (email.split('@')[0] ?? email);
 
   const payload: IncomingMessage = {
@@ -476,13 +499,24 @@ async function processMessageIds(
   downloadAttachment: DownloadAttachmentImpl,
   uploadAttachment: UploadAttachmentImpl,
 ): Promise<void> {
+  const inboxSenderEmail =
+    typeof inbox.config === 'object' &&
+    inbox.config !== null &&
+    'gmailEmail' in inbox.config &&
+    typeof (inbox.config as { gmailEmail?: unknown }).gmailEmail === 'string'
+      ? ((inbox.config as { gmailEmail: string }).gmailEmail)
+      : null;
   for (const id of messageIds) {
     const raw = await fetchFullGmailMessage(id, accessToken, fetchImpl);
-    const built = buildIngestPayload(inbox.id, raw);
-    if (!built) {
-      app.log.warn(
-        { inboxId: inbox.id, gmailMessageId: raw.id },
-        'gmail-sync: no From header, skipping message',
+    const built = buildIngestPayload(inbox.id, raw, inboxSenderEmail);
+    if ('skipReason' in built) {
+      const logFn = built.skipReason === 'self-loopback' ? app.log.info : app.log.warn;
+      logFn.call(
+        app.log,
+        { inboxId: inbox.id, gmailMessageId: raw.id, skipReason: built.skipReason },
+        built.skipReason === 'self-loopback'
+          ? 'gmail-sync: self-loopback detected (From matches inbox sender), skipping message'
+          : 'gmail-sync: no From header, skipping message',
       );
       continue;
     }
