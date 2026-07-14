@@ -251,6 +251,12 @@ export async function processBuiltinBot(
       content: cfg.greetingMessage,
     });
     log.info({ botId: bot.id, conversationId: input.conversationId }, 'builtin-bot: greeting sent');
+    // Greeting is the bot's turn for this inbound — DO NOT fall through to the
+    // LLM path or the contact receives two bot messages back-to-back (greeting
+    // + LLM reply). Confirmed by Yuji-182 E2E on 2026-07-14: every first
+    // inbound generated 2 responses ~250ms apart. Handoff/max-turns/LLM
+    // branches all fire on the NEXT inbound naturally.
+    return;
   }
 
   // ── 5. Check handoff keywords in contact's message ────────────────

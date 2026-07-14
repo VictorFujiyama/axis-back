@@ -377,3 +377,58 @@ describe('processBuiltinBot — playbook integration', () => {
     expect(findPlaybookFetchInsert(insertCalls)).toBeUndefined();
   });
 });
+
+describe('processBuiltinBot — greeting message (bug #A3 regression guard)', () => {
+  beforeEach(() => {
+    mockedFetchPlaybook.mockReset();
+    mockedCallLLM.mockReset();
+    mockedCallLLM.mockResolvedValue({
+      content: 'bot reply from LLM',
+      usage: { promptTokens: 1, completionTokens: 1 },
+      finishReason: 'stop',
+    });
+  });
+
+  it('greeting-only turn: returns after greeting insert WITHOUT calling LLM (previously fell through → 2 bot messages)', async () => {
+    // Setup: config has greetingMessage, history only carries the contact's
+    // brand-new msg (0 prior bot msgs) → greeting branch fires. Before the
+    // fix, the function fell through to the LLM path and inserted a SECOND
+    // bot msg for the same inbound. See E2E Yuji-182 2026-07-14
+    // (19:37:02.608 + 19:37:02.851, 243ms apart). The observable behavior
+    // that guards this is that the LLM was NOT called at all on the
+    // greeting-only turn.
+    const { db } = buildDb({
+      bot: makeBotRow(makeBaseConfig({ greetingMessage: 'Olá! Como posso ajudar?' })),
+    });
+    const app = makeApp();
+
+    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
+
+    // Critical assertion: LLM never called on the first-inbound greeting turn.
+    // If the guard `return` after greeting is removed, this fails with
+    // `expected 0 to be 0` → `expected 1 to be 0`.
+    expect(mockedCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('follow-up turn: greeting condition (botMessages.length === 0) is false → LLM path fires', async () => {
+    // History carries a prior bot msg + a NEW contact msg. Greeting condition
+    // is false, so the function skips section 4 and reaches the LLM path.
+    // This test confirms the fix does NOT break follow-up interactions
+    // (greeting is not accidentally repeated).
+    const history = [
+      { id: 'prior-bot-msg', conversationId: INPUT.conversationId, content: 'Olá!', senderType: 'bot', isPrivateNote: false },
+      { id: INPUT.newMessageId, conversationId: INPUT.conversationId, content: 'segunda pergunta', senderType: 'contact', isPrivateNote: false },
+    ];
+    const { db } = buildDb({
+      bot: makeBotRow(makeBaseConfig({ greetingMessage: 'Olá! Como posso ajudar?' })),
+      history,
+    });
+    const app = makeApp();
+
+    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
+
+    // Critical assertion: LLM called exactly once on follow-up (not zero,
+    // not two).
+    expect(mockedCallLLM).toHaveBeenCalledTimes(1);
+  });
+});
