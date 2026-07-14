@@ -147,12 +147,15 @@ export function subscribeAtlasEvents(app: FastifyInstance): void {
 
     if (!runLegacy) return;
     try {
+      // BullMQ Custom Ids reject `:` (throws `Custom Id cannot contain :`), so
+      // strip it before enqueueing. The payload's `sourceRef` / `jobId` fields
+      // keep their `:` separators — this only sanitizes the queue-level key.
       if (config.USE_PHASE_12_ENVELOPE) {
         const envelope = await buildEnvelopeForEvent(app.db, event);
-        if (envelope) await queue.add(envelope.kind, envelope, { jobId: envelope.sourceRef });
+        if (envelope) await queue.add(envelope.kind, envelope, { jobId: envelope.sourceRef.replaceAll(':', '_') });
       } else {
         const mapped = mapLegacyEvent(event);
-        if (mapped) await queue.add(mapped.payload.type, mapped.payload, { jobId: mapped.jobId });
+        if (mapped) await queue.add(mapped.payload.type, mapped.payload, { jobId: mapped.jobId.replaceAll(':', '_') });
       }
     } catch (err) {
       app.log.warn({ err, eventType: event.type }, 'atlas-events: enqueue failed');

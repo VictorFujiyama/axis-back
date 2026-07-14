@@ -384,7 +384,46 @@ describe('subscribeAtlasEvents', () => {
         actors: [{ kind: 'contact', id: 'contact-1' }],
         viewableBy: { scope: 'org' },
       });
-      expect(opts).toEqual({ jobId: 'conv-abc:message_sent:msg-xyz' });
+      expect(opts).toEqual({ jobId: 'conv-abc_message_sent_msg-xyz' });
+    });
+
+    // BullMQ Custom Ids reject `:` (throws `Custom Id cannot contain :`).
+    // The envelope's `sourceRef` uses `:` as a structural separator, so the
+    // jobId must be sanitized before it hits `queue.add`. Payload is untouched.
+    it('sanitizes ":" out of the jobId (BullMQ Custom Id constraint)', async () => {
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(
+        VALID_SECRET,
+        'true',
+      );
+      const msgRow = {
+        id: 'msg-xyz',
+        conversationId: 'conv-abc',
+        senderType: 'contact',
+        senderId: 'contact-1',
+        content: 'hello world',
+        createdAt: new Date('2026-05-11T12:00:00Z'),
+      };
+      const { app, queues } = buildAppStub([
+        [botManagedConvRow],
+        [convRow],
+        [inboxRow],
+        [msgRow],
+      ]);
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'message.created',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-abc',
+        message: makeMessage({ id: 'msg-xyz', senderType: 'contact', content: 'hello world' }),
+      });
+      await flushMicrotasks();
+
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [, payload, opts] = queues.add.mock.calls[0]!;
+      expect((opts as { jobId: string }).jobId).not.toContain(':');
+      // Payload sourceRef is untouched — audit / dedupe key stays structural.
+      expect((payload as { sourceRef: string }).sourceRef).toContain(':');
     });
 
     it('enqueues handoff conversation_turn envelope when conversation.assigned has assignedBotId === null', async () => {
@@ -420,8 +459,9 @@ describe('subscribeAtlasEvents', () => {
         viewableBy: { scope: 'org' },
       });
       const jobOpts = opts as { jobId: string };
-      expect(jobOpts.jobId).toMatch(/^conv-handoff:handoff:\d+$/);
-      expect((payload as { sourceRef: string }).sourceRef).toBe(jobOpts.jobId);
+      expect(jobOpts.jobId).toMatch(/^conv-handoff_handoff_\d+$/);
+      // Payload sourceRef keeps its `:` separators; jobId is the sanitized form.
+      expect((payload as { sourceRef: string }).sourceRef.replaceAll(':', '_')).toBe(jobOpts.jobId);
     });
 
     it('enqueues resolved conversation_turn envelope on conversation.resolved', async () => {
@@ -454,7 +494,7 @@ describe('subscribeAtlasEvents', () => {
         summary: 'Resolved',
         actors: [],
       });
-      expect(opts).toEqual({ jobId: 'conv-res:resolved' });
+      expect(opts).toEqual({ jobId: 'conv-res_resolved' });
     });
   });
 
@@ -497,7 +537,7 @@ describe('subscribeAtlasEvents', () => {
         /^\d{4}-\d{2}-\d{2}T/,
       );
       expect(payload).not.toHaveProperty('kind');
-      expect(opts).toEqual({ jobId: 'conv-abc:message_sent:msg-xyz' });
+      expect(opts).toEqual({ jobId: 'conv-abc_message_sent_msg-xyz' });
     });
 
     it('enqueues Phase B handoff_to_human legacy job when conversation.assigned has assignedBotId === null', async () => {
@@ -532,7 +572,7 @@ describe('subscribeAtlasEvents', () => {
       });
       expect(payload).not.toHaveProperty('kind');
       const jobOpts = opts as { jobId: string };
-      expect(jobOpts.jobId).toMatch(/^conv-handoff:handoff:\d+$/);
+      expect(jobOpts.jobId).toMatch(/^conv-handoff_handoff_\d+$/);
     });
 
     it('enqueues Phase B conversation_resolved legacy job on conversation.resolved', async () => {
@@ -563,7 +603,7 @@ describe('subscribeAtlasEvents', () => {
       });
       expect(payload).not.toHaveProperty('messageId');
       expect(payload).not.toHaveProperty('kind');
-      expect(opts).toEqual({ jobId: 'conv-res:resolved' });
+      expect(opts).toEqual({ jobId: 'conv-res_resolved' });
     });
   });
 
