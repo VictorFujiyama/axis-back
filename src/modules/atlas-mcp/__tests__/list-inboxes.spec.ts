@@ -44,6 +44,7 @@ function inboxRow(over: Partial<{
   enabled: boolean;
   config: unknown;
   secrets: string | null;
+  defaultBotId: string | null;
   updatedAt: Date;
 }>) {
   return {
@@ -53,6 +54,7 @@ function inboxRow(over: Partial<{
     enabled: true,
     config: {},
     secrets: null,
+    defaultBotId: null,
     updatedAt: new Date('2026-06-01T00:00:00Z'),
     ...over,
   };
@@ -213,5 +215,41 @@ describe('listInboxesHandler (T-03)', () => {
 
     const result = await listInboxesHandler(db, { channelType: 'whatsapp', enabledOnly: true }, CTX);
     expect(result.inboxes).toEqual([]);
+  });
+
+  it('returns hasBot=false when the inbox row has default_bot_id=null', async () => {
+    const { db } = makeDb([
+      [linkRow],
+      [
+        inboxRow({
+          id: 'inbox-uuid-1',
+          name: 'no-bot',
+          channelType: 'email',
+          defaultBotId: null,
+        }),
+      ],
+    ]);
+
+    const result = await listInboxesHandler(db, { channelType: 'email', enabledOnly: true }, CTX);
+    expect(result.inboxes).toHaveLength(1);
+    expect(result.inboxes[0]?.hasBot).toBe(false);
+  });
+
+  it('returns hasBot=true when the inbox row has a default_bot_id uuid', async () => {
+    const { db } = makeDb([
+      [linkRow],
+      [
+        inboxRow({
+          id: 'inbox-uuid-2',
+          name: 'with-bot',
+          channelType: 'email',
+          defaultBotId: '178e9648-7457-41e1-bdf6-5e7af58b8abb',
+        }),
+      ],
+    ]);
+
+    const result = await listInboxesHandler(db, { channelType: 'email', enabledOnly: true }, CTX);
+    expect(result.inboxes).toHaveLength(1);
+    expect(result.inboxes[0]?.hasBot).toBe(true);
   });
 });

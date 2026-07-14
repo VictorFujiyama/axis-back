@@ -1180,6 +1180,14 @@ export interface ListInboxesItem {
   capabilities: InboxCapabilities;
   /** Human-facing send identity (phone / from-email); null when not stored. */
   identifier: string | null;
+  /**
+   * True quando `inboxes.default_bot_id` está setado. O Journey Builder do
+   * Atlas usa isso pra avisar que replies do lead não vão ramificar o
+   * flow-engagement se essa inbox for usada em msg-email node (smart-handoff
+   * gate em `src/modules/atlas-events/enqueue.ts:125-138` descarta inbounds
+   * de conv sem bot atribuído).
+   */
+  hasBot: boolean;
   updatedAt: Date;
 }
 
@@ -1296,6 +1304,7 @@ export async function listInboxesHandler(
       enabled: schema.inboxes.enabled,
       config: schema.inboxes.config,
       secrets: schema.inboxes.secrets,
+      defaultBotId: schema.inboxes.defaultBotId,
       updatedAt: schema.inboxes.updatedAt,
     })
     .from(schema.inboxes)
@@ -1313,6 +1322,7 @@ export async function listInboxesHandler(
       configured: isInboxConfigured(channelType, row.config, decrypted),
       capabilities: capabilitiesForChannel(channelType),
       identifier: identifierForInbox(channelType, row.config),
+      hasBot: row.defaultBotId !== null,
       updatedAt: row.updatedAt,
     };
   });
