@@ -7,6 +7,7 @@ import {
   type SendGmailDeps,
 } from '../gmail-sender.js';
 import type { SendEmailInput } from '../email-sender.js';
+import { stringifySqlChunks } from '../../../test-support/drizzle-sql-inspect.js';
 
 const ACCESS_TOKEN = 'ya29.test-access-token';
 const SEND_URL = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
@@ -867,26 +868,22 @@ describe('sendViaGmail — Message-ID persistence', () => {
     // The patch object shape: `metadata` should be a Drizzle `sql` template
     // (SQL fragment) whose serialized form contains both keys. We flatten
     // its `queryChunks` (Drizzle stores string fragments + column refs +
-    // param objects there) so we can assert on the text without wrestling
-    // with the circular PgTable graph inside column references.
+    // param objects there) via the shared helper so we can assert on the
+    // text without wrestling with the circular PgTable graph inside column
+    // references.
     const patch = dbStub.updateSet.mock.calls[0]![0] as {
       metadata: { queryChunks?: unknown[] };
     };
     expect(patch.metadata).toBeDefined();
     expect(Array.isArray(patch.metadata.queryChunks)).toBe(true);
-    const seen = new WeakSet<object>();
-    const safe = JSON.stringify(patch.metadata.queryChunks, (_k, v) => {
-      if (typeof v === 'object' && v !== null) {
-        if (seen.has(v)) return '[Circular]';
-        seen.add(v);
-      }
-      return v;
-    });
+    const safe = stringifySqlChunks(patch.metadata.queryChunks);
     expect(safe).toContain('gmailMessageId');
     expect(safe).toContain('gmail-internal-abc');
     expect(safe).toContain('gmailThreadId');
     expect(safe).toContain('thr-xyz');
-    // Should merge, not overwrite (uses `||` operator or `jsonb` cast).
-    expect(safe).toMatch(/\|\||jsonb/i);
+    // Should merge, not overwrite — assert the JSONB `||` operator is present.
+    // (The previous `/\|\||jsonb/i` alternation matched a bare `::jsonb` cast,
+    // which does not prove a merge — only a JSONB shape somewhere.)
+    expect(safe).toMatch(/\|\|/);
   });
 });

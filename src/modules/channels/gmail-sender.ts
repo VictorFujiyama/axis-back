@@ -50,6 +50,9 @@ export function composeMimeRfc5322(opts: ComposeMimeOptions): string {
     'Content-Type: text/plain; charset=UTF-8',
     'Content-Transfer-Encoding: 8bit',
   ];
+  // Truthy guard — empty string silently drops the header. Callers must
+  // generate a valid non-empty RFC 5322 msg-id (see RFC_MSG_ID_DOMAIN
+  // construction in sendViaGmail).
   if (opts.messageId) {
     lines.push(`Message-ID: ${opts.messageId}`);
   }
@@ -178,6 +181,11 @@ export async function sendViaGmail(
 
   if (res.ok) {
     const deliveredAt = new Date();
+    // Convention: camelCase for Gmail-native fields (mirrors gmail-parse.ts
+    // inbound side); Atlas-native stampings (`atlas_journey_run_id`,
+    // `atlas_node_id`) live in the same JSONB blob but use snake_case
+    // (matches upsert_and_send in atlas-mcp/tools.ts). Mixed casing is
+    // intentional per-provider — do not normalize without touching both sides.
     const gmailPatch = { gmailMessageId: data.id, gmailThreadId: data.threadId };
     await db
       .update(schema.messages)
