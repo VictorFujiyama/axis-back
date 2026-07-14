@@ -321,6 +321,23 @@ describe('composeMimeRfc5322 — Message-ID header', () => {
     if (inReplyIdx > -1) expect(midIdx).toBeLessThan(inReplyIdx);
   });
 
+  it('emits Message-ID BEFORE In-Reply-To when both are provided', () => {
+    const mime = composeMimeRfc5322({
+      from: { email: 'bot@axisbrasil.ai' },
+      to: 'lead@example.com',
+      subject: 'Re: Hello',
+      body: 'reply body',
+      messageId: '<uuid-mid@axisbrasil.ai>',
+      threadingHints: { inReplyTo: '<original@mail.gmail.com>', references: '<original@mail.gmail.com>' },
+    });
+    const headerBlock = mime.split('\r\n\r\n', 1)[0]!;
+    const midIdx = headerBlock.indexOf('Message-ID:');
+    const inReplyIdx = headerBlock.indexOf('In-Reply-To:');
+    expect(midIdx).toBeGreaterThan(-1);
+    expect(inReplyIdx).toBeGreaterThan(-1);
+    expect(midIdx).toBeLessThan(inReplyIdx);
+  });
+
   it('does not emit Message-ID header when messageId is absent (backwards compat)', () => {
     const mime = composeMimeRfc5322({
       from: { email: 'bot@axisbrasil.ai' },
