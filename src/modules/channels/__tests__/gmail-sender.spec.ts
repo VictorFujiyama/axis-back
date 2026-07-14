@@ -301,6 +301,37 @@ describe('composeMimeRfc5322', () => {
   });
 });
 
+describe('composeMimeRfc5322 — Message-ID header', () => {
+  it('emits `Message-ID: <...>` header when messageId is provided', () => {
+    const mime = composeMimeRfc5322({
+      from: { email: 'bot@axisbrasil.ai', name: 'Axis Bot' },
+      to: 'lead@example.com',
+      subject: 'Hello',
+      body: 'Hi there',
+      messageId: '<uuid-abc@axisbrasil.ai>',
+    });
+    // Header appears exactly once, on its own line, before the blank-line body separator.
+    expect(mime.match(/^Message-ID: <uuid-abc@axisbrasil\.ai>$/gm)).toHaveLength(1);
+    // Order: Message-ID precedes any threading header (In-Reply-To / References).
+    const headerBlock = mime.split('\r\n\r\n', 1)[0]!;
+    const midIdx = headerBlock.indexOf('Message-ID:');
+    const inReplyIdx = headerBlock.indexOf('In-Reply-To:');
+    expect(midIdx).toBeGreaterThan(-1);
+    // In-Reply-To pode nao existir; se existir, Message-ID vem antes.
+    if (inReplyIdx > -1) expect(midIdx).toBeLessThan(inReplyIdx);
+  });
+
+  it('does not emit Message-ID header when messageId is absent (backwards compat)', () => {
+    const mime = composeMimeRfc5322({
+      from: { email: 'bot@axisbrasil.ai' },
+      to: 'lead@example.com',
+      subject: 'Hello',
+      body: 'Hi there',
+    });
+    expect(mime).not.toContain('Message-ID:');
+  });
+});
+
 describe('sendViaGmail — happy path (T-45)', () => {
   it('POSTs to users.messages.send with Bearer token + JSON content-type', async () => {
     const { deps, fetchImpl, getAccessToken } = buildDeps();
@@ -418,7 +449,7 @@ describe('sendViaGmail — happy path (T-45)', () => {
     expect(body).not.toHaveProperty('threadId');
   });
 
-  it('on 200, updates the message row with deliveredAt + channelMsgId from response.id', async () => {
+  it('on 200, updates the message row with deliveredAt + RFC channelMsgId (Gmail internal id moves to metadata)', async () => {
     const { deps, dbStub, fetchImpl } = buildDeps();
     fetchImpl.mockResolvedValueOnce(
       jsonResponse({ id: 'gmail-msg-id-RESP', threadId: 'thr-1', labelIds: ['SENT'] }),
@@ -433,7 +464,9 @@ describe('sendViaGmail — happy path (T-45)', () => {
       channelMsgId?: string | null;
       deliveredAt?: Date;
     };
-    expect(patch.channelMsgId).toBe('gmail-msg-id-RESP');
+    // channelMsgId is now the RFC Message-ID (matches inbound extraction), not
+    // the Gmail internal id. The Gmail id is preserved in metadata.gmailMessageId.
+    expect(patch.channelMsgId).toBe('<11111111-1111-1111-1111-111111111111@axisbrasil.ai>');
     expect(patch.deliveredAt).toBeInstanceOf(Date);
   });
 
@@ -767,5 +800,76 @@ describe('sendViaGmail — idempotency (T-47)', () => {
       expect(messages.some((m) => /already delivered, skip/.test(m))).toBe(true);
       expect(messages.some((m) => /terminally failed, skip/.test(m))).toBe(false);
     });
+  });
+});
+
+describe('sendViaGmail — Message-ID persistence', () => {
+  it('injects deterministic Message-ID <${messageId}@axisbrasil.ai> in the outbound MIME', async () => {
+    const { deps, dbStub, fetchImpl } = buildDeps();
+    fetchImpl.mockResolvedValueOnce(
+      jsonResponse({ id: 'gmail-internal-abc', threadId: 'thr-xyz' }),
+    );
+    const input = buildInput({ messageId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' });
+    const config = { provider: 'gmail' as const, gmailEmail: 'bot@axisbrasil.ai', fromName: 'Axis' };
+
+    await sendViaGmail(input, config, null, null, deps);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toBe(SEND_URL);
+    const body = JSON.parse((init as RequestInit).body as string) as { raw: string };
+    const mime = Buffer.from(body.raw, 'base64url').toString('utf8');
+    expect(mime).toContain('Message-ID: <aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa@axisbrasil.ai>');
+    expect(dbStub.updateSet).toHaveBeenCalled();
+  });
+
+  it('persists channelMsgId = <messageId@axisbrasil.ai> (not the Gmail internal id) after 200', async () => {
+    const { deps, dbStub, fetchImpl } = buildDeps();
+    fetchImpl.mockResolvedValueOnce(
+      jsonResponse({ id: 'gmail-internal-abc', threadId: 'thr-xyz' }),
+    );
+    const input = buildInput({ messageId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' });
+    const config = { provider: 'gmail' as const, gmailEmail: 'bot@axisbrasil.ai' };
+
+    await sendViaGmail(input, config, null, null, deps);
+
+    const patch = dbStub.updateSet.mock.calls[0]![0] as { channelMsgId: string };
+    expect(patch.channelMsgId).toBe('<bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb@axisbrasil.ai>');
+  });
+
+  it('moves data.id/threadId into metadata via JSONB merge', async () => {
+    const { deps, dbStub, fetchImpl } = buildDeps();
+    fetchImpl.mockResolvedValueOnce(
+      jsonResponse({ id: 'gmail-internal-abc', threadId: 'thr-xyz' }),
+    );
+    const input = buildInput({ messageId: 'cccccccc-cccc-cccc-cccc-cccccccccccc' });
+    const config = { provider: 'gmail' as const, gmailEmail: 'bot@axisbrasil.ai' };
+
+    await sendViaGmail(input, config, null, null, deps);
+
+    // The patch object shape: `metadata` should be a Drizzle `sql` template
+    // (SQL fragment) whose serialized form contains both keys. We flatten
+    // its `queryChunks` (Drizzle stores string fragments + column refs +
+    // param objects there) so we can assert on the text without wrestling
+    // with the circular PgTable graph inside column references.
+    const patch = dbStub.updateSet.mock.calls[0]![0] as {
+      metadata: { queryChunks?: unknown[] };
+    };
+    expect(patch.metadata).toBeDefined();
+    expect(Array.isArray(patch.metadata.queryChunks)).toBe(true);
+    const seen = new WeakSet<object>();
+    const safe = JSON.stringify(patch.metadata.queryChunks, (_k, v) => {
+      if (typeof v === 'object' && v !== null) {
+        if (seen.has(v)) return '[Circular]';
+        seen.add(v);
+      }
+      return v;
+    });
+    expect(safe).toContain('gmailMessageId');
+    expect(safe).toContain('gmail-internal-abc');
+    expect(safe).toContain('gmailThreadId');
+    expect(safe).toContain('thr-xyz');
+    // Should merge, not overwrite (uses `||` operator or `jsonb` cast).
+    expect(safe).toMatch(/\|\||jsonb/i);
   });
 });

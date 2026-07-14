@@ -1,5 +1,5 @@
 import type { FastifyBaseLogger } from 'fastify';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { schema, type DB } from '@blossom/db';
 import { eventBus } from '../../realtime/event-bus.js';
 import type { GmailConfig } from './gmail-config.js';
@@ -20,6 +20,7 @@ export interface ComposeMimeOptions {
   to: string;
   subject: string;
   body: string;
+  messageId?: string;
   threadingHints?: ThreadingHints;
 }
 
@@ -49,6 +50,9 @@ export function composeMimeRfc5322(opts: ComposeMimeOptions): string {
     'Content-Type: text/plain; charset=UTF-8',
     'Content-Transfer-Encoding: 8bit',
   ];
+  if (opts.messageId) {
+    lines.push(`Message-ID: ${opts.messageId}`);
+  }
   if (opts.threadingHints?.inReplyTo) {
     lines.push(`In-Reply-To: ${opts.threadingHints.inReplyTo}`);
   }
@@ -60,6 +64,10 @@ export function composeMimeRfc5322(opts: ComposeMimeOptions): string {
 
 const GMAIL_SEND_URL = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
 const FETCH_TIMEOUT_MS = 15_000;
+
+/** RFC 5322 Message-ID domain. Se um dia mudar de domain principal, este valor
+ *  vira opaque token compat porque o Message-ID vira reverse-lookup por uuid. */
+const RFC_MSG_ID_DOMAIN = 'axisbrasil.ai';
 
 export type GmailSendOutcome =
   | { kind: 'delivered'; httpStatus: 200 }
@@ -134,11 +142,14 @@ export async function sendViaGmail(
     return;
   }
 
+  const rfcMessageId = `<${input.messageId}@${RFC_MSG_ID_DOMAIN}>`;
+
   const mime = composeMimeRfc5322({
     from: { email: gmailEmail, name: fromName },
     to: input.contactEmail,
     subject: input.subject,
     body: input.text,
+    messageId: rfcMessageId,
     threadingHints: inReplyToMessageId
       ? { inReplyTo: inReplyToMessageId, references: inReplyToMessageId }
       : undefined,
@@ -167,10 +178,12 @@ export async function sendViaGmail(
 
   if (res.ok) {
     const deliveredAt = new Date();
+    const gmailPatch = { gmailMessageId: data.id, gmailThreadId: data.threadId };
     await db
       .update(schema.messages)
       .set({
-        channelMsgId: data.id ?? null,
+        channelMsgId: rfcMessageId,
+        metadata: sql`COALESCE(${schema.messages.metadata}, '{}'::jsonb) || ${JSON.stringify(gmailPatch)}::jsonb`,
         deliveredAt,
       })
       .where(eq(schema.messages.id, input.messageId));
