@@ -7,6 +7,7 @@ import { config as appConfig } from '../../config';
 import { decryptJSON, encryptJSON, sha256 } from '../../crypto';
 import { writeAudit } from '../../lib/audit';
 import { applyAutoBotForInbox, type AutoBotReason, defaultModelFor } from './auto-bot';
+import { backfillAssignedBotIdOnBotChange } from './backfill';
 import { validateApiKey } from './api-key-validator';
 import {
   deleteTelegramWebhook,
@@ -399,7 +400,20 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
       if (body.defaultBotId !== undefined) patch.defaultBotId = body.defaultBotId;
 
       let inbox: typeof schema.inboxes.$inferSelect | undefined;
+      let previousDefaultBotId: string | null = null;
       await app.db.transaction(async (tx) => {
+        // Capture the current default_bot_id BEFORE the update so we can detect
+        // a null→bot transition (or any change) and backfill assigned_bot_id on
+        // existing open threads. Without this the operator sets a bot but live
+        // conversations stay assigned_bot_id=null and the bot chat flow
+        // silently skips them — bug #A2 root cause (see backfill.ts).
+        const [beforeRow] = await tx
+          .select({ defaultBotId: schema.inboxes.defaultBotId })
+          .from(schema.inboxes)
+          .where(and(eq(schema.inboxes.id, id), eq(schema.inboxes.accountId, req.user.accountId), isNull(schema.inboxes.deletedAt)))
+          .limit(1);
+        previousDefaultBotId = beforeRow?.defaultBotId ?? null;
+
         const [updated] = await tx
           .update(schema.inboxes)
           .set(patch)
@@ -442,6 +456,34 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
             newApiKey: body.botLlmApiKey,
             newProvider: body.botLlmProvider,
           });
+        }
+
+        // Bug #A2 backfill — if defaultBotId just transitioned to a real bot
+        // (from null OR from a different bot), adopt any open/pending/snoozed
+        // threads that never had a bot attached. Re-read the row inside the
+        // same tx because applyAutoBotForInbox may have changed defaultBotId
+        // above (it owns the auto-bot lifecycle writes per D20).
+        // Wrapped: backfill is a side effect on top of a successful inbox
+        // update. If it fails, we log warn but let the tx commit — the primary
+        // write must not roll back over a bonus adoption.
+        try {
+          const [afterRow] = await tx
+            .select({ defaultBotId: schema.inboxes.defaultBotId })
+            .from(schema.inboxes)
+            .where(eq(schema.inboxes.id, id))
+            .limit(1);
+          const currentBotId = afterRow?.defaultBotId ?? null;
+          if (currentBotId && currentBotId !== previousDefaultBotId) {
+            const adopted = await backfillAssignedBotIdOnBotChange(tx, id, currentBotId);
+            if (adopted > 0) {
+              app.log.info(
+                { inboxId: id, botId: currentBotId, adopted, previousBotId: previousDefaultBotId },
+                'inboxes: backfilled assigned_bot_id on open threads after default_bot_id change',
+              );
+            }
+          }
+        } catch (err) {
+          app.log.warn({ err, inboxId: id }, 'inboxes: assigned_bot_id backfill failed (non-fatal)');
         }
       });
 

@@ -13,6 +13,7 @@ import {
 import { clearConnectorCache } from '../atlas-events/connector';
 import { hashPassword } from '../auth/password';
 import { runHandshake } from '../../scripts/atlas-handshake';
+import { backfillAssignedBotIdOnBotChange } from '../inboxes/backfill';
 
 /**
  * [Connect Flow / Phase 12.2 — T-07] Server-to-server provisioning endpoint.
@@ -379,6 +380,23 @@ export async function atlasProvisionRoutes(app: FastifyInstance): Promise<void> 
         .update(schema.inboxes)
         .set({ defaultBotId: botsRowId, updatedAt: new Date() })
         .where(eq(schema.inboxes.id, inboxId));
+      // Bug #A2 backfill — after switching the inbox's default bot, adopt any
+      // open/pending/snoozed threads that had no bot attached. Mirrors the
+      // twin in `inboxes/routes.ts` PATCH; see `backfill.ts` for contract.
+      // Wrapped: backfill is a side effect on top of a successful default_bot
+      // change. If it fails, we log and still succeed the endpoint (the
+      // primary write already committed).
+      try {
+        const adopted = await backfillAssignedBotIdOnBotChange(app.db, inboxId, botsRowId);
+        if (adopted > 0) {
+          app.log.info(
+            { inboxId, botId: botsRowId, adopted },
+            'atlas-connector: backfilled assigned_bot_id on open threads after default_bot_id change',
+          );
+        }
+      } catch (err) {
+        app.log.warn({ err, inboxId, botId: botsRowId }, 'atlas-connector: assigned_bot_id backfill failed (non-fatal)');
+      }
       return reply.send({ ok: true, inboxId, defaultBotId: botsRowId, botsRowId, unchanged: false });
     },
   );

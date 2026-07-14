@@ -791,7 +791,8 @@ describe('POST /atlas-connector/set-inbox-default-bot (T-19-prime, D27/D30/Gap 3
         botType: 'builtin',
       });
       expect(updateSet.mock.calls[0]![0]).toMatchObject({ defaultBotId: NEW_BOT_ID });
-      expect(update).toHaveBeenCalledTimes(1);
+      // 2 updates now: (1) inboxes.default_bot_id, (2) conversations.assigned_bot_id backfill (bug #A2).
+      expect(update).toHaveBeenCalledTimes(2);
     } finally {
       await app.close();
     }
@@ -815,7 +816,8 @@ describe('POST /atlas-connector/set-inbox-default-bot (T-19-prime, D27/D30/Gap 3
       });
       expect(insert).not.toHaveBeenCalled();
       expect(updateSet.mock.calls[0]![0]).toMatchObject({ defaultBotId: EXISTING_BOT_ID });
-      expect(update).toHaveBeenCalledTimes(1);
+      // 2 updates: (1) inboxes.default_bot_id, (2) conversations.assigned_bot_id backfill (bug #A2).
+      expect(update).toHaveBeenCalledTimes(2);
     } finally {
       await app.close();
     }
