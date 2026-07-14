@@ -20,6 +20,7 @@ export interface ComposeMimeOptions {
   to: string;
   subject: string;
   body: string;
+  messageId?: string;
   threadingHints?: ThreadingHints;
 }
 
@@ -49,6 +50,9 @@ export function composeMimeRfc5322(opts: ComposeMimeOptions): string {
     'Content-Type: text/plain; charset=UTF-8',
     'Content-Transfer-Encoding: 8bit',
   ];
+  if (opts.messageId) {
+    lines.push(`Message-ID: ${opts.messageId}`);
+  }
   if (opts.threadingHints?.inReplyTo) {
     lines.push(`In-Reply-To: ${opts.threadingHints.inReplyTo}`);
   }

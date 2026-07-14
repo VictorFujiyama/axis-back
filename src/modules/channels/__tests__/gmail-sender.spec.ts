@@ -301,6 +301,37 @@ describe('composeMimeRfc5322', () => {
   });
 });
 
+describe('composeMimeRfc5322 — Message-ID header', () => {
+  it('emits `Message-ID: <...>` header when messageId is provided', () => {
+    const mime = composeMimeRfc5322({
+      from: { email: 'bot@axisbrasil.ai', name: 'Axis Bot' },
+      to: 'lead@example.com',
+      subject: 'Hello',
+      body: 'Hi there',
+      messageId: '<uuid-abc@axisbrasil.ai>',
+    });
+    // Header appears exactly once, on its own line, before the blank-line body separator.
+    expect(mime.match(/^Message-ID: <uuid-abc@axisbrasil\.ai>$/gm)).toHaveLength(1);
+    // Order: Message-ID precedes any threading header (In-Reply-To / References).
+    const headerBlock = mime.split('\r\n\r\n', 1)[0]!;
+    const midIdx = headerBlock.indexOf('Message-ID:');
+    const inReplyIdx = headerBlock.indexOf('In-Reply-To:');
+    expect(midIdx).toBeGreaterThan(-1);
+    // In-Reply-To pode nao existir; se existir, Message-ID vem antes.
+    if (inReplyIdx > -1) expect(midIdx).toBeLessThan(inReplyIdx);
+  });
+
+  it('does not emit Message-ID header when messageId is absent (backwards compat)', () => {
+    const mime = composeMimeRfc5322({
+      from: { email: 'bot@axisbrasil.ai' },
+      to: 'lead@example.com',
+      subject: 'Hello',
+      body: 'Hi there',
+    });
+    expect(mime).not.toContain('Message-ID:');
+  });
+});
+
 describe('sendViaGmail — happy path (T-45)', () => {
   it('POSTs to users.messages.send with Bearer token + JSON content-type', async () => {
     const { deps, fetchImpl, getAccessToken } = buildDeps();
