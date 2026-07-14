@@ -624,6 +624,52 @@ describe('processGmailSyncJob — incremental path', () => {
     expect(ingest).toHaveBeenCalledTimes(1);
     expect(ingest.mock.calls[0]![3]).toBe('bot-123');
   });
+
+  it('propagates a Journey-Builder-style In-Reply-To (<uuid@axisbrasil.ai>) into payload.threadHints', async () => {
+    const inbox = buildHealthyInbox();
+    const { app } = buildApp([inbox]);
+    const outboundMsgId = '<aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa@axisbrasil.ai>';
+    const inboundMessage = buildFullGmailMessage('gmail-reply-1', {
+      threadId: 'thr-1',
+      headers: [
+        { name: 'From', value: 'lead@example.com' },
+        { name: 'Subject', value: 'Re: Welcome' },
+        { name: 'Message-ID', value: '<lead-reply-abc@gmail.com>' },
+        { name: 'In-Reply-To', value: outboundMsgId },
+        { name: 'References', value: outboundMsgId },
+      ],
+      bodyText: 'Sim, quero saber mais.',
+    });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [
+            {
+              id: 'r-1',
+              messagesAdded: [
+                { message: { id: 'gmail-reply-1', threadId: 'thr-1' } },
+              ],
+            },
+          ],
+          historyId: 'h-end',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(inboundMessage))
+      .mockResolvedValueOnce(modifyResponse());
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockResolvedValue({ deduped: false });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    expect(ingest).toHaveBeenCalledTimes(1);
+    const payload = ingest.mock.calls[0]![1] as { threadHints: string[] };
+    expect(payload.threadHints).toContain(outboundMsgId);
+  });
 });
 
 describe('processGmailSyncJob — incremental path → mark-read (T-39)', () => {
