@@ -419,4 +419,55 @@ describe('parseGmailMessage', () => {
       expect(parseGmailMessage(raw).attachments).toEqual([]);
     });
   });
+
+  describe('auto-responder detection (RFC 3834)', () => {
+    function buildWithHeaders(headers: Array<{ name: string; value: string }>): GmailMessage {
+      return {
+        id: 'auto-header-fixture',
+        payload: {
+          mimeType: 'text/plain',
+          headers: [
+            { name: 'From', value: 'noreply@example.com' },
+            ...headers,
+          ],
+          body: { size: 4, data: encode('body') },
+        },
+      };
+    }
+
+    it('flags Auto-Submitted: auto-generated as an auto-responder (RFC 3834)', () => {
+      const parsed = parseGmailMessage(
+        buildWithHeaders([{ name: 'Auto-Submitted', value: 'auto-generated' }]),
+      );
+      expect(parsed.autoResponder).toBe(true);
+    });
+
+    it('flags Auto-Submitted: auto-replied as an auto-responder (vacation responder)', () => {
+      const parsed = parseGmailMessage(
+        buildWithHeaders([{ name: 'Auto-Submitted', value: 'auto-replied' }]),
+      );
+      expect(parsed.autoResponder).toBe(true);
+    });
+
+    it('flags Precedence: auto_reply as an auto-responder', () => {
+      const parsed = parseGmailMessage(
+        buildWithHeaders([{ name: 'Precedence', value: 'auto_reply' }]),
+      );
+      expect(parsed.autoResponder).toBe(true);
+    });
+
+    it('flags X-Autoreply presence (any value) as an auto-responder', () => {
+      const parsed = parseGmailMessage(
+        buildWithHeaders([{ name: 'X-Autoreply', value: 'yes' }]),
+      );
+      expect(parsed.autoResponder).toBe(true);
+    });
+
+    it('leaves autoResponder=false when no auto-responder headers are present', () => {
+      const parsed = parseGmailMessage(
+        buildWithHeaders([{ name: 'Subject', value: 'normal reply' }]),
+      );
+      expect(parsed.autoResponder).toBe(false);
+    });
+  });
 });

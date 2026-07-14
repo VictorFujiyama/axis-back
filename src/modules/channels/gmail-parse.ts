@@ -45,6 +45,15 @@ export interface ParsedGmailMessage {
   from?: ParsedAddress;
   metadata: ParsedGmailMetadata;
   attachments: ParsedGmailAttachment[];
+  /**
+   * True when RFC 3834 or common vendor auto-responder headers indicate this
+   * message was generated automatically (vacation responder, out-of-office,
+   * mailing list bounce, etc). Consumers MUST NOT trigger downstream bot
+   * replies for auto-responder inbounds — otherwise sender / recipient loops
+   * form (client's vacation responder replies to our bot → bot replies →
+   * vacation responder → ∞).
+   */
+  autoResponder: boolean;
 }
 
 function findFirstPart(
@@ -99,6 +108,29 @@ function collectAttachments(
   }
 }
 
+/**
+ * Detects whether the message is auto-generated per RFC 3834 or common vendor
+ * conventions. `Auto-Submitted` follows the RFC 3834 sentinel: any value other
+ * than `"no"` (case-insensitive) marks the message as auto-generated
+ * (`auto-generated`, `auto-replied`, `auto-notified`). `Precedence` covers
+ * legacy `auto_reply`, `bulk`, `junk`, and mailing-list bounces (`list`).
+ * `X-Autoreply` / `X-Autorespond` / `X-Auto-Response-Suppress` are the common
+ * Outlook / vendor headers — presence alone (any value) is enough.
+ */
+function isAutoResponder(root: GmailMessagePart | undefined): boolean {
+  const autoSubmitted = getHeader(root, 'Auto-Submitted')?.toLowerCase() ?? '';
+  if (autoSubmitted && autoSubmitted !== 'no') return true;
+
+  const precedence = getHeader(root, 'Precedence')?.toLowerCase() ?? '';
+  if (['auto_reply', 'bulk', 'junk', 'list'].includes(precedence)) return true;
+
+  if (getHeader(root, 'X-Autoreply') !== undefined) return true;
+  if (getHeader(root, 'X-Autorespond') !== undefined) return true;
+  if (getHeader(root, 'X-Auto-Response-Suppress') !== undefined) return true;
+
+  return false;
+}
+
 function extractContent(root: GmailMessagePart | undefined): string {
   const plain = findFirstPart(root, 'text/plain');
   if (plain?.body?.data) return decodeBase64url(plain.body.data);
@@ -139,5 +171,6 @@ export function parseGmailMessage(raw: GmailMessage): ParsedGmailMessage {
     from,
     metadata: { gmailThreadId: raw.threadId },
     attachments,
+    autoResponder: isAutoResponder(root),
   };
 }

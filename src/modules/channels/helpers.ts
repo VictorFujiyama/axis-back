@@ -352,7 +352,27 @@ export async function ingestIncomingMessage(
 
   // 6. Side effects (outside tx). Emit BEFORE dispatching the bot so the
   // contact's message is observed by clients before the bot's reply arrives.
-  if (!result.deduped && result.message && result.conversationId) {
+  //
+  // Auto-responder guard: when the inbound was flagged by `parseGmailMessage`
+  // (RFC 3834 `Auto-Submitted`, `Precedence`, `X-Autoreply*`), we still
+  // persist the row (audit trail + future UI badge), but we suppress the
+  // `message.created` event AND the direct `dispatchBot` call. Any bot reply
+  // would keep the vacation-responder loop alive: bot replies → vacation
+  // responder fires again → we ingest again → bot replies again → ∞. Killing
+  // both downstream paths at the source is the loop-break.
+  const autoResponder = input.metadata?.autoResponder === true;
+  if (!result.deduped && result.message && result.conversationId && autoResponder) {
+    log.info(
+      {
+        inboxId: input.inboxId,
+        conversationId: result.conversationId,
+        messageId: result.messageId,
+        from: input.from.identifier,
+      },
+      'ingest: auto-responder detected, suppressing message.created event and bot dispatch',
+    );
+  }
+  if (!result.deduped && result.message && result.conversationId && !autoResponder) {
     const m = result.message;
     const meta = (m.metadata ?? {}) as Record<string, unknown>;
     eventBus.emitEvent({

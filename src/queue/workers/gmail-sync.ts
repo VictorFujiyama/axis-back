@@ -266,6 +266,7 @@ function buildIngestPayload(
       gmailMessageId: raw.id,
       gmailThreadId: parsed.metadata.gmailThreadId,
       gmailHistoryId: raw.historyId,
+      autoResponder: parsed.autoResponder,
     },
   };
   return { payload, attachments: parsed.attachments };

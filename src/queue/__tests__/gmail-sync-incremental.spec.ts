@@ -625,6 +625,90 @@ describe('processGmailSyncJob — incremental path', () => {
     expect(ingest.mock.calls[0]![3]).toBe('bot-123');
   });
 
+  it('propagates the RFC 3834 auto-responder flag into payload.metadata.autoResponder', async () => {
+    // Task 1 (P0): the vacation-responder loop-break relies on this metadata
+    // reaching `ingestIncomingMessage`, which then suppresses `message.created`
+    // so the bot dispatcher never fires. Assert the flag survives the
+    // `buildIngestPayload` translation for an `Auto-Submitted: auto-generated`
+    // inbound.
+    const inbox = buildHealthyInbox();
+    const { app } = buildApp([inbox]);
+    const autoResponderMessage = buildFullGmailMessage('gmail-vacation-1', {
+      threadId: 'thr-vac',
+      headers: [
+        { name: 'From', value: 'client@example.com' },
+        { name: 'Subject', value: 'Auto: Fora do escritório' },
+        { name: 'Message-ID', value: '<vac-1@example.com>' },
+        { name: 'Auto-Submitted', value: 'auto-generated' },
+      ],
+      bodyText: 'Estou de férias até 20/07. Retorno em seguida.',
+    });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [
+            {
+              id: 'r-1',
+              messagesAdded: [
+                { message: { id: 'gmail-vacation-1', threadId: 'thr-vac' } },
+              ],
+            },
+          ],
+          historyId: 'h-end',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(autoResponderMessage))
+      .mockResolvedValueOnce(modifyResponse());
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockResolvedValue({ deduped: false });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    expect(ingest).toHaveBeenCalledTimes(1);
+    const payload = ingest.mock.calls[0]![1] as {
+      metadata: { autoResponder?: boolean };
+    };
+    expect(payload.metadata.autoResponder).toBe(true);
+  });
+
+  it('leaves payload.metadata.autoResponder=false on a normal inbound (regression guard)', async () => {
+    const inbox = buildHealthyInbox();
+    const { app } = buildApp([inbox]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [
+            {
+              id: 'r-1',
+              messagesAdded: [{ message: { id: 'normal-1', threadId: 't' } }],
+            },
+          ],
+          historyId: 'h-end',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(buildFullGmailMessage('normal-1')))
+      .mockResolvedValueOnce(modifyResponse());
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn().mockResolvedValue({ deduped: false });
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
+    );
+
+    const payload = ingest.mock.calls[0]![1] as {
+      metadata: { autoResponder?: boolean };
+    };
+    expect(payload.metadata.autoResponder).toBe(false);
+  });
+
   it('propagates a Journey-Builder-style In-Reply-To (<uuid@axisbrasil.ai>) into payload.threadHints', async () => {
     const inbox = buildHealthyInbox();
     const { app } = buildApp([inbox]);

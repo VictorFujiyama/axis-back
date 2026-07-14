@@ -339,6 +339,7 @@ describe('processGmailSyncJob — bootstrap path → ingest', () => {
         gmailMessageId: 'gmail-id-aaa',
         gmailThreadId: 'thr-1',
         gmailHistoryId: 'h-100',
+        autoResponder: false,
       },
     };
     expect(payload).toEqual(expected);
