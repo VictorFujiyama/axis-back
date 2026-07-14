@@ -469,5 +469,15 @@ describe('parseGmailMessage', () => {
       );
       expect(parsed.autoResponder).toBe(false);
     });
+
+    it('respects RFC 3834 sentinel Auto-Submitted: no (human-originated)', () => {
+      // RFC 3834 § 5 — the value "no" explicitly opts out of auto-responder
+      // classification. Guards against future regression where someone drops
+      // the `!== 'no'` check and starts flagging every Auto-Submitted as auto.
+      const parsed = parseGmailMessage(
+        buildWithHeaders([{ name: 'Auto-Submitted', value: 'no' }]),
+      );
+      expect(parsed.autoResponder).toBe(false);
+    });
   });
 });
