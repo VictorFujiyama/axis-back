@@ -755,18 +755,19 @@ describe('processGmailSyncJob — incremental path', () => {
     expect(payload.threadHints).toContain(outboundMsgId);
   });
 
-  it('skips messages where From matches the inbox sender identity (self-loopback guard)', async () => {
-    // Reproduces the Yuji-182 loop: axis-back sends outbound as
+  it('flags messages where From matches the inbox sender identity with metadata.selfLoopback=true (still ingested; helpers.ts suppresses bot dispatch)', async () => {
+    // Reproduces the Yuji-182 loopback: axis-back sends outbound as
     // victoryuji182@gmail.com to victoryuji182@gmail.com (dev/test setup with
-    // sender=receiver). Gmail delivers the mail back into the same inbox; the
-    // sync worker must NOT ingest it as a "contact reply" — otherwise the
-    // assigned bot responds and an infinite ping-pong starts. This case is NOT
-    // covered by the RFC 3834 auto-responder guard (no Auto-Submitted header).
+    // sender=receiver). Gmail delivers the mail back into the same inbox. The
+    // sync worker STILL ingests the message (audit trail + UI visibility so
+    // the operator sees it landed), but marks metadata.selfLoopback=true so
+    // helpers.ts suppresses `message.created` + `dispatchBot`. Mirrors the
+    // RFC 3834 auto-responder flag pattern.
     const senderEmail = 'victoryuji182@gmail.com';
     const inbox = buildHealthyInbox({
       config: { provider: 'gmail', gmailEmail: senderEmail, gmailHistoryId: 'h-start' },
     });
-    const { app, log } = buildApp([inbox]);
+    const { app } = buildApp([inbox]);
     const echo = buildFullGmailMessage('echo-1', {
       threadId: 'thr-1',
       headers: [
@@ -797,13 +798,48 @@ describe('processGmailSyncJob — incremental path', () => {
       { fetchImpl, getAccessToken, ingest },
     );
 
-    // Ingest MUST NOT be called for the self-loopback message.
-    expect(ingest).not.toHaveBeenCalled();
-    // Observable log at info-level with the self-loopback reason.
-    expect(log.info).toHaveBeenCalledWith(
-      expect.objectContaining({ skipReason: 'self-loopback' }),
-      expect.stringMatching(/self-loopback/i),
+    // Ingest IS called (msg persists) but the payload carries selfLoopback=true
+    // so helpers.ts can suppress downstream bot dispatch.
+    expect(ingest).toHaveBeenCalledTimes(1);
+    const payload = ingest.mock.calls[0]![1] as { metadata: { selfLoopback: boolean } };
+    expect(payload.metadata.selfLoopback).toBe(true);
+  });
+
+  it('leaves metadata.selfLoopback=false when From does NOT match inbox sender', async () => {
+    const inbox = buildHealthyInbox({
+      config: { provider: 'gmail', gmailEmail: 'inbox-owner@example.com', gmailHistoryId: 'h-start' },
+    });
+    const { app } = buildApp([inbox]);
+    const inbound = buildFullGmailMessage('m-1', {
+      threadId: 'thr-1',
+      headers: [
+        { name: 'From', value: 'someone-else@example.com' },
+        { name: 'Subject', value: 'Hi' },
+        { name: 'Message-ID', value: '<m-1@example.com>' },
+      ],
+      bodyText: 'legitimate contact reply',
+    });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        historyResponse({
+          history: [{ id: 'r-1', messagesAdded: [{ message: { id: 'm-1', threadId: 'thr-1' } }] }],
+          historyId: 'h-end',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(inbound));
+    const getAccessToken = vi.fn().mockResolvedValue(ACCESS_TOKEN);
+    const ingest = vi.fn();
+
+    await processGmailSyncJob(
+      app,
+      { data: { inboxId: INBOX_ID } },
+      { fetchImpl, getAccessToken, ingest },
     );
+
+    expect(ingest).toHaveBeenCalledTimes(1);
+    const payload = ingest.mock.calls[0]![1] as { metadata: { selfLoopback: boolean } };
+    expect(payload.metadata.selfLoopback).toBe(false);
   });
 });
 

@@ -353,26 +353,35 @@ export async function ingestIncomingMessage(
   // 6. Side effects (outside tx). Emit BEFORE dispatching the bot so the
   // contact's message is observed by clients before the bot's reply arrives.
   //
-  // Auto-responder guard: when the inbound was flagged by `parseGmailMessage`
-  // (RFC 3834 `Auto-Submitted`, `Precedence`, `X-Autoreply*`), we still
-  // persist the row (audit trail + future UI badge), but we suppress the
-  // `message.created` event AND the direct `dispatchBot` call. Any bot reply
-  // would keep the vacation-responder loop alive: bot replies → vacation
-  // responder fires again → we ingest again → bot replies again → ∞. Killing
-  // both downstream paths at the source is the loop-break.
+  // Auto-responder / self-loopback guard: two independent flags that mean the
+  // same thing for the bot pipeline — persist the row (audit trail + UI
+  // visibility so the operator sees the message landed) but SUPPRESS the
+  // `message.created` event AND the direct `dispatchBot` call.
+  //   - `autoResponder` (RFC 3834 `Auto-Submitted`/`Precedence`/`X-Autoreply*`)
+  //     comes from external vacation responders. Bot replying keeps the loop
+  //     alive.
+  //   - `selfLoopback` (From matches inbox.gmailEmail) comes from sender=
+  //     receiver setups: axis-back sends outbound → mail lands back in its own
+  //     inbox → Gmail sync re-ingests. Bot replying converts that echo into an
+  //     endless ping-pong. The RFC 3834 headers don't cover this case.
+  // Killing both downstream paths at the source is the loop-break in both
+  // cases; message.created ordering downstream is unaffected by this guard.
   const autoResponder = input.metadata?.autoResponder === true;
-  if (!result.deduped && result.message && result.conversationId && autoResponder) {
+  const selfLoopback = input.metadata?.selfLoopback === true;
+  const suppressBot = autoResponder || selfLoopback;
+  if (!result.deduped && result.message && result.conversationId && suppressBot) {
     log.info(
       {
         inboxId: input.inboxId,
         conversationId: result.conversationId,
         messageId: result.messageId,
         from: input.from.identifier,
+        reason: autoResponder ? 'auto-responder' : 'self-loopback',
       },
-      'ingest: auto-responder detected, suppressing message.created event and bot dispatch',
+      'ingest: bot dispatch suppressed (auto-responder or self-loopback detected)',
     );
   }
-  if (!result.deduped && result.message && result.conversationId && !autoResponder) {
+  if (!result.deduped && result.message && result.conversationId && !suppressBot) {
     const m = result.message;
     const meta = (m.metadata ?? {}) as Record<string, unknown>;
     eventBus.emitEvent({
