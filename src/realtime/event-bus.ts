@@ -117,9 +117,10 @@ export type RealtimeEvent =
        * [crm-T-03] A tag was freshly applied to a conversation. Emitted by the
        * 4 in-tree `conversationTags.insert` sites (REST, bulk, automation, bot)
        * AFTER the row truly inserted — noop inserts must not re-fire. The
-       * atlas-events listener resolves the tag name and, if `qualified`
-       * (case-insensitive, D3), routes to `buildLeadQualifiedEnvelope`; other
-       * tag names are no-ops at the connector layer (no envelope is built).
+       * atlas-events listener resolves the tag name against `TAG_ROUTE_MAP`
+       * (case-insensitive): `meeting-ready`, `nurture` and legacy `qualified`
+       * (alias of meeting-ready) route to `buildLeadQualifiedEnvelope`;
+       * `unqualified` and other tag names build no envelope.
        * Realtime sockets drop this event — front-side tag UI re-reads via REST.
        *
        * `taggedAt` is captured per emit so re-tagging the same conversation

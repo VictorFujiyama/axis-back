@@ -243,6 +243,14 @@ async function resolveEventAccountId(db: DB, event: RealtimeEvent): Promise<stri
   return null;
 }
 
+// Qualifier decision tags → lead_qualified route. `qualified` is the legacy
+// alias of `meeting-ready`; `unqualified` is intentionally absent (no route).
+const TAG_ROUTE_MAP: Record<string, 'meeting-ready' | 'nurture'> = {
+  qualified: 'meeting-ready',
+  'meeting-ready': 'meeting-ready',
+  nurture: 'nurture',
+};
+
 async function buildConnectorEventForEvent(
   db: DB,
   event: RealtimeEvent,
@@ -276,10 +284,13 @@ async function buildConnectorEventForEvent(
 
   // `conversation.tagged` fans out (D20). For EVERY tag with a resolvable
   // account it emits `conversation_tagged` (generic — feeds Atlas journey
-  // triggers, Task 6.4). For the `qualified` tag (case-insensitive, D3) it
+  // triggers, Task 6.4). For the qualifying tags (case-insensitive) it
   // ADDITIONALLY emits `lead_qualified` in parallel (the CRM handler's BC, T-02)
-  // — the two coexist, the generic one never replaces it. A vanished tag row or
-  // an unmapped inbox drops both.
+  // with the decision route: `meeting-ready` and `qualified` (legacy alias, D3)
+  // → route=meeting-ready; `nurture` → route=nurture. `unqualified` and any
+  // other tag stay generic-only. The two legs coexist, the generic one never
+  // replaces the qualified one. A vanished tag row or an unmapped inbox drops
+  // both.
   if (event.type === 'conversation.tagged') {
     const [tag] = await db
       .select({ name: schema.tags.name })
@@ -295,14 +306,16 @@ async function buildConnectorEventForEvent(
     if (!inbox?.accountId) return [];
 
     const out: ConnectorEvent[] = [];
-    // lead_qualified (BC, CRM handler) — only the `qualified` tag (D3).
-    if (tag.name.toLowerCase() === 'qualified') {
+    // lead_qualified (BC, CRM handler) — qualifying tags only, route derived.
+    const route = TAG_ROUTE_MAP[tag.name.toLowerCase()];
+    if (route) {
       out.push(
         await buildLeadQualifiedEnvelope(db, {
           conversationId: event.conversationId,
           accountId: inbox.accountId,
           orgId,
           taggedAt: event.taggedAt,
+          route,
         }),
       );
     }

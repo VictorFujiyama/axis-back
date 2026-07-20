@@ -4,9 +4,10 @@ import { eventBus } from '../../realtime/event-bus';
 
 /**
  * [crm-T-03] Emit a `conversation.tagged` realtime event for each freshly
- * applied tag. The `enqueue.ts` listener checks the tag name and, if
- * `qualified` (case-insensitive, D3), routes to `buildLeadQualifiedEnvelope`
- * (T-02). Other tag names are no-ops at the connector layer.
+ * applied tag. The `enqueue.ts` listener resolves the tag name against
+ * `TAG_ROUTE_MAP` (case-insensitive): `meeting-ready`, `nurture` and legacy
+ * `qualified` (alias of meeting-ready) route to `buildLeadQualifiedEnvelope`
+ * (T-02); `unqualified` and other tag names are no-ops at the connector layer.
  *
  * Idempotency: pass ONLY the tagIds that actually inserted (via
  * `.returning(...)` on `.onConflictDoNothing()` or the success branch of a
