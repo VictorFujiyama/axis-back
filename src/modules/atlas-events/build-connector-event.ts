@@ -374,6 +374,8 @@ export async function buildLeadQualifiedEnvelope(
     taggedAt?: string;
     /** Optional running summary at qualify time. Capped to SUMMARY_CAP downstream. */
     convSummary?: string;
+    /** Decision route (qualifier 3-route). Omitted → Atlas defaults to meeting-ready. */
+    route?: 'meeting-ready' | 'nurture';
   },
 ): Promise<ConnectorEvent> {
   const taggedAt = input.taggedAt ?? new Date().toISOString();
@@ -401,6 +403,7 @@ export async function buildLeadQualifiedEnvelope(
     source_ref: conv.id,
     ...(input.convSummary ? { conv_summary: input.convSummary.slice(0, SUMMARY_CAP) } : {}),
     tagged_at: taggedAt,
+    ...(input.route ? { route: input.route } : {}),
   });
   if (!payloadResult.ok) {
     throw new Error(

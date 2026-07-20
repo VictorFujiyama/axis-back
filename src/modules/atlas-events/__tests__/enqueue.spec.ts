@@ -789,11 +789,14 @@ describe('subscribeAtlasEvents', () => {
       await flushMicrotasks();
 
       expect(builderMocks.buildLeadQualifiedEnvelope).toHaveBeenCalledTimes(1);
+      // `qualified` is the legacy alias of `meeting-ready` — the wire now
+      // carries the route explicitly instead of relying on the Atlas default.
       expect(builderMocks.buildLeadQualifiedEnvelope).toHaveBeenCalledWith(app.db, {
         conversationId: 'conv-q',
         accountId: SOURCE_ACCOUNT_ID,
         orgId: ORG_ID,
         taggedAt: '2026-05-29T12:00:00.000Z',
+        route: 'meeting-ready',
       });
       expect(builderMocks.buildConversationTaggedEnvelope).toHaveBeenCalledTimes(1);
       expect(builderMocks.buildConversationTaggedEnvelope).toHaveBeenCalledWith(app.db, {
@@ -843,6 +846,133 @@ describe('subscribeAtlasEvents', () => {
       expect(builderMocks.buildLeadQualifiedEnvelope).toHaveBeenCalledTimes(1);
       expect(builderMocks.buildConversationTaggedEnvelope).toHaveBeenCalledTimes(1);
       expect(queues.add).toHaveBeenCalledTimes(2);
+    });
+
+    // [qualifier-3-route T-09] `meeting-ready` is a first-class qualifying tag:
+    // it fans out to lead_qualified (route=meeting-ready) + conversation_tagged.
+    it('dispatches lead_qualified with route=meeting-ready + conversation_tagged for tag "meeting-ready"', async () => {
+      builderMocks.buildLeadQualifiedEnvelope.mockResolvedValue(
+        fakeConnectorEvent({
+          kind: 'lead_qualified',
+          event_id: 'conv_conv-mr:lead_qualified:1748520000000',
+        }),
+      );
+      builderMocks.buildConversationTaggedEnvelope.mockResolvedValue(
+        fakeConnectorEvent({
+          kind: 'conversation_tagged',
+          event_id: 'conv_conv-mr:tagged:tag-mr:1748520000000',
+        }),
+      );
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
+        enabled: true,
+      });
+      const { app, queues } = buildAppStub([
+        [inboxAccountRow],
+        [{ name: 'meeting-ready' }],
+        [inboxAccountRow],
+      ]);
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'conversation.tagged',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-mr',
+        tagId: 'tag-mr',
+        taggedAt: '2026-05-29T12:00:00.000Z',
+      });
+      await flushMicrotasks();
+
+      expect(builderMocks.buildLeadQualifiedEnvelope).toHaveBeenCalledTimes(1);
+      expect(builderMocks.buildLeadQualifiedEnvelope).toHaveBeenCalledWith(app.db, {
+        conversationId: 'conv-mr',
+        accountId: SOURCE_ACCOUNT_ID,
+        orgId: ORG_ID,
+        taggedAt: '2026-05-29T12:00:00.000Z',
+        route: 'meeting-ready',
+      });
+      expect(builderMocks.buildConversationTaggedEnvelope).toHaveBeenCalledTimes(1);
+      expect(queues.add).toHaveBeenCalledTimes(2);
+    });
+
+    // [qualifier-3-route T-09] `nurture` also qualifies, with its own route.
+    it('dispatches lead_qualified with route=nurture + conversation_tagged for tag "nurture"', async () => {
+      builderMocks.buildLeadQualifiedEnvelope.mockResolvedValue(
+        fakeConnectorEvent({
+          kind: 'lead_qualified',
+          event_id: 'conv_conv-nu:lead_qualified:1748520000000',
+        }),
+      );
+      builderMocks.buildConversationTaggedEnvelope.mockResolvedValue(
+        fakeConnectorEvent({
+          kind: 'conversation_tagged',
+          event_id: 'conv_conv-nu:tagged:tag-nu:1748520000000',
+        }),
+      );
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
+        enabled: true,
+      });
+      const { app, queues } = buildAppStub([
+        [inboxAccountRow],
+        [{ name: 'nurture' }],
+        [inboxAccountRow],
+      ]);
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'conversation.tagged',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-nu',
+        tagId: 'tag-nu',
+        taggedAt: '2026-05-29T12:00:00.000Z',
+      });
+      await flushMicrotasks();
+
+      expect(builderMocks.buildLeadQualifiedEnvelope).toHaveBeenCalledTimes(1);
+      expect(builderMocks.buildLeadQualifiedEnvelope).toHaveBeenCalledWith(app.db, {
+        conversationId: 'conv-nu',
+        accountId: SOURCE_ACCOUNT_ID,
+        orgId: ORG_ID,
+        taggedAt: '2026-05-29T12:00:00.000Z',
+        route: 'nurture',
+      });
+      expect(builderMocks.buildConversationTaggedEnvelope).toHaveBeenCalledTimes(1);
+      expect(queues.add).toHaveBeenCalledTimes(2);
+    });
+
+    // [qualifier-3-route T-09] `unqualified` is a decision, not a qualification:
+    // only the generic conversation_tagged leg fires.
+    it('emits ONLY conversation_tagged for tag "unqualified" (no lead_qualified)', async () => {
+      builderMocks.buildConversationTaggedEnvelope.mockResolvedValue(
+        fakeConnectorEvent({
+          kind: 'conversation_tagged',
+          event_id: 'conv_conv-uq:tagged:tag-uq:1748520000000',
+        }),
+      );
+      const { eventBus, subscribeAtlasEvents } = await loadFreshModules(undefined, 'false', {
+        enabled: true,
+      });
+      const { app, queues } = buildAppStub([
+        [inboxAccountRow],
+        [{ name: 'unqualified' }],
+        [inboxAccountRow],
+      ]);
+
+      subscribeAtlasEvents(app);
+      eventBus.emitEvent({
+        type: 'conversation.tagged',
+        inboxId: 'inbox-1',
+        conversationId: 'conv-uq',
+        tagId: 'tag-uq',
+        taggedAt: '2026-05-29T12:00:00.000Z',
+      });
+      await flushMicrotasks();
+
+      expect(builderMocks.buildLeadQualifiedEnvelope).not.toHaveBeenCalled();
+      expect(builderMocks.buildConversationTaggedEnvelope).toHaveBeenCalledTimes(1);
+      expect(queues.add).toHaveBeenCalledTimes(1);
+      const [name, , opts] = queues.add.mock.calls[0]!;
+      expect(name).toBe('atlas-events');
+      expect(opts).toEqual({ jobId: 'conv_conv-uq:tagged:tag-uq:1748520000000' });
     });
 
     // [6.4-T-11] A non-qualifying tag emits ONLY conversation_tagged (generic,
