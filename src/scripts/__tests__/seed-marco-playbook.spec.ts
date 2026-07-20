@@ -42,6 +42,10 @@ describe.skipIf(!DB_URL)('seedMarcoPlaybook (integration)', () => {
   async function withRollback(fn: (tx: DbOrTx) => Promise<void>): Promise<void> {
     await db
       .transaction(async (tx) => {
+        // O banco de dev pode já ter sido seedado pelo CLI. Hard-delete dentro
+        // da tx (rollback desfaz) pra cada teste partir de estado limpo; o FK
+        // cascade limpa inbox_playbooks e inbox_playbook_versions juntos.
+        await tx.delete(schema.inboxes).where(eq(schema.inboxes.name, MARCO_INBOX_NAME));
         await fn(tx);
         throw new Rollback('rollback');
       })
