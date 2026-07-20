@@ -16,6 +16,7 @@ import { z } from 'zod';
  *     source_ref: <conv_id>,                // mirrors envelope.source_ref.id
  *     conv_summary?: string,                // optional running summary at tag time
  *     tagged_at: ISO string (with offset),  // when the qualifying tag landed
+ *     route?: 'meeting-ready' | 'nurture',  // which qualifying tag fired (fase 4)
  *   }
  *
  * Identity rule: emitting with neither phone nor email is allowed at the
@@ -40,6 +41,7 @@ export const LeadQualifiedPayloadSchema = z.object({
   source_ref: z.string().min(1),
   conv_summary: z.string().min(1).optional(),
   tagged_at: z.string().datetime({ offset: true }),
+  route: z.enum(['meeting-ready', 'nurture']).optional(),
 });
 export type LeadQualifiedPayload = z.infer<typeof LeadQualifiedPayloadSchema>;
 
