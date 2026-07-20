@@ -24,3 +24,4 @@ export * from './atlas-user-links';
 export * from './atlas-activity';
 export * from './atlas-connections';
 export * from './inbox-playbooks';
+export * from './inbox-playbook-versions';

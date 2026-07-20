@@ -239,6 +239,13 @@
       "when": 1780876149738,
       "tag": "0033_regular_speedball",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1784514296341,
+      "tag": "0034_adorable_the_twelve",
+      "breakpoints": true
     }
   ]
 }
