@@ -25,6 +25,7 @@ import { accountRoutes } from './modules/accounts/routes';
 import { userRoutes } from './modules/users/routes';
 import { profileRoutes } from './modules/profile/routes';
 import { inboxRoutes } from './modules/inboxes/routes';
+import { inboxPlaybookRoutes } from './modules/inbox-playbooks/routes';
 import { tagRoutes } from './modules/tags/routes';
 import { contactRoutes } from './modules/contacts/routes';
 import { conversationRoutes } from './modules/conversations/routes';
@@ -196,6 +197,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(userRoutes);
   await app.register(profileRoutes);
   await app.register(inboxRoutes);
+  await app.register(inboxPlaybookRoutes);
   await app.register(tagRoutes);
   await app.register(contactRoutes);
   await app.register(conversationRoutes);
