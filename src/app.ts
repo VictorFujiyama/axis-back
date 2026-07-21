@@ -71,6 +71,7 @@ import { atlasInboundRoutes } from './modules/atlas-connector/inbound-routes';
 import { atlasBackfillRoutes } from './modules/atlas-connector/backfill-routes';
 import { atlasProvisionRoutes } from './modules/atlas-connector/provision-routes';
 import { atlasMcpRoutes } from './modules/atlas-mcp-client/routes';
+import { mailboxRotateRoutes } from './modules/mailbox-rotate/routes';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -253,6 +254,11 @@ export async function buildApp(): Promise<FastifyInstance> {
   // Phase 12.2 MCP pull (GET /api/v1/atlas/memory). Front-facing read of Atlas
   // memory; always registered, returns 503 when ATLAS_MCP_BEARER is unset.
   await app.register(atlasMcpRoutes);
+
+  // Fase 5.1 — rotação de mailbox pra journeys de outbound. X-API-Key gated
+  // (Atlas server-to-server); escolhe a mailbox menos carregada dentre as
+  // passadas e reserva o slot atomicamente reusando reserveForInbox.
+  await app.register(mailboxRotateRoutes);
 
   // Load pluggable modules (ENABLED_MODULES) — after core routes so modules can
   // safely depend on app.requireAuth / app.db / app.queues decorators.
