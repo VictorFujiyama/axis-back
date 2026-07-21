@@ -20,10 +20,10 @@ import { activeInboxesGauge, botAutoCreatedTotal, botAutoDisabledTotal } from '.
 
 const BUILTIN_BOT_NAME = 'Atlas Assistant';
 
-// builtinBotConfigSchema requires systemPrompt.min(1); this seeds a fresh bot
-// until the operator edits the prompt in the bot config UI.
+// builtinBotConfigSchema exige systemPrompt.min(1); esse valor semeia um bot
+// novo até o operador editar o prompt pela UI de config do bot.
 const DEFAULT_SYSTEM_PROMPT =
-  'You are a helpful customer support assistant. Answer concisely and hand the conversation to a human agent whenever you are unsure.';
+  'Você é um atendente de suporte prestativo. Responda de forma concisa e passe a conversa pra um humano sempre que estiver em dúvida.';
 
 const DEFAULT_MODELS: Record<BotProvider, string> = {
   // Validated against llm-client.ts: model string is passed through verbatim (D18).

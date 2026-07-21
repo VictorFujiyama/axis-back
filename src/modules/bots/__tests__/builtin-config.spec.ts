@@ -19,13 +19,19 @@ describe('builtinBotConfigSchema — playbookSource', () => {
     expect(parsed.playbookSource).toBe('inline');
   });
 
-  it('accepts "atlas" explicitly', () => {
-    const parsed = parseBuiltinConfig({ ...baseConfig, playbookSource: 'atlas' });
-    expect(parsed.playbookSource).toBe('atlas');
+  it('normaliza valores legacy ("atlas", "local") pra "inline"', () => {
+    expect(parseBuiltinConfig({ ...baseConfig, playbookSource: 'atlas' }).playbookSource).toBe(
+      'inline',
+    );
+    expect(parseBuiltinConfig({ ...baseConfig, playbookSource: 'local' }).playbookSource).toBe(
+      'inline',
+    );
   });
 
-  it('rejects an unknown enum value such as "remote"', () => {
-    expect(() => parseBuiltinConfig({ ...baseConfig, playbookSource: 'remote' })).toThrow();
+  it('normaliza valor desconhecido tipo "remote" pra "inline"', () => {
+    expect(parseBuiltinConfig({ ...baseConfig, playbookSource: 'remote' }).playbookSource).toBe(
+      'inline',
+    );
   });
 
   it('preserves other defaults when applying playbookSource default', () => {
