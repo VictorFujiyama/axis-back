@@ -65,8 +65,9 @@ const CONFLICT_MSG = 'Config was modified by someone else. Reload and retry.';
 
 export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
   const requireAdmin = app.requireRole('admin');
-  // GET/PATCH também são chamados server-to-server pelo Atlas (bot-analyzer /
-  // bot_prompt_decide_proposal) com X-API-Key — mesmo trust model do
+  // GET/PATCH config, GET /versions e POST /rollback também são chamados
+  // server-to-server pelo Atlas (bot-analyzer / bot_prompt_decide_proposal /
+  // VersionHistory) com X-API-Key — mesmo trust model do
   // /api/auth/create-from-atlas. Nesse caminho não há JWT, logo não há
   // req.user: o lookup do bot deixa de filtrar por accountId (chave é
   // confiança total no serviço) e a versão persiste sem created_by_user_id.
@@ -204,7 +205,7 @@ export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
 
   app.get(
     '/api/v1/bots/:botId/versions',
-    { preHandler: app.requireRole('admin') },
+    { preHandler: adminOrAtlasKey },
     async (req, reply) => {
       const { botId } = botIdParams.parse(req.params);
       const parsedQuery = versionsQuery.safeParse(req.query);
@@ -213,7 +214,7 @@ export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
       const [bot] = await app.db
         .select({ id: schema.bots.id })
         .from(schema.bots)
-        .where(and(eq(schema.bots.id, botId), eq(schema.bots.accountId, req.user.accountId)))
+        .where(botScope(botId, req.user))
         .limit(1);
       if (!bot) return reply.notFound();
 
@@ -240,7 +241,7 @@ export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
 
   app.post(
     '/api/v1/bots/:botId/rollback',
-    { preHandler: app.requireRole('admin') },
+    { preHandler: adminOrAtlasKey },
     async (req, reply) => {
       const { botId } = botIdParams.parse(req.params);
       const parsed = rollbackBody.safeParse(req.body);
@@ -256,7 +257,7 @@ export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
           const [bot] = await tx
             .select()
             .from(schema.bots)
-            .where(and(eq(schema.bots.id, botId), eq(schema.bots.accountId, req.user.accountId)))
+            .where(botScope(botId, req.user))
             .limit(1)
             .for('update');
           if (!bot) throw new NotFoundInTx();
@@ -313,7 +314,7 @@ export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
             temperature: String(merged.temperature),
             maxTokens: merged.maxTokens,
             etag: newEtag,
-            createdByUserId: req.user.sub,
+            createdByUserId: req.user?.sub ?? null,
           });
 
           await tx
