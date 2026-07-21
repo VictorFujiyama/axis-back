@@ -514,6 +514,37 @@ describe('GET /api/v1/bots/:botId/versions', () => {
       await app.close();
     }
   });
+
+  it('aceita X-API-Key do Atlas no lugar do JWT admin', async () => {
+    const app = await buildTestApp({
+      selects: [[botRow()], [versionRow(2), versionRow(1)]],
+    });
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/versions`,
+        headers: { 'x-api-key': ATLAS_KEY },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().map((v: { version: number }) => v.version)).toEqual([2, 1]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejeita X-API-Key inválida com 401', async () => {
+    const app = await buildTestApp();
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/versions`,
+        headers: { 'x-api-key': 'nope' },
+      });
+      expect(res.statusCode).toBe(401);
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 describe('POST /api/v1/bots/:botId/rollback', () => {
@@ -619,6 +650,52 @@ describe('POST /api/v1/bots/:botId/rollback', () => {
         payload: { targetVersion: 2 },
       });
       expect(res.statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('X-API-Key do Atlas: restaura e persiste version sem created_by_user_id', async () => {
+    const app = await buildTestApp({
+      txSelects: [[botRow()], [versionRow(2)], [{ version: 5 }]],
+    });
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/bots/${BOT_ID}/rollback`,
+        headers: { 'x-api-key': ATLAS_KEY },
+        payload: { targetVersion: 2 },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().version).toBe(6);
+      expect(versionInsertValues).toHaveBeenCalledWith(
+        expect.objectContaining({
+          version: 6,
+          systemPrompt: 'Prompt v2',
+          createdByUserId: null,
+        }),
+      );
+      expect(botUpdateSet).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({ systemPrompt: 'Prompt v2' }),
+        }),
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejeita X-API-Key inválida com 401', async () => {
+    const app = await buildTestApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/bots/${BOT_ID}/rollback`,
+        headers: { 'x-api-key': 'nope' },
+        payload: { targetVersion: 2 },
+      });
+      expect(res.statusCode).toBe(401);
+      expect(versionInsertValues).not.toHaveBeenCalled();
     } finally {
       await app.close();
     }
