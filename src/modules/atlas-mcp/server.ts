@@ -10,8 +10,8 @@ import {
   assignInputSchema,
   assignUserHandler,
   assignUserInputSchema,
-  getInboxPlaybookHandler,
-  getInboxPlaybookInputSchema,
+  getQualifierEnabledHandler,
+  getQualifierEnabledInputSchema,
   getRecentOutboundHandler,
   getRecentOutboundInputSchema,
   getThreadHandler,
@@ -211,22 +211,22 @@ export function buildMcpServer(
     },
   );
 
-  // ── messaging.get_inbox_playbook (T-06 — playbook-in-axis) ────────────────
+  // ── inbox.get_qualifier_enabled (playbook-deprecation) ────────────────────
   // A read tool, but it needs `ctx` to enforce the D27 cross-tenant check: the
-  // calling Atlas org may only read playbooks of the axis account it is bound
+  // calling Atlas org may only read inboxes of the axis account it is bound
   // to via `atlas_user_links`. Missing identity headers → forbidden, same as
   // the write tools.
   server.registerTool(
-    'messaging.get_inbox_playbook',
+    'inbox.get_qualifier_enabled',
     {
       description:
-        'Fetch the playbook configured for an inbox (axis-back is the source of truth). Returns {exists:true, content, etag, version, updatedAt} or {exists:false} when no playbook is set, the inbox is unknown, or the feature is disabled. Scoped to the caller Atlas org\'s account; reading another account\'s inbox is forbidden.',
-      inputSchema: getInboxPlaybookInputSchema.shape,
+        "Return the qualifier opt-out flag of an inbox as {enabled: boolean}. When false, inbound messages on the inbox skip the Atlas qualifier stage. Unknown inbox is not_found. Scoped to the caller Atlas org's account; reading another account's inbox is forbidden.",
+      inputSchema: getQualifierEnabledInputSchema.shape,
     },
     async (args) => {
       try {
         const bound = requireCtx(ctx);
-        const result = await getInboxPlaybookHandler(db, args, bound);
+        const result = await getQualifierEnabledHandler(db, args, bound);
         return toToolResult(result);
       } catch (err) {
         const mapped = mapToolError(err);

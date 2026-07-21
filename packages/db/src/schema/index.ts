@@ -25,3 +25,4 @@ export * from './atlas-activity';
 export * from './atlas-connections';
 export * from './inbox-playbooks';
 export * from './inbox-playbook-versions';
+export * from './bot-config-versions';

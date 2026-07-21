@@ -21,6 +21,8 @@ vi.mock('../api-key-validator', () => ({
   validateApiKey: (...args: unknown[]) => validateApiKeyMock(...args),
 }));
 
+let lastUpdatePatch: Record<string, unknown> | undefined;
+
 const TEST_USER_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const TEST_ACCOUNT_ID = '11111111-2222-4333-8444-555555555555';
 const INBOX_ID = '99999999-8888-4777-8666-555555555555';
@@ -34,6 +36,7 @@ function inboxRow(overrides: Record<string, unknown> = {}) {
     secrets: null,
     defaultBotId: null as string | null,
     enabled: true,
+    qualifierEnabled: true,
     accountId: TEST_ACCOUNT_ID,
     botLlmApiKeyEnc: null as string | null,
     botLlmProvider: null as string | null,
@@ -69,10 +72,13 @@ async function buildTestApp(options: DbOptions = {}): Promise<FastifyInstance> {
   // inbox_playbooks, and the audit insert.
   const tx = {
     update: vi.fn().mockReturnValue({
-      set: vi.fn().mockReturnValue({
-        where: vi.fn().mockReturnValue({
-          returning: vi.fn().mockResolvedValue(options.updateReturning ?? [inboxRow()]),
-        }),
+      set: vi.fn().mockImplementation((patch: Record<string, unknown>) => {
+        lastUpdatePatch = patch;
+        return {
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue(options.updateReturning ?? [inboxRow()]),
+          }),
+        };
       }),
     }),
     insert: vi.fn().mockReturnValue({
@@ -81,6 +87,15 @@ async function buildTestApp(options: DbOptions = {}): Promise<FastifyInstance> {
       }),
     }),
     delete: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }),
+    // beforeRow/afterRow defaultBotId reads (bug #A2 backfill) — null keeps the
+    // backfill branch inert so these tests stay focused on the HTTP contract.
+    select: vi.fn().mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([{ defaultBotId: null }]),
+        }),
+      }),
+    }),
   };
 
   // Post-tx app.db.select() is used twice: inbox re-read, then playbook content.
@@ -241,6 +256,29 @@ describe('PATCH /api/v1/inboxes/:id — playbook + key + provider (T-05)', () =>
       });
       expect(res.statusCode).toBe(500);
       expect(applyAutoBotMock).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('accepts qualifierEnabled=false, persists it and returns it in the response', async () => {
+    const app = await buildTestApp({
+      updateReturning: [inboxRow({ qualifierEnabled: false })],
+      freshInbox: [inboxRow({ qualifierEnabled: false })],
+    });
+    try {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/inboxes/${INBOX_ID}`,
+        headers: { authorization: authHeader(app) },
+        payload: { qualifierEnabled: false },
+      });
+      expect(res.statusCode).toBe(200);
+      // The flag reached the UPDATE (not silently discarded by the zod schema).
+      expect(lastUpdatePatch).toMatchObject({ qualifierEnabled: false });
+      expect(res.json().qualifierEnabled).toBe(false);
+      // Plain flag toggle — no playbook feature involvement.
+      expect(applyAutoBotMock).not.toHaveBeenCalled();
     } finally {
       await app.close();
     }

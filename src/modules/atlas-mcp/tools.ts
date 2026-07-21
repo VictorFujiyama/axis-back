@@ -3,7 +3,6 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema, type DB } from '@blossom/db';
 import type { ChannelType } from '@blossom/shared-types';
-import { config } from '../../config';
 import { decryptJSON } from '../../crypto';
 import { isInboxConfigured } from '../channels/configured-check';
 import {
@@ -1042,64 +1041,48 @@ export async function assignUserHandler(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// messaging.get_inbox_playbook (T-06 — playbook-in-axis D26/D27/D40)
+// inbox.get_qualifier_enabled (playbook-deprecation)
 // ──────────────────────────────────────────────────────────────────────────────
 
-export const getInboxPlaybookInputSchema = z.object({ inboxId: uuid });
-export type GetInboxPlaybookInput = z.infer<typeof getInboxPlaybookInputSchema>;
+export const getQualifierEnabledInputSchema = z.object({ inboxId: uuid });
+export type GetQualifierEnabledInput = z.infer<typeof getQualifierEnabledInputSchema>;
 
-export type GetInboxPlaybookResult =
-  | { exists: false }
-  | {
-      exists: true;
-      content: string;
-      etag: string;
-      version: number;
-      updatedAt: Date;
-    };
+export interface GetQualifierEnabledResult {
+  enabled: boolean;
+}
 
 /**
- * Read the locally-stored playbook for an inbox (D1: axis-back is the source of
- * truth). Atlas-worker calls this via MCP to fetch the playbook it observes
- * conversations against (D26).
+ * Read the `qualifier_enabled` opt-out flag of an inbox. The Atlas
+ * connector-events worker calls this before Gate 2 to decide whether inbound
+ * messages on the inbox go through the qualifier stage.
  *
- * Unlike the other read tools (which are intentionally not account-scoped —
- * L-408 trusts the inbound HMAC and Atlas decides visibility), this tool leaks
- * inbox content cross-org if unguarded, so it carries an explicit cross-tenant
- * check (D27): the playbook is only returned when the inbox's account matches
- * the account the calling Atlas org is bound to via its `atlas-bot:%` link in
- * `atlas_user_links`. A missing link or an account mismatch is `forbidden`.
- *
- * Degrades gracefully when the feature flag is off (D40) or the inbox /
- * playbook row is absent — returns `{exists: false}` rather than throwing, so
- * the Atlas worker falls back to its legacy `readPlaybook` path during a
- * rollback without surfacing a hard error.
+ * Carries the same cross-tenant check as the write tools (D27): the flag is
+ * only returned when the inbox's account matches the account the calling Atlas
+ * org is bound to via its `atlas-bot:%` link in `atlas_user_links`. A missing
+ * link or an account mismatch is `forbidden`. Unlike the retired
+ * `messaging.get_inbox_playbook` tool it replaces, an unknown inbox is a hard
+ * `not_found` — there is no legacy fallback to degrade to.
  */
-export async function getInboxPlaybookHandler(
+export async function getQualifierEnabledHandler(
   db: DB,
-  input: GetInboxPlaybookInput,
+  input: GetQualifierEnabledInput,
   ctx: AtlasRequestContext,
-): Promise<GetInboxPlaybookResult> {
-  // D40 — feature flag off: behave as if no playbook exists so the Atlas worker
-  // falls back to its legacy readPlaybook path.
-  if (!config.PLAYBOOK_IN_AXIS_ENABLED) {
-    return { exists: false };
-  }
-
-  // Resolve the inbox (its account drives the cross-tenant check). A
-  // non-existent inbox degrades to {exists:false} (D26) — not a 404.
+): Promise<GetQualifierEnabledResult> {
   const [inbox] = await db
-    .select({ accountId: schema.inboxes.accountId })
+    .select({
+      accountId: schema.inboxes.accountId,
+      qualifierEnabled: schema.inboxes.qualifierEnabled,
+    })
     .from(schema.inboxes)
     .where(eq(schema.inboxes.id, input.inboxId))
     .limit(1);
   if (!inbox || inbox.accountId === null) {
-    return { exists: false };
+    throw new MessagingToolError('not_found', `inbox ${input.inboxId} not found`);
   }
 
   // D27 — cross-tenant gate. The Atlas org is bound to exactly one axis account
   // through its provisioned `atlas-bot:<orgId>` link (D31). Reading an inbox
-  // that belongs to a different account is a cross-tenant leak → forbidden.
+  // that belongs to a different account is forbidden.
   const [link] = await db
     .select({ accountId: schema.atlasUserLinks.accountId })
     .from(schema.atlasUserLinks)
@@ -1114,27 +1097,7 @@ export async function getInboxPlaybookHandler(
     throw new MessagingToolError('forbidden', 'cross-tenant access denied');
   }
 
-  const [playbook] = await db
-    .select({
-      content: schema.inboxPlaybooks.content,
-      etag: schema.inboxPlaybooks.etag,
-      version: schema.inboxPlaybooks.version,
-      updatedAt: schema.inboxPlaybooks.updatedAt,
-    })
-    .from(schema.inboxPlaybooks)
-    .where(eq(schema.inboxPlaybooks.inboxId, input.inboxId))
-    .limit(1);
-  if (!playbook) {
-    return { exists: false };
-  }
-
-  return {
-    exists: true,
-    content: playbook.content,
-    etag: playbook.etag,
-    version: playbook.version,
-    updatedAt: playbook.updatedAt,
-  };
+  return { enabled: inbox.qualifierEnabled };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1188,6 +1151,12 @@ export interface ListInboxesItem {
    * de conv sem bot atribuído).
    */
   hasBot: boolean;
+  /**
+   * UUID do bot default da inbox (`inboxes.default_bot_id`) ou null. O cron
+   * bot-analyzer do Atlas precisa do id pra ler/editar o system prompt via
+   * `/api/v1/bots/:botId/config` (playbook-deprecation Task 14/15).
+   */
+  botId: string | null;
   updatedAt: Date;
 }
 
@@ -1323,6 +1292,7 @@ export async function listInboxesHandler(
       capabilities: capabilitiesForChannel(channelType),
       identifier: identifierForInbox(channelType, row.config),
       hasBot: row.defaultBotId !== null,
+      botId: row.defaultBotId,
       updatedAt: row.updatedAt,
     };
   });

@@ -144,16 +144,16 @@ const BOT_USER_ROW = {
 };
 
 describe('buildMcpServer — InMemoryTransport pair', () => {
-  it('exposes all messaging.* tools via listTools() (T-015b read + T-023 write + T-15 tag + Fase G handoff + T-06 playbook)', async () => {
+  it('exposes all tools via listTools() (T-015b read + T-023 write + T-15 tag + Fase G handoff + qualifier flag)', async () => {
     const db = makeDb([]);
     const { client, close } = await connectPair(db, CTX);
     try {
       const result = await client.listTools();
       const names = result.tools.map((t) => t.name).sort();
       expect(names).toEqual([
+        'inbox.get_qualifier_enabled',
         'messaging.assign',
         'messaging.assign_user',
-        'messaging.get_inbox_playbook',
         'messaging.get_recent_outbound',
         'messaging.get_thread',
         'messaging.list_inboxes',

@@ -6,7 +6,7 @@ import {
   MessagingToolError,
   assignHandler,
   assignUserHandler,
-  getInboxPlaybookHandler,
+  getQualifierEnabledHandler,
   getRecentOutboundHandler,
   getThreadHandler,
   listThreadsHandler,
@@ -18,7 +18,6 @@ import {
 } from '../tools';
 import { buildAtlasBotEmail } from '../atlas-bot';
 import { eventBus } from '../../../realtime/event-bus';
-import { config } from '../../../config';
 
 /**
  * Mock the drizzle chain used by tools.ts handlers:
@@ -1035,72 +1034,50 @@ describe('assignUserHandler', () => {
   });
 });
 
-describe('getInboxPlaybookHandler (T-06)', () => {
+describe('getQualifierEnabledHandler', () => {
   const INBOX_ID = '11111111-1111-1111-1111-111111111111';
   const ACCOUNT_A = 'account-A';
   const ACCOUNT_B = 'account-B';
-  const playbookRow = {
-    content: 'You are a helpful sales agent for Acme Corp.',
-    etag: 'abc123def456',
-    version: 3,
-    updatedAt: new Date('2026-05-20T08:00:00Z'),
-  };
 
-  let originalFlag: boolean;
-  beforeEach(() => {
-    originalFlag = config.PLAYBOOK_IN_AXIS_ENABLED;
-    config.PLAYBOOK_IN_AXIS_ENABLED = true;
-  });
-  afterEach(() => {
-    config.PLAYBOOK_IN_AXIS_ENABLED = originalFlag;
-  });
-
-  it('returns {exists:true,...} when inbox, link and playbook all match', async () => {
-    // queries in order: inbox → atlas_user_links → inbox_playbooks
+  it('returns {enabled:true} when the inbox has qualifier_enabled=true', async () => {
+    // queries in order: inbox → atlas_user_links
     const { db } = makeDb([
+      [{ accountId: ACCOUNT_A, qualifierEnabled: true }],
       [{ accountId: ACCOUNT_A }],
-      [{ accountId: ACCOUNT_A }],
-      [playbookRow],
     ]);
 
-    const result = await getInboxPlaybookHandler(db, { inboxId: INBOX_ID }, CTX);
+    const result = await getQualifierEnabledHandler(db, { inboxId: INBOX_ID }, CTX);
 
-    expect(result).toEqual({
-      exists: true,
-      content: playbookRow.content,
-      etag: playbookRow.etag,
-      version: playbookRow.version,
-      updatedAt: playbookRow.updatedAt,
-    });
+    expect(result).toEqual({ enabled: true });
   });
 
-  it('returns {exists:false} when the inbox does not exist (no 404)', async () => {
+  it('returns {enabled:false} when the inbox has qualifier_enabled=false', async () => {
+    const { db } = makeDb([
+      [{ accountId: ACCOUNT_A, qualifierEnabled: false }],
+      [{ accountId: ACCOUNT_A }],
+    ]);
+
+    const result = await getQualifierEnabledHandler(db, { inboxId: INBOX_ID }, CTX);
+
+    expect(result).toEqual({ enabled: false });
+  });
+
+  it('throws MessagingToolError("not_found") when the inbox does not exist', async () => {
     const { db } = makeDb([[]]);
 
-    const result = await getInboxPlaybookHandler(db, { inboxId: INBOX_ID }, CTX);
+    const promise = getQualifierEnabledHandler(db, { inboxId: INBOX_ID }, CTX);
 
-    expect(result).toEqual({ exists: false });
-  });
-
-  it('returns {exists:false} when the inbox exists but has no playbook row', async () => {
-    const { db } = makeDb([
-      [{ accountId: ACCOUNT_A }],
-      [{ accountId: ACCOUNT_A }],
-      [],
-    ]);
-
-    const result = await getInboxPlaybookHandler(db, { inboxId: INBOX_ID }, CTX);
-
-    expect(result).toEqual({ exists: false });
+    await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
+    await expect(promise).rejects.toMatchObject({ code: 'not_found' });
   });
 
   it('throws forbidden when the Atlas org is bound to a different account (cross-tenant)', async () => {
     const { db } = makeDb([
-      [{ accountId: ACCOUNT_B }], // inbox belongs to account B
-      [{ accountId: ACCOUNT_A }], // caller org bound to account A
+      [{ accountId: ACCOUNT_B, qualifierEnabled: true }], // inbox belongs to account B
+      [{ accountId: ACCOUNT_A }],                         // caller org bound to account A
     ]);
 
-    const promise = getInboxPlaybookHandler(db, { inboxId: INBOX_ID }, CTX);
+    const promise = getQualifierEnabledHandler(db, { inboxId: INBOX_ID }, CTX);
 
     await expect(promise).rejects.toBeInstanceOf(MessagingToolError);
     await expect(promise).rejects.toMatchObject({ code: 'forbidden' });
@@ -1108,26 +1085,12 @@ describe('getInboxPlaybookHandler (T-06)', () => {
 
   it('throws forbidden when the caller org has no atlas-bot link at all', async () => {
     const { db } = makeDb([
-      [{ accountId: ACCOUNT_A }],
+      [{ accountId: ACCOUNT_A, qualifierEnabled: true }],
       [], // no link row
     ]);
 
-    const promise = getInboxPlaybookHandler(db, { inboxId: INBOX_ID }, CTX);
+    const promise = getQualifierEnabledHandler(db, { inboxId: INBOX_ID }, CTX);
 
     await expect(promise).rejects.toMatchObject({ code: 'forbidden' });
-  });
-
-  it('returns {exists:false} when the feature flag is off, even if a row exists (D40)', async () => {
-    config.PLAYBOOK_IN_AXIS_ENABLED = false;
-    // No query should be issued; pass a db that would throw if touched.
-    const select = vi.fn(() => {
-      throw new Error('db should not be queried when flag is off');
-    });
-    const db = { select } as unknown as DB;
-
-    const result = await getInboxPlaybookHandler(db, { inboxId: INBOX_ID }, CTX);
-
-    expect(result).toEqual({ exists: false });
-    expect(select).not.toHaveBeenCalled();
   });
 });

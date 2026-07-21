@@ -246,6 +246,13 @@
       "when": 1784514296341,
       "tag": "0034_adorable_the_twelve",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1784599278173,
+      "tag": "0035_chief_wrecking_crew",
+      "breakpoints": true
     }
   ]
 }

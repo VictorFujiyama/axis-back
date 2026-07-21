@@ -21,6 +21,9 @@ export const inboxes = pgTable('inboxes', {
   // Provider for the builtin bot LLM: 'anthropic' | 'openai' (app-level enum validation).
   botLlmProvider: text('bot_llm_provider'),
   enabled: boolean('enabled').notNull().default(true),
+  // Opt-out flag for the qualifier stage. When false, inbound messages skip
+  // qualification and go straight to the bot pipeline.
+  qualifierEnabled: boolean('qualifier_enabled').notNull().default(true),
   deletedAt: timestamp('deleted_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
