@@ -39,6 +39,7 @@ import { widgetWsRoutes } from './realtime/widget-ws';
 import { botRoutes } from './modules/bots/routes';
 import { botRespondRoutes } from './modules/bots/respond';
 import { botEventsRoutes } from './modules/bots/events-routes';
+import { botConfigRoutes } from './modules/bots/config-routes';
 import { realtimeRoutes } from './realtime/ws-routes';
 import { actionRoutes } from './modules/actions/routes';
 import { analyticsRoutes } from './modules/analytics/routes';
@@ -203,6 +204,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(botRoutes);
   await app.register(botRespondRoutes);
   await app.register(botEventsRoutes);
+  await app.register(botConfigRoutes);
   await app.register(apiChannelRoutes);
   await app.register(emailChannelRoutes);
   await app.register(webchatChannelRoutes);
