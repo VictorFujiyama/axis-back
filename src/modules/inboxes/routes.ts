@@ -58,6 +58,7 @@ const updateBody = z.object({
   config: z.record(z.unknown()).optional(),
   secrets: z.record(z.unknown()).optional(),
   enabled: z.boolean().optional(),
+  qualifierEnabled: z.boolean().optional(),
   defaultBotId: z.string().uuid().nullable().optional(),
   // playbook-in-axis (D13/D14/D20): playbook content + LLM credentials. `null`
   // clears; omitted (undefined) leaves the field untouched. min/max only apply
@@ -116,6 +117,7 @@ function publicInbox(
     config: row.config,
     defaultBotId: row.defaultBotId,
     enabled: row.enabled,
+    qualifierEnabled: row.qualifierEnabled,
     secretsConfigured: row.secrets !== null,
     callbackWebhookUrl,
     webhookAutoConfigured,
@@ -396,6 +398,7 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
       if (body.name !== undefined) patch.name = body.name;
       if (body.config !== undefined) patch.config = body.config;
       if (body.enabled !== undefined) patch.enabled = body.enabled;
+      if (body.qualifierEnabled !== undefined) patch.qualifierEnabled = body.qualifierEnabled;
       if (body.secrets !== undefined) patch.secrets = encryptJSON(body.secrets);
       if (body.defaultBotId !== undefined) patch.defaultBotId = body.defaultBotId;
 
