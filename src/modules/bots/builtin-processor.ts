@@ -11,7 +11,7 @@
  * 6. Insert bot response + emit WebSocket
  * 7. Check max turns safety net
  */
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import type { FastifyBaseLogger } from 'fastify';
 import type Redis from 'ioredis';
 import { schema, type DB } from '@blossom/db';
@@ -19,7 +19,6 @@ import { decryptJSON } from '../../crypto';
 import { eventBus } from '../../realtime/event-bus';
 import { parseBuiltinConfig, type BuiltinBotConfig } from './builtin-config';
 import { callLLM, resolveApiKey, type LLMMessage } from './llm-client';
-import { fetchPlaybook, type PlaybookSource } from './playbook-fetcher';
 
 const HISTORY_LIMIT = 20;
 
@@ -30,13 +29,6 @@ export interface ProcessInput {
   newMessageId: string;
   botId: string;
   accountId: string;
-  /**
-   * Playbook version captured at dispatch time (D11 stale detection). Only set
-   * for builtin bots with `playbookSource === 'local'`. When the live
-   * inbox_playbooks row has a different version (e.g. a PATCH bumped it while
-   * this job was queued), the job aborts rather than reply with a stale prompt.
-   */
-  expectedPlaybookVersion?: number;
 }
 
 export async function processBuiltinBot(
@@ -44,12 +36,11 @@ export async function processBuiltinBot(
   {
     db,
     log,
-    redis,
-    fetchImpl,
   }: {
     db: DB;
     log: FastifyBaseLogger;
     redis: Redis;
+    // Não usado desde a deprecation do playbook; dispatcher ainda repassa (sai na Task 4).
     fetchImpl?: typeof fetch;
   },
 ): Promise<void> {
@@ -104,127 +95,8 @@ export async function processBuiltinBot(
     return;
   }
 
-  // ── 2.5. Resolve effective system prompt (Atlas playbook or inline) ──
-  const playbookStart = Date.now();
-  let effectiveSystemPrompt = cfg.systemPrompt;
-  let playbookFetchResult: { source: PlaybookSource; etag: string } | null = null;
-  let playbookFetchError: string | undefined;
-  if (cfg.playbookSource === 'atlas') {
-    try {
-      const playbook = await fetchPlaybook(
-        input.inboxId,
-        { redis, log },
-        { fetchImpl },
-      );
-      if (playbook) {
-        effectiveSystemPrompt = playbook.markdown;
-        playbookFetchResult = { source: playbook.source, etag: playbook.etag };
-      } else {
-        log.warn(
-          { botId: bot.id, inboxId: input.inboxId },
-          'builtin-bot: playbook fetch returned null; falling back to inline systemPrompt',
-        );
-      }
-    } catch (err) {
-      playbookFetchError = err instanceof Error ? err.message.slice(0, 200) : 'unknown';
-      log.warn(
-        { err, botId: bot.id, inboxId: input.inboxId },
-        'builtin-bot: playbook fetch threw',
-      );
-    }
-    await db
-      .insert(schema.botEvents)
-      .values({
-        botId: bot.id,
-        accountId: input.accountId,
-        conversationId: input.conversationId,
-        messageId: input.newMessageId,
-        event: 'playbook_fetch',
-        direction: 'outbound',
-        status: playbookFetchResult ? 'success' : 'failed',
-        latencyMs: Date.now() - playbookStart,
-        payload: playbookFetchResult
-          ? {
-              source: playbookFetchResult.source,
-              etag: playbookFetchResult.etag.slice(0, 8),
-              fallback: false,
-            }
-          : {
-              fallback: true,
-              ...(playbookFetchError
-                ? { reason: 'threw', errorPreview: playbookFetchError }
-                : { reason: 'returned-null' }),
-            },
-      })
-      .catch((err) => log.warn({ err }, 'bot_events insert failed (playbook_fetch)'));
-  } else if (cfg.playbookSource === 'local') {
-    // ── 2.5b. Local playbook (axis-back inbox_playbooks, D11/D24) ────
-    const [pb] = await db
-      .select()
-      .from(schema.inboxPlaybooks)
-      .where(eq(schema.inboxPlaybooks.inboxId, input.inboxId))
-      .limit(1);
-
-    // D11 stale detection: a PATCH may have bumped version while this job was
-    // queued. Abort instead of replying with a stale prompt; the dispatch that
-    // bumped version enqueues a fresh job carrying the new expected version.
-    if (
-      pb &&
-      input.expectedPlaybookVersion != null &&
-      pb.version !== input.expectedPlaybookVersion
-    ) {
-      log.warn(
-        {
-          botId: bot.id,
-          inboxId: input.inboxId,
-          expected: input.expectedPlaybookVersion,
-          actual: pb.version,
-        },
-        'builtin-bot: local playbook version stale, aborting',
-      );
-      await db
-        .insert(schema.botEvents)
-        .values({
-          botId: bot.id,
-          accountId: input.accountId,
-          conversationId: input.conversationId,
-          messageId: input.newMessageId,
-          event: 'playbook_stale_skipped',
-          direction: 'outbound',
-          status: 'failed',
-          latencyMs: Date.now() - playbookStart,
-          payload: { source: 'local', expected: input.expectedPlaybookVersion, actual: pb.version },
-        })
-        .catch((err) => log.warn({ err }, 'bot_events insert failed (playbook_stale_skipped)'));
-      return;
-    }
-
-    if (pb) {
-      effectiveSystemPrompt = pb.content;
-      playbookFetchResult = { source: 'local', etag: pb.etag };
-    } else {
-      log.warn(
-        { botId: bot.id, inboxId: input.inboxId },
-        'builtin-bot: inbox_playbooks empty for local source, falling back to inline systemPrompt',
-      );
-    }
-    await db
-      .insert(schema.botEvents)
-      .values({
-        botId: bot.id,
-        accountId: input.accountId,
-        conversationId: input.conversationId,
-        messageId: input.newMessageId,
-        event: 'playbook_fetch',
-        direction: 'outbound',
-        status: pb ? 'success' : 'failed',
-        latencyMs: Date.now() - playbookStart,
-        payload: pb
-          ? { source: 'local', etag: pb.etag.slice(0, 8), version: pb.version }
-          : { fallback: true, reason: 'no-local-row' },
-      })
-      .catch((err) => log.warn({ err }, 'bot_events insert failed (playbook_fetch)'));
-  }
+  // System prompt vem direto do bot config (deprecation 2026-07-20: playbook obsoleto)
+  const effectiveSystemPrompt = cfg.systemPrompt;
 
   // ── 3. Load message history ───────────────────────────────────────
   const historyRows = await db

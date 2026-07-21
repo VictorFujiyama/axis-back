@@ -1,15 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyBaseLogger } from 'fastify';
 import type Redis from 'ioredis';
-import { schema, type DB } from '@blossom/db';
+import type { DB } from '@blossom/db';
 
 import { processBuiltinBot, type ProcessInput } from '../builtin-processor';
-import { fetchPlaybook } from '../playbook-fetcher';
 import { callLLM } from '../llm-client';
-
-vi.mock('../playbook-fetcher', () => ({
-  fetchPlaybook: vi.fn(),
-}));
 
 vi.mock('../llm-client', () => ({
   callLLM: vi.fn(),
@@ -26,7 +21,6 @@ vi.mock('../../../realtime/event-bus', () => ({
   eventBus: { emitEvent: vi.fn() },
 }));
 
-const mockedFetchPlaybook = vi.mocked(fetchPlaybook);
 const mockedCallLLM = vi.mocked(callLLM);
 
 const INPUT: ProcessInput = {
@@ -39,7 +33,6 @@ const INPUT: ProcessInput = {
 };
 
 const INLINE_PROMPT = 'You are an INLINE-FIXTURE assistant.';
-const REMOTE_MARKDOWN = '# Remote Playbook\nYou are a REMOTE-FIXTURE assistant.';
 
 function makeBaseConfig(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -90,14 +83,6 @@ interface BuildDbOpts {
   conv?: unknown;
   bot: unknown;
   history?: unknown[];
-  /** When set, the FIRST insert whose values.event matches this string rejects. */
-  rejectInsertForEvent?: string;
-  /**
-   * When defined, an extra `inbox_playbooks` SELECT (.limit(1)) is wired between
-   * the bot and history selects — matching the `playbookSource === 'local'`
-   * branch. Pass `[]` to simulate a missing row, or `[row]` for a present one.
-   */
-  localPlaybook?: unknown[];
 }
 
 function buildDb(opts: BuildDbOpts): DbMock {
@@ -106,11 +91,12 @@ function buildDb(opts: BuildDbOpts): DbMock {
   const insertCalls: Array<{ table: unknown; values: unknown }> = [];
 
   // SELECT chain — terminal `.limit(...)` calls, in invocation order:
-  // conversation, bot, [inbox_playbooks if local], history.
+  // conversation, bot, history.
   const limit = vi.fn();
-  limit.mockResolvedValueOnce([conv]).mockResolvedValueOnce([opts.bot]);
-  if (opts.localPlaybook !== undefined) limit.mockResolvedValueOnce(opts.localPlaybook);
-  limit.mockResolvedValueOnce(history);
+  limit
+    .mockResolvedValueOnce([conv])
+    .mockResolvedValueOnce([opts.bot])
+    .mockResolvedValueOnce(history);
   const orderBy = vi.fn().mockReturnValue({ limit });
   const where = vi.fn().mockReturnValue({ limit, orderBy });
   const from = vi.fn().mockReturnValue({ where });
@@ -119,19 +105,11 @@ function buildDb(opts: BuildDbOpts): DbMock {
   // INSERT chain — values() returns a thenable that's also `.returning()`-able,
   // so both `await insert.values(...).catch(...)` (bot_events) and
   // `await insert.values(...).returning()` (messages) work.
-  let rejectedOnce = false;
   const insert = vi.fn().mockImplementation((table: unknown) => {
     return {
       values: (values: Record<string, unknown>) => {
         insertCalls.push({ table, values });
-        const shouldReject =
-          opts.rejectInsertForEvent !== undefined &&
-          !rejectedOnce &&
-          values['event'] === opts.rejectInsertForEvent;
-        if (shouldReject) rejectedOnce = true;
-        const promise = shouldReject
-          ? Promise.reject(new Error('bot_events insert simulated failure'))
-          : Promise.resolve([{ id: 'inserted-row' }]);
+        const promise = Promise.resolve([{ id: 'inserted-row' }]);
         return {
           then: promise.then.bind(promise),
           catch: promise.catch.bind(promise),
@@ -143,7 +121,7 @@ function buildDb(opts: BuildDbOpts): DbMock {
   });
 
   // UPDATE chain — returning() returns [] so insertBotMessage exits before the
-  // messages insert, keeping the test focused on the playbook/llm path.
+  // messages insert, keeping the test focused on the llm path.
   const updateReturning = vi.fn().mockResolvedValue([]);
   const updateWhere = vi.fn().mockReturnValue({ returning: updateReturning });
   const set = vi.fn().mockReturnValue({ where: updateWhere });
@@ -175,9 +153,8 @@ function findPlaybookFetchInsert(
   return hit?.values as Record<string, unknown> | undefined;
 }
 
-describe('processBuiltinBot — playbook integration', () => {
+describe('processBuiltinBot — system prompt (single inline path)', () => {
   beforeEach(() => {
-    mockedFetchPlaybook.mockReset();
     mockedCallLLM.mockReset();
     mockedCallLLM.mockResolvedValue({
       content: 'bot reply',
@@ -186,73 +163,18 @@ describe('processBuiltinBot — playbook integration', () => {
     });
   });
 
-  it('(a) playbookSource defaults to inline: callLLM uses cfg.systemPrompt and no playbook_fetch event is logged', async () => {
-    // `playbookSource` omitted → zod default 'inline' kicks in at parseBuiltinConfig.
+  it('callLLM usa cfg.systemPrompt direto e nenhum evento playbook_fetch é gravado', async () => {
     const { db, insertCalls } = buildDb({ bot: makeBotRow(makeBaseConfig()) });
     const app = makeApp();
 
     await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
 
-    expect(mockedFetchPlaybook).not.toHaveBeenCalled();
     expect(mockedCallLLM).toHaveBeenCalledTimes(1);
     expect(mockedCallLLM.mock.calls[0]![0].systemPrompt).toBe(INLINE_PROMPT);
     expect(findPlaybookFetchInsert(insertCalls)).toBeUndefined();
   });
 
-  it("(b) playbookSource 'atlas' + fetch returns 200: callLLM uses remote markdown and event payload records success", async () => {
-    mockedFetchPlaybook.mockResolvedValue({
-      markdown: REMOTE_MARKDOWN,
-      source: 'atlas-fresh',
-      etag: 'abcdef1234567890',
-    });
-    const { db, insertCalls } = buildDb({
-      bot: makeBotRow(makeBaseConfig({ playbookSource: 'atlas' })),
-    });
-    const app = makeApp();
-
-    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
-
-    expect(mockedFetchPlaybook).toHaveBeenCalledTimes(1);
-    expect(mockedCallLLM).toHaveBeenCalledTimes(1);
-    expect(mockedCallLLM.mock.calls[0]![0].systemPrompt).toBe(REMOTE_MARKDOWN);
-
-    const evt = findPlaybookFetchInsert(insertCalls);
-    expect(evt).toBeDefined();
-    expect(evt!['event']).toBe('playbook_fetch');
-    expect(evt!['status']).toBe('success');
-    expect(evt!['direction']).toBe('outbound');
-    expect(evt!['accountId']).toBe(INPUT.accountId);
-    const payload = evt!['payload'] as Record<string, unknown>;
-    expect(payload['source']).toBe('atlas-fresh');
-    expect(payload['fallback']).toBe(false);
-    // Spec: etag truncated to 8 chars in the payload, not 16.
-    expect(payload['etag']).toBe('abcdef12');
-  });
-
-  it("(c) playbookSource 'atlas' + fetch returns null: falls back to cfg.systemPrompt with payload.reason='returned-null'", async () => {
-    mockedFetchPlaybook.mockResolvedValue(null);
-    const { db, insertCalls } = buildDb({
-      bot: makeBotRow(makeBaseConfig({ playbookSource: 'atlas' })),
-    });
-    const app = makeApp();
-
-    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
-
-    expect(mockedFetchPlaybook).toHaveBeenCalledTimes(1);
-    expect(mockedCallLLM).toHaveBeenCalledTimes(1);
-    expect(mockedCallLLM.mock.calls[0]![0].systemPrompt).toBe(INLINE_PROMPT);
-
-    const evt = findPlaybookFetchInsert(insertCalls);
-    expect(evt).toBeDefined();
-    expect(evt!['status']).toBe('failed');
-    const payload = evt!['payload'] as Record<string, unknown>;
-    expect(payload['fallback']).toBe(true);
-    expect(payload['reason']).toBe('returned-null');
-    expect(payload['errorPreview']).toBeUndefined();
-  });
-
-  it("(d) playbookSource 'atlas' + fetcher throws: falls back to cfg.systemPrompt with payload.reason='threw'", async () => {
-    mockedFetchPlaybook.mockRejectedValue(new Error('boom: unexpected failure'));
+  it("config legado com playbookSource 'atlas' é ignorado: cfg.systemPrompt direto, sem lookup", async () => {
     const { db, insertCalls } = buildDb({
       bot: makeBotRow(makeBaseConfig({ playbookSource: 'atlas' })),
     });
@@ -262,125 +184,27 @@ describe('processBuiltinBot — playbook integration', () => {
 
     expect(mockedCallLLM).toHaveBeenCalledTimes(1);
     expect(mockedCallLLM.mock.calls[0]![0].systemPrompt).toBe(INLINE_PROMPT);
-
-    const evt = findPlaybookFetchInsert(insertCalls);
-    expect(evt).toBeDefined();
-    expect(evt!['status']).toBe('failed');
-    const payload = evt!['payload'] as Record<string, unknown>;
-    expect(payload['fallback']).toBe(true);
-    expect(payload['reason']).toBe('threw');
-    expect(payload['errorPreview']).toBe('boom: unexpected failure');
+    expect(findPlaybookFetchInsert(insertCalls)).toBeUndefined();
   });
 
-  it("(e) playbookSource 'atlas' + bot_events insert throws: bot still calls LLM and logs warn", async () => {
-    mockedFetchPlaybook.mockResolvedValue({
-      markdown: REMOTE_MARKDOWN,
-      source: 'atlas-fresh',
-      etag: 'abcdef1234567890',
-    });
-    const { db, insertCalls } = buildDb({
-      bot: makeBotRow(makeBaseConfig({ playbookSource: 'atlas' })),
-      // Make the playbook_fetch bot_events insert reject; llm_call insert succeeds.
-      rejectInsertForEvent: 'playbook_fetch',
-    });
-    const app = makeApp();
-
-    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
-
-    // The .catch on the insert swallows the rejection and surfaces it via log.warn.
-    expect(mockedCallLLM).toHaveBeenCalledTimes(1);
-    expect(mockedCallLLM.mock.calls[0]![0].systemPrompt).toBe(REMOTE_MARKDOWN);
-
-    const warnCall = app.logWarn.mock.calls.find(
-      (call) => call[1] === 'bot_events insert failed (playbook_fetch)',
-    );
-    expect(warnCall).toBeDefined();
-
-    // Confirm the playbook_fetch row was attempted (even though it rejected),
-    // so the caller-side bookkeeping ran.
-    expect(findPlaybookFetchInsert(insertCalls)).toBeDefined();
-    // schema.botEvents is the table for the playbook_fetch insert.
-    const fetchInsert = insertCalls.find(
-      (c) => (c.values as Record<string, unknown>)['event'] === 'playbook_fetch',
-    );
-    expect(fetchInsert!.table).toBe(schema.botEvents);
-  });
-
-  it("(f) playbookSource 'local' + inbox_playbooks row exists: callLLM uses local content, payload.source='local'", async () => {
+  it("config legado com playbookSource 'local' é ignorado: cfg.systemPrompt direto, sem select em inbox_playbooks", async () => {
     const { db, insertCalls } = buildDb({
       bot: makeBotRow(makeBaseConfig({ playbookSource: 'local' })),
-      localPlaybook: [{ content: 'LOCAL playbook content', etag: 'deadbeefcafe0000', version: 3 }],
     });
     const app = makeApp();
 
     await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
 
-    // Local source must NOT hit the Atlas HTTP fetcher.
-    expect(mockedFetchPlaybook).not.toHaveBeenCalled();
-    expect(mockedCallLLM).toHaveBeenCalledTimes(1);
-    expect(mockedCallLLM.mock.calls[0]![0].systemPrompt).toBe('LOCAL playbook content');
-
-    const evt = findPlaybookFetchInsert(insertCalls);
-    expect(evt).toBeDefined();
-    expect(evt!['status']).toBe('success');
-    const payload = evt!['payload'] as Record<string, unknown>;
-    expect(payload['source']).toBe('local');
-    expect(payload['etag']).toBe('deadbeef');
-    expect(payload['version']).toBe(3);
-  });
-
-  it("(g) playbookSource 'local' + no inbox_playbooks row: falls back to cfg.systemPrompt, payload.reason='no-local-row'", async () => {
-    const { db, insertCalls } = buildDb({
-      bot: makeBotRow(makeBaseConfig({ playbookSource: 'local' })),
-      localPlaybook: [],
-    });
-    const app = makeApp();
-
-    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
-
-    expect(mockedFetchPlaybook).not.toHaveBeenCalled();
+    // buildDb wires exactly 3 selects (conversation, bot, history); an extra
+    // inbox_playbooks lookup would shift the history rows and break the run.
     expect(mockedCallLLM).toHaveBeenCalledTimes(1);
     expect(mockedCallLLM.mock.calls[0]![0].systemPrompt).toBe(INLINE_PROMPT);
-
-    const evt = findPlaybookFetchInsert(insertCalls);
-    expect(evt).toBeDefined();
-    expect(evt!['status']).toBe('failed');
-    const payload = evt!['payload'] as Record<string, unknown>;
-    expect(payload['fallback']).toBe(true);
-    expect(payload['reason']).toBe('no-local-row');
-  });
-
-  it("(h) playbookSource 'local' + expectedPlaybookVersion stale: aborts before LLM, logs playbook_stale_skipped", async () => {
-    const { db, insertCalls } = buildDb({
-      bot: makeBotRow(makeBaseConfig({ playbookSource: 'local' })),
-      localPlaybook: [{ content: 'LOCAL playbook content', etag: 'deadbeefcafe0000', version: 2 }],
-    });
-    const app = makeApp();
-
-    // Dispatch snapshotted version 1, but the live row is now version 2 → stale.
-    await processBuiltinBot(
-      { ...INPUT, expectedPlaybookVersion: 1 },
-      { db, log: app.log, redis: app.redis },
-    );
-
-    // Aborted before reaching the LLM.
-    expect(mockedCallLLM).not.toHaveBeenCalled();
-
-    const stale = insertCalls.find(
-      (c) => (c.values as Record<string, unknown>)['event'] === 'playbook_stale_skipped',
-    );
-    expect(stale).toBeDefined();
-    const payload = (stale!.values as Record<string, unknown>)['payload'] as Record<string, unknown>;
-    expect(payload['expected']).toBe(1);
-    expect(payload['actual']).toBe(2);
-    // No regular playbook_fetch event when stale-skipped.
     expect(findPlaybookFetchInsert(insertCalls)).toBeUndefined();
   });
 });
 
 describe('processBuiltinBot — greeting message (bug #A3 regression guard)', () => {
   beforeEach(() => {
-    mockedFetchPlaybook.mockReset();
     mockedCallLLM.mockReset();
     mockedCallLLM.mockResolvedValue({
       content: 'bot reply from LLM',
