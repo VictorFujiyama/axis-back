@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { UserRole } from '@blossom/shared-types';
 
-// Task 7 (playbook deprecation): endpoints REST de config do bot builtin.
-// GET/PATCH /api/v1/bots/:botId/config + POST /api/v1/bots/:botId/invalidate-cache.
-// DB mockado (convenção do repo pra route specs); o comportamento real do schema
-// bots_config_versions é coberto pelo teste de integração da Task 1.
+// Tasks 7+8 (playbook deprecation): endpoints REST de config do bot builtin.
+// GET/PATCH /api/v1/bots/:botId/config, POST invalidate-cache, GET /versions e
+// POST /rollback. DB mockado (convenção do repo pra route specs); o comportamento
+// real do schema bots_config_versions é coberto pelo teste de integração da Task 1.
 
 const TEST_USER_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const TEST_ACCOUNT_ID = '11111111-2222-4333-8444-555555555555';
@@ -50,14 +50,37 @@ function botRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function versionRow(version: number, overrides: Record<string, unknown> = {}) {
+  return {
+    id: `00000000-0000-4000-8000-00000000000${version}`,
+    botId: BOT_ID,
+    version,
+    systemPrompt: `Prompt v${version}`,
+    model: 'claude-sonnet-4-5',
+    provider: 'anthropic',
+    temperature: '0.5',
+    maxTokens: 900,
+    etag: `e7a9${version}b2c4d6f8a0${version}c`.slice(0, 16),
+    createdAt: new Date(`2026-07-0${version}T00:00:00.000Z`),
+    createdByUserId: TEST_USER_ID,
+    ...overrides,
+  };
+}
+
 const versionInsertValues = vi.fn();
 const botUpdateSet = vi.fn();
+/** Chains created by app.db.select, in call order (pra inspecionar .limit etc). */
+const dbSelectChains: Array<Record<string, unknown>> = [];
 
 interface DbOptions {
   /** Bot row lookup ([] => 404). */
   botRow?: unknown[];
   /** Latest bots_config_versions row ([] => version 0). */
   latestVersion?: unknown[];
+  /** Override completo da sequência de resultados de app.db.select. */
+  selects?: unknown[][];
+  /** Override completo da sequência de resultados de tx.select. */
+  txSelects?: unknown[][];
 }
 
 async function buildTestApp(options: DbOptions = {}): Promise<FastifyInstance> {
@@ -71,14 +94,18 @@ async function buildTestApp(options: DbOptions = {}): Promise<FastifyInstance> {
   await app.register(jwtPlugin);
 
   // GET uses app.db.select twice (bot, latest version); invalidate-cache once.
-  const selectResults = [options.botRow ?? [botRow()], options.latestVersion ?? []];
+  const selectResults = options.selects ?? [options.botRow ?? [botRow()], options.latestVersion ?? []];
   let selectCall = 0;
-  const dbSelect = vi
-    .fn()
-    .mockImplementation(() => chain(selectResults[selectCall++] ?? []));
+  const dbSelect = vi.fn().mockImplementation(() => {
+    const c = chain(selectResults[selectCall++] ?? []);
+    dbSelectChains.push(c);
+    return c;
+  });
 
   // PATCH runs inside a tx: bot FOR UPDATE, latest version, insert, update.
-  const txSelectResults = [options.botRow ?? [botRow()], options.latestVersion ?? []];
+  // Rollback: bot FOR UPDATE, target version, latest version, insert, update.
+  const txSelectResults =
+    options.txSelects ?? [options.botRow ?? [botRow()], options.latestVersion ?? []];
   let txSelectCall = 0;
   const tx = {
     select: vi.fn().mockImplementation(() => chain(txSelectResults[txSelectCall++] ?? [])),
@@ -356,6 +383,199 @@ describe('POST /api/v1/bots/:botId/invalidate-cache', () => {
         headers: { authorization: authHeader(app) },
       });
       expect(res.statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('GET /api/v1/bots/:botId/versions', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    dbSelectChains.length = 0;
+  });
+
+  it('retorna lista desc com etagPrefix de 8 chars', async () => {
+    const app = await buildTestApp({
+      selects: [[botRow()], [versionRow(3), versionRow(2), versionRow(1)]],
+    });
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/versions`,
+        headers: { authorization: authHeader(app) },
+      });
+      expect(res.statusCode).toBe(200);
+      const json = res.json();
+      expect(json.map((v: { version: number }) => v.version)).toEqual([3, 2, 1]);
+      expect(json[0]).toEqual({
+        version: 3,
+        createdAt: versionRow(3).createdAt.toISOString(),
+        createdByUserId: TEST_USER_ID,
+        etagPrefix: (versionRow(3).etag as string).slice(0, 8),
+      });
+      expect(json[0].etagPrefix).toHaveLength(8);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('aplica ?limit=N na query (default 20)', async () => {
+    const app = await buildTestApp({ selects: [[botRow()], [], [botRow()], []] });
+    try {
+      const res1 = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/versions?limit=5`,
+        headers: { authorization: authHeader(app) },
+      });
+      expect(res1.statusCode).toBe(200);
+      expect(dbSelectChains[1]?.limit).toHaveBeenCalledWith(5);
+
+      const res2 = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/versions`,
+        headers: { authorization: authHeader(app) },
+      });
+      expect(res2.statusCode).toBe(200);
+      expect(dbSelectChains[3]?.limit).toHaveBeenCalledWith(20);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('retorna 404 pra bot fora da conta', async () => {
+    const app = await buildTestApp({ selects: [[]] });
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/versions`,
+        headers: { authorization: authHeader(app) },
+      });
+      expect(res.statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('POST /api/v1/bots/:botId/rollback', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    dbSelectChains.length = 0;
+  });
+
+  it('restaura config da versão alvo e cria versão nova (não deleta histórico)', async () => {
+    const app = await buildTestApp({
+      txSelects: [[botRow()], [versionRow(2)], [{ version: 5 }]],
+    });
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/bots/${BOT_ID}/rollback`,
+        headers: { authorization: authHeader(app) },
+        payload: { targetVersion: 2 },
+      });
+      expect(res.statusCode).toBe(200);
+      const json = res.json();
+      expect(json.version).toBe(6);
+      const { configEtag } = await import('../config-routes');
+      expect(json.etag).toBe(
+        configEtag({
+          systemPrompt: 'Prompt v2',
+          model: 'claude-sonnet-4-5',
+          provider: 'anthropic',
+          temperature: 0.5,
+          maxTokens: 900,
+        }),
+      );
+      expect(versionInsertValues).toHaveBeenCalledWith(
+        expect.objectContaining({
+          botId: BOT_ID,
+          version: 6,
+          systemPrompt: 'Prompt v2',
+          model: 'claude-sonnet-4-5',
+          provider: 'anthropic',
+          temperature: '0.5',
+          maxTokens: 900,
+          etag: json.etag,
+          createdByUserId: TEST_USER_ID,
+        }),
+      );
+      expect(botUpdateSet).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: expect.objectContaining({
+            systemPrompt: 'Prompt v2',
+            temperature: 0.5,
+            maxTokens: 900,
+            // Campos fora do histórico permanecem os atuais do bot.
+            playbookSource: 'inline',
+            handoffKeywords: [],
+          }),
+        }),
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('retorna 404 quando targetVersion não existe', async () => {
+    const app = await buildTestApp({ txSelects: [[botRow()], []] });
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/bots/${BOT_ID}/rollback`,
+        headers: { authorization: authHeader(app) },
+        payload: { targetVersion: 42 },
+      });
+      expect(res.statusCode).toBe(404);
+      expect(versionInsertValues).not.toHaveBeenCalled();
+      expect(botUpdateSet).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('retorna 409 quando expectedEtag não bate', async () => {
+    const app = await buildTestApp({ txSelects: [[botRow()]] });
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/bots/${BOT_ID}/rollback`,
+        headers: { authorization: authHeader(app) },
+        payload: { targetVersion: 2, expectedEtag: 'deadbeefdeadbeef' },
+      });
+      expect(res.statusCode).toBe(409);
+      expect(versionInsertValues).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('retorna 404 pra bot fora da conta', async () => {
+    const app = await buildTestApp({ txSelects: [[]] });
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/bots/${BOT_ID}/rollback`,
+        headers: { authorization: authHeader(app) },
+        payload: { targetVersion: 2 },
+      });
+      expect(res.statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejeita body sem targetVersion com 400', async () => {
+    const app = await buildTestApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/bots/${BOT_ID}/rollback`,
+        headers: { authorization: authHeader(app) },
+        payload: {},
+      });
+      expect(res.statusCode).toBe(400);
     } finally {
       await app.close();
     }

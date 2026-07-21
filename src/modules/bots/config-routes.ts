@@ -2,7 +2,8 @@
  * Bot config endpoints — substituem os antigos inbox-playbooks REST.
  * `bots.config` guarda os valores atuais; cada PATCH appenda uma row em
  * `bots_config_versions` (histórico linear, mesmo desenho do playbook antigo).
- * Task 8 adiciona listagem de versões + rollback.
+ * GET /versions lista o histórico; POST /rollback restaura uma versão prévia
+ * criando uma versão NOVA com o conteúdo antigo (nunca deleta histórico).
  */
 import { and, desc, eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
@@ -34,6 +35,16 @@ const patchBody = z
       v.maxTokens !== undefined,
     { message: 'nenhum campo de config para atualizar' },
   );
+
+const versionsQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+const rollbackBody = z.object({
+  targetVersion: z.number().int().min(1),
+  // Mesmo optimistic lock do PATCH: etag do estado que o cliente está vendo.
+  expectedEtag: z.string().optional(),
+});
 
 type ConfigFields = Pick<
   BuiltinBotConfig,
@@ -176,6 +187,150 @@ export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
+  app.get(
+    '/api/v1/bots/:botId/versions',
+    { preHandler: app.requireRole('admin') },
+    async (req, reply) => {
+      const { botId } = botIdParams.parse(req.params);
+      const parsedQuery = versionsQuery.safeParse(req.query);
+      if (!parsedQuery.success) return reply.badRequest('limit inválido (1..100)');
+
+      const [bot] = await app.db
+        .select({ id: schema.bots.id })
+        .from(schema.bots)
+        .where(and(eq(schema.bots.id, botId), eq(schema.bots.accountId, req.user.accountId)))
+        .limit(1);
+      if (!bot) return reply.notFound();
+
+      const rows = await app.db
+        .select({
+          version: schema.botsConfigVersions.version,
+          createdAt: schema.botsConfigVersions.createdAt,
+          createdByUserId: schema.botsConfigVersions.createdByUserId,
+          etag: schema.botsConfigVersions.etag,
+        })
+        .from(schema.botsConfigVersions)
+        .where(eq(schema.botsConfigVersions.botId, botId))
+        .orderBy(desc(schema.botsConfigVersions.createdAt))
+        .limit(parsedQuery.data.limit);
+
+      return rows.map((r) => ({
+        version: r.version,
+        createdAt: r.createdAt,
+        createdByUserId: r.createdByUserId,
+        etagPrefix: r.etag.slice(0, 8),
+      }));
+    },
+  );
+
+  app.post(
+    '/api/v1/bots/:botId/rollback',
+    { preHandler: app.requireRole('admin') },
+    async (req, reply) => {
+      const { botId } = botIdParams.parse(req.params);
+      const parsed = rollbackBody.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.badRequest(parsed.error.issues.map((i) => i.message).join('; '));
+      }
+      const { targetVersion, expectedEtag } = parsed.data;
+
+      let newVersion = 0;
+      let newEtag = '';
+      try {
+        await app.db.transaction(async (tx) => {
+          const [bot] = await tx
+            .select()
+            .from(schema.bots)
+            .where(and(eq(schema.bots.id, botId), eq(schema.bots.accountId, req.user.accountId)))
+            .limit(1)
+            .for('update');
+          if (!bot) throw new NotFoundInTx();
+          if (bot.botType !== 'builtin') throw new NotBuiltinInTx();
+
+          const currentCfg = bot.config as Partial<BuiltinBotConfig>;
+          if (expectedEtag !== undefined && expectedEtag !== configEtag(currentCfg)) {
+            throw new HttpConflict();
+          }
+
+          const [target] = await tx
+            .select()
+            .from(schema.botsConfigVersions)
+            .where(
+              and(
+                eq(schema.botsConfigVersions.botId, botId),
+                eq(schema.botsConfigVersions.version, targetVersion),
+              ),
+            )
+            .limit(1);
+          if (!target) throw new VersionNotFoundInTx();
+
+          // Só os campos versionados voltam; o resto da config (greeting,
+          // handoff etc.) permanece como está no bot hoje.
+          let merged: BuiltinBotConfig;
+          try {
+            merged = builtinBotConfigSchema.parse({
+              ...currentCfg,
+              systemPrompt: target.systemPrompt,
+              model: target.model,
+              provider: target.provider,
+              temperature: target.temperature == null ? undefined : Number(target.temperature),
+              maxTokens: target.maxTokens ?? undefined,
+            });
+          } catch (err) {
+            throw new BadConfigInTx(err instanceof Error ? err.message : 'config inválida');
+          }
+          newEtag = configEtag(merged);
+
+          const [latest] = await tx
+            .select({ version: schema.botsConfigVersions.version })
+            .from(schema.botsConfigVersions)
+            .where(eq(schema.botsConfigVersions.botId, botId))
+            .orderBy(desc(schema.botsConfigVersions.version))
+            .limit(1);
+          newVersion = (latest?.version ?? 0) + 1;
+
+          await tx.insert(schema.botsConfigVersions).values({
+            botId,
+            version: newVersion,
+            systemPrompt: merged.systemPrompt,
+            model: merged.model,
+            provider: merged.provider,
+            temperature: String(merged.temperature),
+            maxTokens: merged.maxTokens,
+            etag: newEtag,
+            createdByUserId: req.user.sub,
+          });
+
+          await tx
+            .update(schema.bots)
+            .set({ config: merged, updatedAt: new Date() })
+            .where(eq(schema.bots.id, botId));
+        });
+      } catch (err) {
+        if (err instanceof NotFoundInTx) return reply.notFound();
+        if (err instanceof VersionNotFoundInTx) return reply.notFound('versão não encontrada');
+        if (err instanceof NotBuiltinInTx) return reply.badRequest('bot não é builtin');
+        if (err instanceof BadConfigInTx) return reply.badRequest(`Configuração inválida: ${err.message}`);
+        if (err instanceof HttpConflict) return reply.conflict(CONFLICT_MSG);
+        if ((err as { code?: string }).code === '23505') return reply.conflict(CONFLICT_MSG);
+        throw err;
+      }
+
+      void writeAudit(
+        req,
+        {
+          action: 'bot.config_rolled_back',
+          entityType: 'bot',
+          entityId: botId,
+          changes: { version: newVersion, targetVersion },
+        },
+        { db: app.db, log: app.log },
+      );
+
+      return { etag: newEtag, version: newVersion };
+    },
+  );
+
   // No-op: o cache do prompt vive no lado do Atlas (Task 12). O endpoint
   // existe pra front/MCP terem um contrato estável desde já.
   app.post(
@@ -195,5 +350,6 @@ export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
 }
 
 class NotFoundInTx extends Error {}
+class VersionNotFoundInTx extends Error {}
 class NotBuiltinInTx extends Error {}
 class BadConfigInTx extends Error {}
