@@ -2,9 +2,9 @@ import { integer, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-or
 import { bots } from './bots';
 import { users } from './users';
 
-// Append-only version history for bot config (mirror of inbox_playbook_versions).
-// Every config save writes a new row here; `bots.config` keeps only the current
-// values. Rollback = new version with old values, so history stays linear.
+// Append-only version history for bot config. Every config save writes a new
+// row here; `bots.config` keeps only the current values. Rollback = new version
+// with old values, so history stays linear.
 export const botsConfigVersions = pgTable(
   'bots_config_versions',
   {

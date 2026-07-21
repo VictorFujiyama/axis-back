@@ -185,7 +185,7 @@ describe('processBuiltinBot — system prompt (single inline path)', () => {
     expect(findPlaybookFetchInsert(insertCalls)).toBeUndefined();
   });
 
-  it("config legado com playbookSource 'local' é ignorado: cfg.systemPrompt direto, sem select em inbox_playbooks", async () => {
+  it("config legado com playbookSource 'local' é ignorado: cfg.systemPrompt direto, sem lookup externo", async () => {
     const { db, insertCalls } = buildDb({
       bot: makeBotRow(makeBaseConfig({ playbookSource: 'local' })),
     });
@@ -194,7 +194,7 @@ describe('processBuiltinBot — system prompt (single inline path)', () => {
     await processBuiltinBot(INPUT, { db, log: app.log });
 
     // buildDb wires exactly 3 selects (conversation, bot, history); an extra
-    // inbox_playbooks lookup would shift the history rows and break the run.
+    // legacy playbook lookup would shift the history rows and break the run.
     expect(mockedCallLLM).toHaveBeenCalledTimes(1);
     expect(mockedCallLLM.mock.calls[0]![0].systemPrompt).toBe(INLINE_PROMPT);
     expect(findPlaybookFetchInsert(insertCalls)).toBeUndefined();

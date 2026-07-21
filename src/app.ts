@@ -71,7 +71,6 @@ import { atlasInboundRoutes } from './modules/atlas-connector/inbound-routes';
 import { atlasBackfillRoutes } from './modules/atlas-connector/backfill-routes';
 import { atlasProvisionRoutes } from './modules/atlas-connector/provision-routes';
 import { atlasMcpRoutes } from './modules/atlas-mcp-client/routes';
-import { backfillRoutes } from './modules/internal/backfill-routes';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -254,12 +253,6 @@ export async function buildApp(): Promise<FastifyInstance> {
   // Phase 12.2 MCP pull (GET /api/v1/atlas/memory). Front-facing read of Atlas
   // memory; always registered, returns 503 when ATLAS_MCP_BEARER is unset.
   await app.register(atlasMcpRoutes);
-
-  // One-time atlas→axis playbook backfill (POST /api/v1/internal/backfill/
-  // inbox-playbook, D34). HMAC-gated (X-Backfill-Signature), no JWT; returns
-  // 503 when BACKFILL_SHARED_SECRET is unset so the migration window stays
-  // closed until an operator provisions the secret.
-  await app.register(backfillRoutes);
 
   // Load pluggable modules (ENABLED_MODULES) — after core routes so modules can
   // safely depend on app.requireAuth / app.db / app.queues decorators.

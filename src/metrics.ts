@@ -7,8 +7,7 @@
  *
  * CAVEAT: values are process-local and reset on restart. Under multiple pods the
  * scraped sum diverges from the true global count — acceptable for D39 visibility,
- * consistent with the "local per pod" philosophy of D28. If stronger accuracy is
- * ever needed, reseed the gauge from `SELECT count(*) FROM inbox_playbooks` at boot.
+ * consistent with the "local per pod" philosophy of D28.
  */
 
 export class Counter {

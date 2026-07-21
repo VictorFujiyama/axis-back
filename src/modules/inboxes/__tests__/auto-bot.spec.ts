@@ -105,7 +105,7 @@ describe('applyAutoBotForInbox', () => {
     expect(auditValues.entityId).toBe(BOT_ID);
   });
 
-  it('never queries inbox_playbooks (exactly two selects: inbox + bot)', async () => {
+  it('lookup is exactly two selects: inbox + bot', async () => {
     const { db, spies } = makeDb({
       selectLimits: [[inboxRow({ botLlmApiKeyEnc: 'enc', botLlmProvider: 'anthropic', defaultBotId: BOT_ID })], [botRow()]],
     });
