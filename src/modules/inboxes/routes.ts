@@ -1,10 +1,10 @@
 import { randomBytes } from 'node:crypto';
-import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { config as appConfig } from '../../config';
-import { decryptJSON, encryptJSON, sha256 } from '../../crypto';
+import { decryptJSON, encryptJSON } from '../../crypto';
 import { writeAudit } from '../../lib/audit';
 import { applyAutoBotForInbox, type AutoBotReason, defaultModelFor } from './auto-bot';
 import { backfillAssignedBotIdOnBotChange } from './backfill';
@@ -60,10 +60,6 @@ const updateBody = z.object({
   enabled: z.boolean().optional(),
   qualifierEnabled: z.boolean().optional(),
   defaultBotId: z.string().uuid().nullable().optional(),
-  // playbook-in-axis (D13/D14/D20): playbook content + LLM credentials. `null`
-  // clears; omitted (undefined) leaves the field untouched. min/max only apply
-  // when a string is supplied (nullable bypasses the length checks).
-  playbook: z.string().min(20).max(10000).nullable().optional(),
   botLlmApiKey: z.string().min(1).nullable().optional(),
   botLlmProvider: z.enum(['anthropic', 'openai']).nullable().optional(),
 });
@@ -85,12 +81,7 @@ const memberBody = z.object({
 });
 
 // Public representation — omit encrypted secrets blob and indicate configured.
-// `playbookContent` is only loaded on the detail/PATCH paths; when omitted the
-// `playbook` field is left off the response (it isn't needed in list views).
-function publicInbox(
-  row: typeof schema.inboxes.$inferSelect,
-  playbookContent?: string | null,
-) {
+function publicInbox(row: typeof schema.inboxes.$inferSelect) {
   const config = (row.config ?? {}) as Record<string, unknown>;
   const provider = typeof config.provider === 'string' ? config.provider : undefined;
   const webhookAutoConfigured = config.webhookAutoConfigured === true;
@@ -123,7 +114,6 @@ function publicInbox(
     webhookAutoConfigured,
     botLlmApiKeyConfigured: row.botLlmApiKeyEnc != null,
     botLlmProvider: row.botLlmProvider ?? null,
-    ...(playbookContent !== undefined ? { playbook: playbookContent } : {}),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -184,12 +174,7 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
         const allowed = await inboxIdsForUser(app, req.user.sub, req.user.accountId);
         if (!allowed.includes(inbox.id)) return reply.forbidden('Not a member of this inbox');
       }
-      const [pb] = await app.db
-        .select({ content: schema.inboxPlaybooks.content })
-        .from(schema.inboxPlaybooks)
-        .where(eq(schema.inboxPlaybooks.inboxId, inbox.id))
-        .limit(1);
-      return publicInbox(inbox, pb?.content ?? null);
+      return publicInbox(inbox);
     },
   );
 
@@ -359,16 +344,10 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
       }
       const body = parsed.data;
 
-      // playbook-in-axis fields present? (D20 transactional path)
-      const touchesPlaybookFeature =
-        body.playbook !== undefined ||
-        body.botLlmApiKey !== undefined ||
-        body.botLlmProvider !== undefined;
-
-      // Feature flag gate (D37): block playbook/key changes during a rollback.
-      if (touchesPlaybookFeature && !appConfig.PLAYBOOK_IN_AXIS_ENABLED) {
-        return reply.badRequest('feature disabled');
-      }
+      // Auto-bot lifecycle (D20 transactional path) fires when the caller
+      // touches the LLM credentials pair.
+      const touchesLLMCredentials =
+        body.botLlmApiKey !== undefined || body.botLlmProvider !== undefined;
 
       // Key ↔ provider must travel together (D14): a non-null key requires a
       // non-null provider and vice versa.
@@ -425,31 +404,10 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
         if (!updated) return; // inbox missing — handled after tx, nothing persisted.
         inbox = updated;
 
-        // Upsert / clear the playbook row (D1, version bump + fresh etag).
-        if (body.playbook !== undefined) {
-          if (body.playbook === null) {
-            await tx.delete(schema.inboxPlaybooks).where(eq(schema.inboxPlaybooks.inboxId, id));
-          } else {
-            const etag = sha256(body.playbook).slice(0, 16);
-            await tx
-              .insert(schema.inboxPlaybooks)
-              .values({ inboxId: id, content: body.playbook, etag })
-              .onConflictDoUpdate({
-                target: schema.inboxPlaybooks.inboxId,
-                set: {
-                  content: body.playbook,
-                  etag,
-                  version: sql`${schema.inboxPlaybooks.version} + 1`,
-                  updatedAt: new Date(),
-                },
-              });
-          }
-        }
-
         // Auto-bot lifecycle (single writer of key columns + defaultBotId, D20).
-        if (touchesPlaybookFeature) {
+        if (touchesLLMCredentials) {
           let reason: AutoBotReason = 'enable';
-          if (body.botLlmApiKey === null || body.playbook === null) reason = 'disable';
+          if (body.botLlmApiKey === null) reason = 'disable';
           else if (body.botLlmApiKey != null) reason = 'rotate-key';
           await applyAutoBotForInbox(tx, {
             inboxId: id,
@@ -501,12 +459,6 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
         .limit(1);
       const finalInbox = fresh ?? inbox;
 
-      const [pb] = await app.db
-        .select({ content: schema.inboxPlaybooks.content })
-        .from(schema.inboxPlaybooks)
-        .where(eq(schema.inboxPlaybooks.inboxId, id))
-        .limit(1);
-
       void writeAudit(
         req,
         {
@@ -516,13 +468,12 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
           changes: {
             fields: Object.keys(body).filter((k) => k !== 'secrets' && k !== 'botLlmApiKey'),
             secretsChanged: body.secrets !== undefined,
-            playbookChanged: body.playbook !== undefined,
             keyChanged: body.botLlmApiKey !== undefined,
           },
         },
         { db: app.db, log: app.log },
       );
-      return publicInbox(finalInbox, pb?.content ?? null);
+      return publicInbox(finalInbox);
     },
   );
 

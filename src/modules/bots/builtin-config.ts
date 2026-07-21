@@ -6,7 +6,7 @@ export const builtinBotConfigSchema = z.object({
   systemPrompt: z.string().min(1).max(10_000),
   temperature: z.number().min(0).max(2).default(0.7),
   maxTokens: z.number().int().min(1).max(8192).default(1024),
-  /** Where the system prompt comes from: 'inline' (cfg.systemPrompt), 'atlas' (HTTP-fetched markdown, falls back to inline on error), or 'local' (axis-back inbox_playbooks row, falls back to inline when absent). */
+  /** Historical field — always resolves to 'inline' (cfg.systemPrompt). Legacy values ('atlas', 'local') are still accepted for backward compat with stored bot rows but no longer trigger any external lookup. */
   playbookSource: z.enum(['inline', 'atlas', 'local']).default('inline'),
   /** Words/phrases from the contact that trigger automatic handoff to human. */
   handoffKeywords: z.array(z.string().max(100)).max(50).default([]),

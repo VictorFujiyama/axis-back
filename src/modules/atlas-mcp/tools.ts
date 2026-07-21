@@ -1059,9 +1059,8 @@ export interface GetQualifierEnabledResult {
  * Carries the same cross-tenant check as the write tools (D27): the flag is
  * only returned when the inbox's account matches the account the calling Atlas
  * org is bound to via its `atlas-bot:%` link in `atlas_user_links`. A missing
- * link or an account mismatch is `forbidden`. Unlike the retired
- * `messaging.get_inbox_playbook` tool it replaces, an unknown inbox is a hard
- * `not_found` — there is no legacy fallback to degrade to.
+ * link or an account mismatch is `forbidden`. An unknown inbox is a hard
+ * `not_found` — no legacy fallback to degrade to.
  */
 export async function getQualifierEnabledHandler(
   db: DB,
