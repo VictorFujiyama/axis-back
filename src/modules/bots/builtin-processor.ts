@@ -141,15 +141,20 @@ export async function processBuiltinBot(
   }
 
   // ── 7. Map history to LLM messages ────────────────────────────────
+  // Só msgs do bot ATUAL viram `role='assistant'` — msgs de bots anteriores
+  // (troca de prompt / bot swap) são ignoradas pra não contaminar o contexto
+  // com padrões de resposta obsoletos. Ver [[atlas-assistant-json-leak-bug]]:
+  // um bot com prompt de qualifier antigo (JSON) gerou exemplos que fizeram o
+  // novo Marco reply-bot mimickar o formato mesmo com systemPrompt trocado.
   const llmMessages: LLMMessage[] = [];
   for (const m of history) {
     if (!m.content) continue;
     if (m.senderType === 'contact') {
       llmMessages.push({ role: 'user', content: m.content });
-    } else if (m.senderType === 'bot') {
+    } else if (m.senderType === 'bot' && m.senderId === bot.id) {
       llmMessages.push({ role: 'assistant', content: m.content });
     }
-    // system/user (human agent) messages are skipped for the LLM
+    // system/user (human agent) messages + msgs de outros bots são skipped.
   }
 
   // ── 8. Call LLM ───────────────────────────────────────────────────
