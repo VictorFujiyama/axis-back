@@ -445,6 +445,110 @@ describe('POST /api/v1/bots/:botId/invalidate-cache', () => {
       await app.close();
     }
   });
+
+  it('aceita X-API-Key do Atlas no lugar do JWT admin', async () => {
+    const app = await buildTestApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/bots/${BOT_ID}/invalidate-cache`,
+        headers: { 'x-api-key': ATLAS_KEY },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ ok: true });
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('GET /api/v1/bots/:botId/versions/:version', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    dbSelectChains.length = 0;
+  });
+
+  it('retorna row completa (systemPrompt + config) da versão pedida', async () => {
+    const app = await buildTestApp({ selects: [[botRow()], [versionRow(2)]] });
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/versions/2`,
+        headers: { authorization: authHeader(app) },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        version: 2,
+        systemPrompt: 'Prompt v2',
+        model: 'claude-sonnet-4-5',
+        provider: 'anthropic',
+        temperature: 0.5,
+        maxTokens: 900,
+        etag: versionRow(2).etag,
+        createdAt: versionRow(2).createdAt.toISOString(),
+        createdByUserId: TEST_USER_ID,
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('retorna 404 pra bot fora da conta', async () => {
+    const app = await buildTestApp({ selects: [[]] });
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/versions/1`,
+        headers: { authorization: authHeader(app) },
+      });
+      expect(res.statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('retorna 404 pra versão inexistente', async () => {
+    const app = await buildTestApp({ selects: [[botRow()], []] });
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/versions/99`,
+        headers: { authorization: authHeader(app) },
+      });
+      expect(res.statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejeita version não-numérica', async () => {
+    const app = await buildTestApp();
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/versions/abc`,
+        headers: { authorization: authHeader(app) },
+      });
+      expect(res.statusCode).toBe(400);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('aceita X-API-Key do Atlas', async () => {
+    const app = await buildTestApp({ selects: [[botRow()], [versionRow(1)]] });
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/versions/1`,
+        headers: { 'x-api-key': ATLAS_KEY },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().systemPrompt).toBe('Prompt v1');
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 describe('GET /api/v1/bots/:botId/versions', () => {

@@ -40,6 +40,11 @@ const versionsQuery = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
 });
 
+const versionParams = z.object({
+  botId: z.string().uuid(),
+  version: z.coerce.number().int().min(1),
+});
+
 const rollbackBody = z.object({
   targetVersion: z.number().int().min(1),
   // Mesmo optimistic lock do PATCH: etag do estado que o cliente está vendo.
@@ -239,6 +244,58 @@ export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
+  // Read a single version — usado pelo diff viewer da UI (compara vN vs vAtual).
+  app.get(
+    '/api/v1/bots/:botId/versions/:version',
+    { preHandler: adminOrAtlasKey },
+    async (req, reply) => {
+      const parsed = versionParams.safeParse(req.params);
+      if (!parsed.success) return reply.badRequest('version inválida');
+      const { botId, version } = parsed.data;
+
+      const [bot] = await app.db
+        .select({ id: schema.bots.id })
+        .from(schema.bots)
+        .where(botScope(botId, req.user))
+        .limit(1);
+      if (!bot) return reply.notFound();
+
+      const [row] = await app.db
+        .select({
+          version: schema.botsConfigVersions.version,
+          systemPrompt: schema.botsConfigVersions.systemPrompt,
+          model: schema.botsConfigVersions.model,
+          provider: schema.botsConfigVersions.provider,
+          temperature: schema.botsConfigVersions.temperature,
+          maxTokens: schema.botsConfigVersions.maxTokens,
+          etag: schema.botsConfigVersions.etag,
+          createdAt: schema.botsConfigVersions.createdAt,
+          createdByUserId: schema.botsConfigVersions.createdByUserId,
+        })
+        .from(schema.botsConfigVersions)
+        .where(
+          and(
+            eq(schema.botsConfigVersions.botId, botId),
+            eq(schema.botsConfigVersions.version, version),
+          ),
+        )
+        .limit(1);
+      if (!row) return reply.notFound('versão não encontrada');
+
+      return {
+        version: row.version,
+        systemPrompt: row.systemPrompt,
+        model: row.model,
+        provider: row.provider,
+        temperature: row.temperature == null ? null : Number(row.temperature),
+        maxTokens: row.maxTokens,
+        etag: row.etag,
+        createdAt: row.createdAt,
+        createdByUserId: row.createdByUserId,
+      };
+    },
+  );
+
   app.post(
     '/api/v1/bots/:botId/rollback',
     { preHandler: adminOrAtlasKey },
@@ -348,16 +405,17 @@ export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
   );
 
   // No-op: o cache do prompt vive no lado do Atlas (Task 12). O endpoint
-  // existe pra front/MCP terem um contrato estável desde já.
+  // existe pra front/MCP terem um contrato estável desde já. Aceita X-API-Key
+  // pra Atlas server-to-server usar o mesmo shape dos outros bots.* endpoints.
   app.post(
     '/api/v1/bots/:botId/invalidate-cache',
-    { preHandler: app.requireRole('admin') },
+    { preHandler: adminOrAtlasKey },
     async (req, reply) => {
       const { botId } = botIdParams.parse(req.params);
       const [bot] = await app.db
         .select({ id: schema.bots.id })
         .from(schema.bots)
-        .where(and(eq(schema.bots.id, botId), eq(schema.bots.accountId, req.user.accountId)))
+        .where(botScope(botId, req.user))
         .limit(1);
       if (!bot) return reply.notFound();
       return reply.code(200).send({ ok: true });
