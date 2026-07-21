@@ -254,3 +254,164 @@ describe('processBuiltinBot — greeting message (bug #A3 regression guard)', ()
     expect(mockedCallLLM).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * History bot_id filter (2026-07-21) — resolve o [[atlas-assistant-json-leak-bug]].
+ *
+ * Root cause era o LLM ver msgs de bots ANTERIORES como `role='assistant'` no
+ * histórico e mimickar o formato (ex: JSON estruturado do qualifier antigo).
+ * Fix: só msgs do bot atual (`m.senderId === bot.id`) viram assistant. Msgs de
+ * bots diferentes são ignoradas.
+ */
+describe('processBuiltinBot — history bot_id filter (troca de prompt)', () => {
+  beforeEach(() => {
+    mockedCallLLM.mockReset();
+    mockedCallLLM.mockResolvedValue({
+      content: 'nova resposta natural',
+      usage: { promptTokens: 1, completionTokens: 1 },
+      finishReason: 'stop',
+    });
+  });
+
+  it('msgs de bot ANTIGO (senderId diferente) NÃO viram assistant no LLM context', async () => {
+    const OLD_BOT_ID = 'bot-old-11111111-1111-4111-8111-111111111111';
+    const NEW_BOT_ID = INPUT.botId; // 'bot-1' do INPUT
+    const history = [
+      // 2 msgs do bot antigo (formato JSON qualifier)
+      {
+        id: 'old-bot-1',
+        conversationId: INPUT.conversationId,
+        content: '```json\n{"type":"tag","tag":"nurture"}\n```',
+        senderType: 'bot',
+        senderId: OLD_BOT_ID,
+        isPrivateNote: false,
+      },
+      {
+        id: 'old-bot-2',
+        conversationId: INPUT.conversationId,
+        content: '```json\n{"type":"reply","content":"Oi"}\n```',
+        senderType: 'bot',
+        senderId: OLD_BOT_ID,
+        isPrivateNote: false,
+      },
+      // msg atual do contact
+      {
+        id: INPUT.newMessageId,
+        conversationId: INPUT.conversationId,
+        content: 'nova pergunta',
+        senderType: 'contact',
+        senderId: null,
+        isPrivateNote: false,
+      },
+    ];
+    const { db } = buildDb({
+      bot: { ...(makeBotRow(makeBaseConfig()) as object), id: NEW_BOT_ID },
+      history,
+    });
+    const app = makeApp();
+
+    await processBuiltinBot(INPUT, { db, log: app.log });
+
+    expect(mockedCallLLM).toHaveBeenCalledTimes(1);
+    const msgs = mockedCallLLM.mock.calls[0]![0].messages;
+    // Só a msg do contact deve estar; NENHUMA das 2 do bot antigo
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]).toEqual({ role: 'user', content: 'nova pergunta' });
+    // Confirmação explícita: nenhum JSON leaked
+    for (const m of msgs) {
+      expect(m.content).not.toMatch(/"type":"tag"|"type":"reply"/);
+    }
+  });
+
+  it('msgs do bot ATUAL (mesmo senderId) viram assistant normal', async () => {
+    const BOT_ID = INPUT.botId;
+    // DB retorna DESC (mais recente primeiro). Processor faz .reverse() pra
+    // virar ASC antes de mapear pro LLM.
+    const history = [
+      {
+        id: INPUT.newMessageId,
+        conversationId: INPUT.conversationId,
+        content: 'segunda pergunta do lead',
+        senderType: 'contact',
+        senderId: null,
+        isPrivateNote: false,
+      },
+      {
+        id: 'own-bot-1',
+        conversationId: INPUT.conversationId,
+        content: 'primeira resposta do Marco',
+        senderType: 'bot',
+        senderId: BOT_ID,
+        isPrivateNote: false,
+      },
+    ];
+    const { db } = buildDb({
+      bot: { ...(makeBotRow(makeBaseConfig()) as object), id: BOT_ID },
+      history,
+    });
+    const app = makeApp();
+
+    await processBuiltinBot(INPUT, { db, log: app.log });
+
+    expect(mockedCallLLM).toHaveBeenCalledTimes(1);
+    const msgs = mockedCallLLM.mock.calls[0]![0].messages;
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0]).toEqual({ role: 'assistant', content: 'primeira resposta do Marco' });
+    expect(msgs[1]).toEqual({ role: 'user', content: 'segunda pergunta do lead' });
+  });
+
+  it('mistura: só as do bot atual passam; contact sempre passa', async () => {
+    const BOT_ID = INPUT.botId;
+    const OLD_BOT_ID = 'bot-old-22222222-2222-4222-8222-222222222222';
+    const history = [
+      {
+        id: 'c1',
+        conversationId: INPUT.conversationId,
+        content: 'pergunta 1',
+        senderType: 'contact',
+        senderId: null,
+        isPrivateNote: false,
+      },
+      {
+        id: 'old-bot',
+        conversationId: INPUT.conversationId,
+        content: 'resposta bot antigo',
+        senderType: 'bot',
+        senderId: OLD_BOT_ID,
+        isPrivateNote: false,
+      },
+      {
+        id: 'my-bot',
+        conversationId: INPUT.conversationId,
+        content: 'resposta minha (bot atual)',
+        senderType: 'bot',
+        senderId: BOT_ID,
+        isPrivateNote: false,
+      },
+      {
+        id: INPUT.newMessageId,
+        conversationId: INPUT.conversationId,
+        content: 'pergunta 2',
+        senderType: 'contact',
+        senderId: null,
+        isPrivateNote: false,
+      },
+    ];
+    const { db } = buildDb({
+      bot: { ...(makeBotRow(makeBaseConfig()) as object), id: BOT_ID },
+      history,
+    });
+    const app = makeApp();
+
+    await processBuiltinBot(INPUT, { db, log: app.log });
+
+    const msgs = mockedCallLLM.mock.calls[0]![0].messages;
+    // 2 contact + 1 bot atual = 3. NÃO deve ter a do bot antigo.
+    expect(msgs).toHaveLength(3);
+    expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant', 'user']);
+    expect(msgs[1].content).toBe('resposta minha (bot atual)');
+    for (const m of msgs) {
+      expect(m.content).not.toBe('resposta bot antigo');
+    }
+  });
+});
