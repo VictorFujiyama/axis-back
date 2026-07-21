@@ -1151,6 +1151,12 @@ export interface ListInboxesItem {
    * de conv sem bot atribuído).
    */
   hasBot: boolean;
+  /**
+   * UUID do bot default da inbox (`inboxes.default_bot_id`) ou null. O cron
+   * bot-analyzer do Atlas precisa do id pra ler/editar o system prompt via
+   * `/api/v1/bots/:botId/config` (playbook-deprecation Task 14/15).
+   */
+  botId: string | null;
   updatedAt: Date;
 }
 
@@ -1286,6 +1292,7 @@ export async function listInboxesHandler(
       capabilities: capabilitiesForChannel(channelType),
       identifier: identifierForInbox(channelType, row.config),
       hasBot: row.defaultBotId !== null,
+      botId: row.defaultBotId,
       updatedAt: row.updatedAt,
     };
   });

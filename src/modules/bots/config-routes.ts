@@ -6,7 +6,7 @@
  * criando uma versão NOVA com o conteúdo antigo (nunca deleta histórico).
  */
 import { and, desc, eq } from 'drizzle-orm';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { schema } from '@blossom/db';
 import { sha256 } from '../../crypto';
@@ -64,15 +64,30 @@ class HttpConflict extends Error {}
 const CONFLICT_MSG = 'Config was modified by someone else. Reload and retry.';
 
 export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
+  const requireAdmin = app.requireRole('admin');
+  // GET/PATCH também são chamados server-to-server pelo Atlas (bot-analyzer /
+  // bot_prompt_decide_proposal) com X-API-Key — mesmo trust model do
+  // /api/auth/create-from-atlas. Nesse caminho não há JWT, logo não há
+  // req.user: o lookup do bot deixa de filtrar por accountId (chave é
+  // confiança total no serviço) e a versão persiste sem created_by_user_id.
+  const adminOrAtlasKey = async (req: FastifyRequest, reply: FastifyReply): Promise<void> => {
+    if (req.headers['x-api-key'] !== undefined) return app.requireAtlasApiKey(req, reply);
+    return requireAdmin(req, reply);
+  };
+  const botScope = (botId: string, user: { accountId: string } | undefined) =>
+    user
+      ? and(eq(schema.bots.id, botId), eq(schema.bots.accountId, user.accountId))
+      : eq(schema.bots.id, botId);
+
   app.get(
     '/api/v1/bots/:botId/config',
-    { preHandler: app.requireRole('admin') },
+    { preHandler: adminOrAtlasKey },
     async (req, reply) => {
       const { botId } = botIdParams.parse(req.params);
       const [bot] = await app.db
         .select()
         .from(schema.bots)
-        .where(and(eq(schema.bots.id, botId), eq(schema.bots.accountId, req.user.accountId)))
+        .where(botScope(botId, req.user))
         .limit(1);
       if (!bot) return reply.notFound();
       if (bot.botType !== 'builtin') return reply.badRequest('bot não é builtin');
@@ -99,7 +114,7 @@ export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
 
   app.patch(
     '/api/v1/bots/:botId/config',
-    { preHandler: app.requireRole('admin') },
+    { preHandler: adminOrAtlasKey },
     async (req, reply) => {
       const { botId } = botIdParams.parse(req.params);
       const parsed = patchBody.safeParse(req.body);
@@ -117,7 +132,7 @@ export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
           const [bot] = await tx
             .select()
             .from(schema.bots)
-            .where(and(eq(schema.bots.id, botId), eq(schema.bots.accountId, req.user.accountId)))
+            .where(botScope(botId, req.user))
             .limit(1)
             .for('update');
           if (!bot) throw new NotFoundInTx();
@@ -153,7 +168,7 @@ export async function botConfigRoutes(app: FastifyInstance): Promise<void> {
             temperature: String(merged.temperature),
             maxTokens: merged.maxTokens,
             etag: newEtag,
-            createdByUserId: req.user.sub,
+            createdByUserId: req.user?.sub ?? null,
           });
 
           await tx

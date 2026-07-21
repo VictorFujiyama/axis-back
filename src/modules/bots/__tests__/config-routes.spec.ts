@@ -10,6 +10,11 @@ import type { UserRole } from '@blossom/shared-types';
 const TEST_USER_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const TEST_ACCOUNT_ID = '11111111-2222-4333-8444-555555555555';
 const BOT_ID = '99999999-8888-4777-8666-555555555555';
+const ATLAS_KEY = 'atlas-test-api-key';
+
+// Antes de qualquer import dinâmico de ../config: o plugin atlas-auth congela
+// config.ATLAS_API_KEY no primeiro import do módulo de config.
+vi.stubEnv('ATLAS_API_KEY', ATLAS_KEY);
 
 /** Awaitable query-builder chain: every builder method returns itself, and
  * awaiting it resolves `result`. */
@@ -87,11 +92,13 @@ async function buildTestApp(options: DbOptions = {}): Promise<FastifyInstance> {
   const Fastify = (await import('fastify')).default;
   const sensible = (await import('@fastify/sensible')).default;
   const { default: jwtPlugin } = await import('../../../plugins/jwt');
+  const { default: atlasAuthPlugin } = await import('../../../plugins/atlas-auth');
   const { botConfigRoutes } = await import('../config-routes');
 
   const app = Fastify({ logger: false });
   await app.register(sensible);
   await app.register(jwtPlugin);
+  await app.register(atlasAuthPlugin);
 
   // GET uses app.db.select twice (bot, latest version); invalidate-cache once.
   const selectResults = options.selects ?? [options.botRow ?? [botRow()], options.latestVersion ?? []];
@@ -209,6 +216,35 @@ describe('GET /api/v1/bots/:botId/config', () => {
       await app.close();
     }
   });
+
+  it('aceita X-API-Key do Atlas no lugar do JWT admin', async () => {
+    const app = await buildTestApp({ latestVersion: [{ version: 2 }] });
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/config`,
+        headers: { 'x-api-key': ATLAS_KEY },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().version).toBe(2);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejeita X-API-Key inválida com 401', async () => {
+    const app = await buildTestApp();
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/bots/${BOT_ID}/config`,
+        headers: { 'x-api-key': 'nope' },
+      });
+      expect(res.statusCode).toBe(401);
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 describe('PATCH /api/v1/bots/:botId/config', () => {
@@ -250,6 +286,28 @@ describe('PATCH /api/v1/bots/:botId/config', () => {
             provider: 'anthropic',
             playbookSource: 'inline',
           }),
+        }),
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('X-API-Key do Atlas: patcha e persiste version sem created_by_user_id', async () => {
+    const app = await buildTestApp({ latestVersion: [{ version: 1 }] });
+    try {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/bots/${BOT_ID}/config`,
+        headers: { 'x-api-key': ATLAS_KEY },
+        payload: { systemPrompt: 'Prompt editado pelo Atlas.' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().version).toBe(2);
+      expect(versionInsertValues).toHaveBeenCalledWith(
+        expect.objectContaining({
+          systemPrompt: 'Prompt editado pelo Atlas.',
+          createdByUserId: null,
         }),
       );
     } finally {
