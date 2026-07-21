@@ -7,17 +7,23 @@ import { activeInboxesGauge, botAutoCreatedTotal, botAutoDisabledTotal } from '.
  * Auto-bot lifecycle for an inbox (D14, D15, D18-D22, D33).
  *
  * A builtin "Atlas Assistant" bot is auto-managed based on whether the inbox has
- * BOTH a playbook (inbox_playbooks row with content) AND an LLM API key + provider.
- * When both are present (and the inbox is not soft-deleted) the bot is created /
- * re-enabled and wired as the inbox's defaultBotId. When either is missing the bot
- * is disabled and defaultBotId cleared — the row is kept for reversibility (D19).
+ * an LLM API key + provider. When both are present (and the inbox is not
+ * soft-deleted) the bot is created / re-enabled and wired as the inbox's
+ * defaultBotId. When either is missing the bot is disabled and defaultBotId
+ * cleared — the row is kept for reversibility (D19). Playbooks are no longer
+ * part of this decision: the bot's prompt lives inline in bot.config.
  *
  * This function is the SINGLE writer of inbox.botLlmApiKeyEnc / inbox.botLlmProvider /
  * inbox.defaultBotId and of the builtin bot row, so the PATCH handler (D20) only has
- * to wrap it (plus the playbook upsert) in a transaction.
+ * to wrap it in a transaction.
  */
 
 const BUILTIN_BOT_NAME = 'Atlas Assistant';
+
+// builtinBotConfigSchema requires systemPrompt.min(1); this seeds a fresh bot
+// until the operator edits the prompt in the bot config UI.
+const DEFAULT_SYSTEM_PROMPT =
+  'You are a helpful customer support assistant. Answer concisely and hand the conversation to a human agent whenever you are unsure.';
 
 const DEFAULT_MODELS: Record<BotProvider, string> = {
   // Validated against llm-client.ts: model string is passed through verbatim (D18).
@@ -51,15 +57,14 @@ export interface AutoBotResult {
 /** Both a full DB and a transaction satisfy the query surface we use here. */
 export type DbOrTx = DB | Parameters<Parameters<DB['transaction']>[0]>[0];
 
-function defaultBuiltinConfig(provider: BotProvider, systemPrompt: string) {
+function defaultBuiltinConfig(provider: BotProvider) {
   return {
     provider,
     model: DEFAULT_MODELS[provider],
-    systemPrompt,
+    systemPrompt: DEFAULT_SYSTEM_PROMPT,
     temperature: 0.7,
     maxTokens: 1024,
-    // 'local' branch lands in T-07; config is plain jsonb so this is safe to set now.
-    playbookSource: 'local',
+    playbookSource: 'inline',
     handoffKeywords: [] as string[],
     maxTurnsBeforeHandoff: null,
   };
@@ -94,16 +99,10 @@ export async function applyAutoBotForInbox(
       : null;
   }
 
-  // 3. Load the playbook for this inbox.
-  const [playbook] = await tx
-    .select()
-    .from(schema.inboxPlaybooks)
-    .where(eq(schema.inboxPlaybooks.inboxId, input.inboxId))
-    .limit(1);
-
-  const hasPlaybook = !!playbook && playbook.content.trim().length > 0;
+  // 3. Active = key + provider present and inbox alive. No playbook lookup —
+  //    the prompt is inline in bot.config (playbook deprecation).
   const hasKey = finalKeyEnc != null && finalProvider != null;
-  const active = hasPlaybook && hasKey && !inbox.deletedAt;
+  const active = hasKey && !inbox.deletedAt;
 
   // 4. Persist key columns whenever the caller changed them (so rotate/remove stick
   //    even when the inbox ends up inactive). secret column stays encrypted on a plain
@@ -149,7 +148,7 @@ export async function applyAutoBotForInbox(
           botType: 'builtin',
           // finalKeyEnc is the encryptJSON({apiKey, provider}) blob (D16) — reused as bot.secret.
           secret: finalKeyEnc as string,
-          config: defaultBuiltinConfig(finalProvider as BotProvider, playbook!.content),
+          config: defaultBuiltinConfig(finalProvider as BotProvider),
           inboxId: input.inboxId,
           enabled: true,
         })
