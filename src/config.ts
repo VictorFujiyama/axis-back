@@ -62,10 +62,9 @@ const envSchema = z.object({
   // create-from-atlas). Optional so dev/test envs without the integration boot
   // fine; the requireAtlasApiKey middleware refuses requests when unset.
   ATLAS_API_KEY: z.string().optional(),
-  // Base URL of the Atlas instance the playbook fetcher targets
-  // (e.g. http://localhost:3010 in dev). When unset, the fetcher returns
-  // null without making any network call, so bots silently fall back to
-  // `cfg.systemPrompt`. Pairs with ATLAS_API_KEY for `X-API-Key` auth.
+  // Base URL of the Atlas instance (e.g. http://localhost:3010 in dev).
+  // Used by the atlas-events worker as the POST target base. Pairs with
+  // ATLAS_API_KEY for `X-API-Key` auth.
   ATLAS_BASE_URL: z.string().url().optional(),
   // Shared HMAC secret used to sign outbound messaging events posted to
   // Atlas at `${ATLAS_BASE_URL}${ATLAS_EVENTS_ENDPOINT}`. When unset, the

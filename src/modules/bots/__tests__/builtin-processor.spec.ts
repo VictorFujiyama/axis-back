@@ -1,6 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyBaseLogger } from 'fastify';
-import type Redis from 'ioredis';
 import type { DB } from '@blossom/db';
 
 import { processBuiltinBot, type ProcessInput } from '../builtin-processor';
@@ -133,10 +132,9 @@ function buildDb(opts: BuildDbOpts): DbMock {
   };
 }
 
-function makeApp(): { redis: Redis; log: FastifyBaseLogger; logWarn: ReturnType<typeof vi.fn> } {
+function makeApp(): { log: FastifyBaseLogger; logWarn: ReturnType<typeof vi.fn> } {
   const logWarn = vi.fn();
   return {
-    redis: {} as unknown as Redis,
     log: {
       warn: logWarn,
       info: vi.fn(),
@@ -167,7 +165,7 @@ describe('processBuiltinBot — system prompt (single inline path)', () => {
     const { db, insertCalls } = buildDb({ bot: makeBotRow(makeBaseConfig()) });
     const app = makeApp();
 
-    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
+    await processBuiltinBot(INPUT, { db, log: app.log });
 
     expect(mockedCallLLM).toHaveBeenCalledTimes(1);
     expect(mockedCallLLM.mock.calls[0]![0].systemPrompt).toBe(INLINE_PROMPT);
@@ -180,7 +178,7 @@ describe('processBuiltinBot — system prompt (single inline path)', () => {
     });
     const app = makeApp();
 
-    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
+    await processBuiltinBot(INPUT, { db, log: app.log });
 
     expect(mockedCallLLM).toHaveBeenCalledTimes(1);
     expect(mockedCallLLM.mock.calls[0]![0].systemPrompt).toBe(INLINE_PROMPT);
@@ -193,7 +191,7 @@ describe('processBuiltinBot — system prompt (single inline path)', () => {
     });
     const app = makeApp();
 
-    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
+    await processBuiltinBot(INPUT, { db, log: app.log });
 
     // buildDb wires exactly 3 selects (conversation, bot, history); an extra
     // inbox_playbooks lookup would shift the history rows and break the run.
@@ -226,7 +224,7 @@ describe('processBuiltinBot — greeting message (bug #A3 regression guard)', ()
     });
     const app = makeApp();
 
-    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
+    await processBuiltinBot(INPUT, { db, log: app.log });
 
     // Critical assertion: LLM never called on the first-inbound greeting turn.
     // If the guard `return` after greeting is removed, this fails with
@@ -249,7 +247,7 @@ describe('processBuiltinBot — greeting message (bug #A3 regression guard)', ()
     });
     const app = makeApp();
 
-    await processBuiltinBot(INPUT, { db, log: app.log, redis: app.redis });
+    await processBuiltinBot(INPUT, { db, log: app.log });
 
     // Critical assertion: LLM called exactly once on follow-up (not zero,
     // not two).

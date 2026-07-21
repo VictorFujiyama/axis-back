@@ -13,7 +13,6 @@
  */
 import { and, desc, eq } from 'drizzle-orm';
 import type { FastifyBaseLogger } from 'fastify';
-import type Redis from 'ioredis';
 import { schema, type DB } from '@blossom/db';
 import { decryptJSON } from '../../crypto';
 import { eventBus } from '../../realtime/event-bus';
@@ -33,16 +32,7 @@ export interface ProcessInput {
 
 export async function processBuiltinBot(
   input: ProcessInput,
-  {
-    db,
-    log,
-  }: {
-    db: DB;
-    log: FastifyBaseLogger;
-    redis: Redis;
-    // Não usado desde a deprecation do playbook; dispatcher ainda repassa (sai na Task 4).
-    fetchImpl?: typeof fetch;
-  },
+  { db, log }: { db: DB; log: FastifyBaseLogger },
 ): Promise<void> {
   // ── 1. Load entities ──────────────────────────────────────────────
   const [conv] = await db

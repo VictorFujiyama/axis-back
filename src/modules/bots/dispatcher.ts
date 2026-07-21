@@ -1,5 +1,4 @@
 import type { FastifyBaseLogger } from 'fastify';
-import type Redis from 'ioredis';
 import { schema, type DB } from '@blossom/db';
 import { QUEUE_NAMES, type BotDispatchJob, type QueueName } from '../../queue';
 import type { Queue } from 'bullmq';
@@ -11,8 +10,6 @@ export interface DispatchInput {
   newMessageId: string;
   botId: string;
   accountId: string;
-  /** Playbook version snapshotted at enqueue time (D11 stale detection). */
-  expectedPlaybookVersion?: number;
 }
 
 interface DispatchDeps {
@@ -20,10 +17,6 @@ interface DispatchDeps {
   log: FastifyBaseLogger;
   /** Optional: when present, enqueues to BullMQ. When absent, falls back to in-process. */
   queue?: Queue<BotDispatchJob>;
-  /** Required by the in-process fallback path so builtin bots can fetch
-   * their playbook from Atlas. The queue path doesn't need it (the worker
-   * pulls `app.redis` at job execution time). */
-  redis?: Redis;
 }
 
 /**
@@ -51,14 +44,8 @@ export function dispatchBot(input: DispatchInput, deps: DispatchDeps): void {
     return;
   }
   // Fallback (no queue) — fire-and-forget direct delivery (used in tests).
-  // Builtin bots need redis (playbook cache); skip rather than crash if absent.
-  if (!deps.redis) {
-    deps.log.warn({ input }, 'bot dispatch (direct fallback): skipped, no redis');
-    return;
-  }
-  const redis = deps.redis;
   void import('./dispatcher-fn').then(({ deliverBotWebhook }) =>
-    deliverBotWebhook(input, { db: deps.db, log: deps.log, redis }).catch((err) =>
+    deliverBotWebhook(input, { db: deps.db, log: deps.log }).catch((err) =>
       deps.log.error({ err, input }, 'bot dispatch (direct) failed'),
     ),
   );
