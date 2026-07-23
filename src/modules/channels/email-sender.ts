@@ -279,6 +279,33 @@ export async function dispatchEmailSend(
  *
  * Single-row indexed lookup — does NOT load the whole conversation.
  */
+/**
+ * Decide como o e-mail sai: com o assunto próprio da campanha ou como resposta
+ * dentro da conversa.
+ *
+ * Mensagem de journey é PRIMEIRO CONTATO. Antes, todo e-mail saía como
+ * `Re: <nome da inbox>` com `In-Reply-To` da última mensagem recebida — e como
+ * a journey reaproveita uma conversa já aberta, o disparo aparecia aninhado
+ * numa thread antiga no cliente do destinatário, parecendo resposta de uma
+ * conversa que aquela pessoa nunca teve (e o assunto escrito pela IA era
+ * descartado). Resposta manual do agente pela inbox continua como sempre.
+ *
+ * `messages` não tem coluna de assunto: o Atlas grava em `metadata.subject`
+ * (ver atlas-mcp/tools.ts).
+ */
+export function resolveEmailFraming(
+  metadata: Record<string, unknown> | null | undefined,
+  inboxName: string,
+): { subject: string; useReplyThreading: boolean } {
+  const meta = metadata ?? {};
+  const isJourney = meta['source'] === 'atlas-journey';
+  const atlasSubject = typeof meta['subject'] === 'string' ? meta['subject'].trim() : '';
+  return {
+    subject: isJourney && atlasSubject ? atlasSubject : `Re: ${inboxName}`,
+    useReplyThreading: !isJourney,
+  };
+}
+
 export async function lastInboundChannelMsgId(
   db: DB,
   conversationId: string,

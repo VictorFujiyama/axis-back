@@ -5,7 +5,7 @@ import { schema } from '@blossom/db';
 import { canAccessConversation } from '../conversations/access';
 import { deleteMessageUpstream, deleteCapabilityForChannel } from './delete-upstream';
 import { eventBus } from '../../realtime/event-bus';
-import { lastInboundChannelMsgId } from '../channels/email-sender';
+import { lastInboundChannelMsgId, resolveEmailFraming } from '../channels/email-sender';
 import { QUEUE_NAMES, type EmailOutboundJob, type WhatsAppOutboundJob, type TelegramOutboundJob, type TwilioMetaOutboundJob, type ScheduledMessageJob } from '../../queue';
 import { resolveMentions, createMentionNotifications } from '../notifications/helpers';
 
@@ -674,13 +674,19 @@ export async function dispatchOutbound(
       return;
     }
 
-    const inReplyTo = await lastInboundChannelMsgId(app.db, conversationId);
-
     // Enqueue — worker (queue/workers.ts) reads inbox config/secrets and calls Postmark.
     // BullMQ handles retries with exponential backoff and persists across restarts.
     const meta = (msg.metadata as Record<string, unknown> | null) ?? {};
     const source: 'atlas-journey' | 'manual' =
       meta['source'] === 'atlas-journey' ? 'atlas-journey' : 'manual';
+
+    // Assunto próprio + sem cabeçalho de thread pra journey (primeiro contato);
+    // "Re: …" + In-Reply-To pra resposta manual. Ver resolveEmailFraming.
+    const { subject, useReplyThreading } = resolveEmailFraming(meta, inbox.name);
+    const inReplyTo = useReplyThreading
+      ? await lastInboundChannelMsgId(app.db, conversationId)
+      : null;
+
     await app.queues
       .getQueue<EmailOutboundJob>(QUEUE_NAMES.EMAIL_OUTBOUND)
       .add(
@@ -690,7 +696,7 @@ export async function dispatchOutbound(
           conversationId,
           inboxId: inbox.id,
           contactEmail: contact.email,
-          subject: `Re: ${inbox.name}`,
+          subject,
           text: msg.content ?? '',
           inReplyToMessageId: inReplyTo,
           source,
