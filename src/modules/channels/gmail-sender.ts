@@ -24,13 +24,33 @@ export interface ComposeMimeOptions {
   threadingHints?: ThreadingHints;
 }
 
+/**
+ * Codifica um valor para caber num cabeçalho RFC 5322 (que é 7-bit ASCII).
+ * ASCII puro passa direto; qualquer não-ASCII vira encoded-word RFC 2047
+ * (`=?UTF-8?B?<base64>?=`). Sem isso, o assunto com acento saía cru no header
+ * e o cliente de e-mail interpretava os bytes UTF-8 como latin1 — o clássico
+ * "Construção" → "ConstruÃƒÂ§ÃƒÂ£o". O corpo não sofria porque tem
+ * `Content-Type: charset=UTF-8`; cabeçalho não tem esse mecanismo.
+ */
+function encodeHeaderValue(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  if (/^[\x00-\x7F]*$/.test(value)) return value;
+  return `=?UTF-8?B?${Buffer.from(value, 'utf8').toString('base64')}?=`;
+}
+
 function escapeQuoted(value: string): string {
   return value.replace(/[\\"]/g, '\\$&');
 }
 
 function formatFrom(addr: ComposeMimeFrom): string {
   if (addr.name && addr.name.length > 0) {
-    return `"${escapeQuoted(addr.name)}" <${addr.email}>`;
+    // Nome ASCII vira quoted-string; com acento vira encoded-word RFC 2047
+    // (sem aspas — encoded-word não pode ficar dentro de quoted-string).
+    // eslint-disable-next-line no-control-regex
+    const display = /^[\x00-\x7F]*$/.test(addr.name)
+      ? `"${escapeQuoted(addr.name)}"`
+      : encodeHeaderValue(addr.name);
+    return `${display} <${addr.email}>`;
   }
   return addr.email;
 }
@@ -45,7 +65,7 @@ export function composeMimeRfc5322(opts: ComposeMimeOptions): string {
   const lines: string[] = [
     `From: ${formatFrom(opts.from)}`,
     `To: ${opts.to}`,
-    `Subject: ${opts.subject}`,
+    `Subject: ${encodeHeaderValue(opts.subject)}`,
     'MIME-Version: 1.0',
     'Content-Type: text/plain; charset=UTF-8',
     'Content-Transfer-Encoding: 8bit',
