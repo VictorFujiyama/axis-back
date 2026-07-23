@@ -99,6 +99,53 @@ function buildDeps(
 }
 
 describe('composeMimeRfc5322', () => {
+  describe('cabeçalho não-ASCII (RFC 2047)', () => {
+    it('assunto ASCII passa cru', () => {
+      const mime = composeMimeRfc5322({
+        from: { email: 'a@b.com' },
+        to: 'c@d.com',
+        subject: 'Plain subject',
+        body: 'x',
+      });
+      expect(mime).toContain('Subject: Plain subject\r\n');
+    });
+
+    it('assunto com acento vira encoded-word (não sai UTF-8 cru)', () => {
+      const subject = 'Uma oportunidade para a Engemon Engenharia & Construção';
+      const mime = composeMimeRfc5322({
+        from: { email: 'a@b.com' },
+        to: 'c@d.com',
+        subject,
+        body: 'x',
+      });
+      const expected = `=?UTF-8?B?${Buffer.from(subject, 'utf8').toString('base64')}?=`;
+      expect(mime).toContain(`Subject: ${expected}\r\n`);
+      // Não pode conter os bytes crus da palavra acentuada no header.
+      expect(mime.split('\r\n\r\n')[0]).not.toContain('Construção');
+    });
+
+    it('nome do remetente com acento vira encoded-word sem aspas', () => {
+      const mime = composeMimeRfc5322({
+        from: { email: 'a@b.com', name: 'João Ção' },
+        to: 'c@d.com',
+        subject: 'Hi',
+        body: 'x',
+      });
+      const expected = `=?UTF-8?B?${Buffer.from('João Ção', 'utf8').toString('base64')}?=`;
+      expect(mime).toContain(`From: ${expected} <a@b.com>\r\n`);
+    });
+
+    it('nome ASCII do remetente continua quoted-string', () => {
+      const mime = composeMimeRfc5322({
+        from: { email: 'a@b.com', name: 'Marco Russo' },
+        to: 'c@d.com',
+        subject: 'Hi',
+        body: 'x',
+      });
+      expect(mime).toContain('From: "Marco Russo" <a@b.com>\r\n');
+    });
+  });
+
   describe('basic structure', () => {
     it('separates headers from body with a blank CRLF line', () => {
       const mime = composeMimeRfc5322({
